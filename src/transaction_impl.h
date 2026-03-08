@@ -139,6 +139,11 @@ class Transaction::Impl {
 
   ReadSetType read_set_;
   WriteSetType write_set_;
+
+  // Hash map index for O(1) lookup in read_set_ and write_set_.
+  // Key: "table_name\0key", Value: index into respective vector.
+  std::unordered_map<std::string, size_t> read_set_index_;
+  std::unordered_map<std::string, size_t> write_set_index_;
   struct NotNullProgress {
     size_t remainingWrites;
     std::unordered_set<std::string> satisfiedIndexNames;

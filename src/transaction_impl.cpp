@@ -84,22 +84,29 @@ const std::pair<const std::byte* const, const size_t> Transaction::Impl::Read(
 
   EnsureCurrentTable();
 
-  for (auto& snapshot : write_set_) {
-    if (snapshot.key == key &&
-        snapshot.table_name == current_table_->GetTableName() &&
-        snapshot.index_name.empty()) {
-      return std::make_pair(snapshot.data_item_copy.value(),
-                            snapshot.data_item_copy.size());
-    }
+  const auto& table_name = current_table_->GetTableName();
+
+  // Build lookup key: "table_name\0key" (primary index only, index_name empty)
+  std::string lookup_key;
+  lookup_key.reserve(table_name.size() + 1 + key.size());
+  lookup_key.append(table_name);
+  lookup_key.push_back('\0');
+  lookup_key.append(key);
+
+  // O(1) lookup in write_set
+  auto wit = write_set_index_.find(lookup_key);
+  if (wit != write_set_index_.end()) {
+    auto& snapshot = write_set_[wit->second];
+    return std::make_pair(snapshot.data_item_copy.value(),
+                          snapshot.data_item_copy.size());
   }
 
-  for (auto& snapshot : read_set_) {
-    if (snapshot.key == key &&
-        snapshot.table_name == current_table_->GetTableName() &&
-        snapshot.index_name.empty()) {
-      return std::make_pair(snapshot.data_item_copy.value(),
-                            snapshot.data_item_copy.size());
-    }
+  // O(1) lookup in read_set
+  auto rit = read_set_index_.find(lookup_key);
+  if (rit != read_set_index_.end()) {
+    auto& snapshot = read_set_[rit->second];
+    return std::make_pair(snapshot.data_item_copy.value(),
+                          snapshot.data_item_copy.size());
   }
 
   auto* index_leaf = current_table_->GetPrimaryIndex().GetOrInsert(key);
@@ -107,7 +114,9 @@ const std::pair<const std::byte* const, const size_t> Transaction::Impl::Read(
       key, nullptr, 0, index_leaf, current_table_->GetTableName(), ""};
 
   snapshot.data_item_copy = concurrency_control_->Read(key, index_leaf);
+  size_t idx = read_set_.size();
   auto& ref = read_set_.emplace_back(std::move(snapshot));
+  read_set_index_.emplace(std::move(lookup_key), idx);
   if (ref.data_item_copy.IsInitialized()) {
     return {ref.data_item_copy.value(), ref.data_item_copy.size()};
   } else {
@@ -190,22 +199,24 @@ void Transaction::Impl::Write(const std::string_view key,
   // then we have to abort this transaction or throw exception
   EnsureCurrentTable();
 
+  const auto& table_name = current_table_->GetTableName();
+
+  std::string lookup_key;
+  lookup_key.reserve(table_name.size() + 1 + key.size());
+  lookup_key.append(table_name);
+  lookup_key.push_back('\0');
+  lookup_key.append(key);
+
   bool is_rmf = false;
-  for (auto& snapshot : read_set_) {
-    if (snapshot.key == key &&
-        snapshot.table_name == current_table_->GetTableName() &&
-        snapshot.index_name.empty()) {
-      is_rmf = true;
-      snapshot.is_read_modify_write = true;
-      break;
-    }
+  auto rit = read_set_index_.find(lookup_key);
+  if (rit != read_set_index_.end()) {
+    is_rmf = true;
+    read_set_[rit->second].is_read_modify_write = true;
   }
 
-  for (auto& snapshot : write_set_) {
-    if (snapshot.key != key ||
-        snapshot.table_name != current_table_->GetTableName())
-      continue;
-    if (!snapshot.index_name.empty()) continue;
+  auto wit = write_set_index_.find(lookup_key);
+  if (wit != write_set_index_.end()) {
+    auto& snapshot = write_set_[wit->second];
     snapshot.data_item_copy.Reset(value, size);
     if (is_rmf) snapshot.is_read_modify_write = true;
     return;
@@ -217,7 +228,9 @@ void Transaction::Impl::Write(const std::string_view key,
   Snapshot sp(key, value, size, index_leaf, current_table_->GetTableName(), "",
               {});
   if (is_rmf) sp.is_read_modify_write = true;
+  size_t idx = write_set_.size();
   write_set_.emplace_back(std::move(sp));
+  write_set_index_.emplace(std::move(lookup_key), idx);
 }
 
 void Transaction::Impl::WriteSecondaryIndex(
