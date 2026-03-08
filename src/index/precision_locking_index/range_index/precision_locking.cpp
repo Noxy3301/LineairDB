@@ -18,8 +18,10 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <functional>
 #include <string_view>
+#include <thread>
 
 #include "transaction_impl.h"
 #include "types/data_item.hpp"
@@ -75,6 +77,8 @@ PrecisionLockingIndex::PrecisionLockingIndex(LineairDB::EpochFramework& e)
               }
             }
           }
+          // Sleep to avoid busy-wait; GC only needs to run once per epoch
+          std::this_thread::sleep_for(std::chrono::milliseconds(40));
         }
       }){};
 
