@@ -98,7 +98,7 @@ std::optional<size_t> PrecisionLockingIndex::Scan(
     if (end < begin) return std::nullopt;
   }
 
-  std::lock_guard<decltype(plock_)> p_guard(plock_);
+  std::shared_lock<decltype(plock_)> p_guard(plock_);
   std::shared_lock<decltype(ulock_)> u_guard(ulock_);
   if (IsOverlapWithInsertOrDelete(b, e)) {
     return std::nullopt;
@@ -120,8 +120,11 @@ std::optional<size_t> PrecisionLockingIndex::Scan(
 
   const auto epoch = epoch_manager_ref_.GetMyThreadLocalEpoch();
 
-  predicate_list_[epoch].emplace_back(b, e);
-  predicate_list_[epoch].back().tx_context = GetCurrentTransactionContext();
+  {
+    std::lock_guard<std::mutex> append_guard(predicate_append_lock_);
+    predicate_list_[epoch].emplace_back(b, e);
+    predicate_list_[epoch].back().tx_context = GetCurrentTransactionContext();
+  }
 
   return hit;
 };
@@ -137,7 +140,7 @@ std::optional<size_t> PrecisionLockingIndex::ScanReverse(
     if (end < begin) return std::nullopt;
   }
 
-  std::lock_guard<decltype(plock_)> p_guard(plock_);
+  std::shared_lock<decltype(plock_)> p_guard(plock_);
   std::shared_lock<decltype(ulock_)> u_guard(ulock_);
   if (IsOverlapWithInsertOrDelete(b, e)) {
     return std::nullopt;
@@ -160,14 +163,17 @@ std::optional<size_t> PrecisionLockingIndex::ScanReverse(
 
   const auto epoch = epoch_manager_ref_.GetMyThreadLocalEpoch();
 
-  predicate_list_[epoch].emplace_back(b, e);
-  predicate_list_[epoch].back().tx_context = GetCurrentTransactionContext();
+  {
+    std::lock_guard<std::mutex> append_guard(predicate_append_lock_);
+    predicate_list_[epoch].emplace_back(b, e);
+    predicate_list_[epoch].back().tx_context = GetCurrentTransactionContext();
+  }
 
   return hit;
 };
 
 bool PrecisionLockingIndex::Insert(const std::string_view key) {
-  std::shared_lock<decltype(plock_)> p_guard(plock_);
+  std::lock_guard<decltype(plock_)> p_guard(plock_);
   if (IsInPredicateSet(key)) {
     return false;
   }
@@ -190,7 +196,7 @@ void PrecisionLockingIndex::ForceInsert(const std::string_view key) {
 }
 
 bool PrecisionLockingIndex::Delete(const std::string_view key) {
-  std::shared_lock<decltype(plock_)> p_guard(plock_);
+  std::lock_guard<decltype(plock_)> p_guard(plock_);
   if (IsInPredicateSet(key)) {
     return false;
   }

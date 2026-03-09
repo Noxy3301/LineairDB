@@ -23,6 +23,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <mutex>
 #include <shared_mutex>
 #include <string_view>
 
@@ -99,6 +100,7 @@ class PrecisionLockingIndex {
 
   PredicateList predicate_list_;
   std::shared_mutex plock_;
+  std::mutex predicate_append_lock_;
   InsertOrDeleteKeySet insert_or_delete_key_set_;
   std::shared_mutex ulock_;
   ROWEXRangeIndexContainer container_;
