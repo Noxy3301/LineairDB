@@ -69,6 +69,10 @@ struct Snapshot {
   }
 
   static bool Compare(const Snapshot& left, const Snapshot& right) {
+    if (left.index_cache != nullptr && right.index_cache != nullptr &&
+        left.index_cache != right.index_cache) {
+      return left.index_cache < right.index_cache;
+    }
     if (left.table_name != right.table_name) {
       return left.table_name < right.table_name;
     }
@@ -81,6 +85,15 @@ struct Snapshot {
 
 using ReadSetType = std::vector<Snapshot>;
 using WriteSetType = std::vector<Snapshot>;
+
+// Lightweight entry for Scan-originated reads.
+// NWR validation only needs index_cache and TID; storing full Snapshots (288B)
+// for scan entries wastes memory and hurts cache locality.
+struct ScanValidationEntry {
+  DataItem* index_cache;
+  TransactionId tid;  // Non-atomic copy of TID at read time
+};
+using ScanValidationSetType = std::vector<ScanValidationEntry>;
 
 }  // namespace LineairDB
 

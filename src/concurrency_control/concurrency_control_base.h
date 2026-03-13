@@ -31,6 +31,7 @@ namespace LineairDB {
 struct TransactionReferences {
   ReadSetType& read_set_ref_;
   WriteSetType& write_set_ref_;
+  ScanValidationSetType& scan_validation_ref_;
   EpochFramework& epoch_framework_ref_;
   TxStatus& current_status_ref_;
 };
@@ -39,6 +40,18 @@ class ConcurrencyControlBase {
   ConcurrencyControlBase(TransactionReferences&& tx) : tx_ref_(tx) {}
   virtual ~ConcurrencyControlBase(){};
   virtual const DataItem Read(std::string_view, DataItem*) = 0;
+  // Zero-copy read: returns pointer to data in-place (no DataItem copy).
+  // Caller must consume the data before any concurrent writer can modify it.
+  // TID double-check ensures memory safety. Registers in validation_set_.
+  // out_tid receives the TID at read time for NWR validation.
+  virtual std::pair<const std::byte*, size_t> ReadDirect(
+      std::string_view key, DataItem* index_leaf,
+      TransactionId& out_tid) = 0;
+  // Scan-optimized ReadDirect: same TID double-check, but skips
+  // validation_set_ push (scan_validation_set_ is used instead).
+  virtual std::pair<const std::byte*, size_t> ReadDirectForScan(
+      std::string_view key, DataItem* index_leaf,
+      TransactionId& out_tid) = 0;
   virtual void Write(const std::string_view key, const std::byte* const value,
                      const size_t size, DataItem*) = 0;
   virtual void Abort() = 0;
@@ -46,7 +59,10 @@ class ConcurrencyControlBase {
   virtual void PostProcessing(TxStatus) = 0;
 
   bool IsReadOnly() { return (0 == tx_ref_.write_set_ref_.size()); }
-  bool IsWriteOnly() { return (0 == tx_ref_.read_set_ref_.size()); }
+  bool IsWriteOnly() {
+    return (0 == tx_ref_.read_set_ref_.size()) &&
+           (0 == tx_ref_.scan_validation_ref_.size());
+  }
 
  protected:
   TransactionReferences tx_ref_;

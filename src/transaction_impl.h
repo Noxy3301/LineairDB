@@ -34,6 +34,8 @@
 
 namespace LineairDB {
 
+struct DataItem;
+
 /**
  * @brief
  * Transaction::Impl controls users' requests of the four operation of the page
@@ -130,6 +132,10 @@ class Transaction::Impl {
  private:
   void EnsureCurrentTable();
   bool IsAborted() { return current_status_ == TxStatus::Aborted; };
+  const std::pair<const std::byte* const, const size_t> ScanRead(
+      const std::string_view key, std::string& lookup_key_buf);
+  const std::pair<const std::byte* const, const size_t> ScanRead(
+      const std::string_view key, DataItem* index_leaf);
 
  private:
   TxStatus current_status_;
@@ -139,6 +145,7 @@ class Transaction::Impl {
 
   ReadSetType read_set_;
   WriteSetType write_set_;
+  ScanValidationSetType scan_validation_set_;
 
   // Hash map index for O(1) lookup in read_set_ and write_set_.
   // Key: "table_name\0key", Value: index into respective vector.

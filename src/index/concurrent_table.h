@@ -45,6 +45,9 @@ class ConcurrentTable {
                              const std::optional<std::string_view> end,
                              std::function<bool(std::string_view)> operation);
   std::optional<size_t> Scan(
+      const std::string_view begin, const std::optional<std::string_view> end,
+      std::function<bool(std::string_view, DataItem&)> operation);
+  std::optional<size_t> Scan(
       const std::string_view begin, const std::string_view end,
       std::function<bool(std::string_view, DataItem&)> operation);
   std::optional<size_t> ScanReverse(

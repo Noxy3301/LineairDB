@@ -20,7 +20,7 @@
 
 #include <algorithm>
 #include <memory>
-#include <set>
+#include <thread>
 #include <utility>
 
 #include "concurrency_control/concurrency_control_base.h"
@@ -28,11 +28,14 @@
 #include "concurrency_control/impl/two_phase_locking.hpp"
 #include "database_impl.h"
 #include "types/snapshot.hpp"
+#include "util/ordo_profile.hpp"
 
 namespace LineairDB {
 
 namespace {
 thread_local void* current_transaction_context = nullptr;
+// High bit tags read_set_index_ entries as scan_validation_set_ indices.
+constexpr size_t SCAN_ENTRY_BIT = size_t(1) << 63;
 }
 
 void* GetCurrentTransactionContext() { return current_transaction_context; }
@@ -44,7 +47,7 @@ Transaction::Impl::Impl(Database::Impl* db_pimpl) noexcept
       current_table_(nullptr) {
   current_transaction_context = this;
 
-  TransactionReferences&& tx = {read_set_, write_set_,
+  TransactionReferences&& tx = {read_set_, write_set_, scan_validation_set_,
                                 db_pimpl_->epoch_framework_, current_status_};
 
   // WANTFIX for performance
@@ -104,7 +107,25 @@ const std::pair<const std::byte* const, const size_t> Transaction::Impl::Read(
   // O(1) lookup in read_set
   auto rit = read_set_index_.find(lookup_key);
   if (rit != read_set_index_.end()) {
-    auto& snapshot = read_set_[rit->second];
+    size_t idx = rit->second;
+    if (idx & SCAN_ENTRY_BIT) {
+      // Scan entry: lightweight validation-only entry exists.
+      // Upgrade to full Snapshot with actual data for Read-after-Scan.
+      auto& scan_entry = scan_validation_set_[idx & ~SCAN_ENTRY_BIT];
+      auto* index_leaf = scan_entry.index_cache;
+      Snapshot snapshot = {
+          key, nullptr, 0, index_leaf, current_table_->GetTableName(), ""};
+      snapshot.data_item_copy = concurrency_control_->Read(key, index_leaf);
+      size_t new_idx = read_set_.size();
+      auto& ref = read_set_.emplace_back(std::move(snapshot));
+      rit->second = new_idx;  // Update to point to read_set_
+      if (ref.data_item_copy.IsInitialized()) {
+        return {ref.data_item_copy.value(), ref.data_item_copy.size()};
+      } else {
+        return {nullptr, 0};
+      }
+    }
+    auto& snapshot = read_set_[idx];
     return std::make_pair(snapshot.data_item_copy.value(),
                           snapshot.data_item_copy.size());
   }
@@ -119,6 +140,60 @@ const std::pair<const std::byte* const, const size_t> Transaction::Impl::Read(
   read_set_index_.emplace(std::move(lookup_key), idx);
   if (ref.data_item_copy.IsInitialized()) {
     return {ref.data_item_copy.value(), ref.data_item_copy.size()};
+  } else {
+    return {nullptr, 0};
+  }
+}
+
+// Optimized Read for Scan: skips write_set and read_set index lookups.
+// Caller guarantees: key is NOT in write_set, and NOT yet in read_set.
+// lookup_key_buf: reusable string buffer for read_set_index_ key construction.
+//   On entry, contains "table_name\0" prefix. Key portion is appended/truncated.
+//
+// Instead of creating a full Snapshot (288B), adds a lightweight
+// ScanValidationEntry (16B) to scan_validation_set_. The read_set_index_
+// entry is tagged with SCAN_ENTRY_BIT to distinguish from read_set_ entries.
+const std::pair<const std::byte* const, const size_t>
+Transaction::Impl::ScanRead(const std::string_view key,
+                            std::string& lookup_key_buf) {
+  auto* index_leaf = current_table_->GetPrimaryIndex().GetOrInsert(key);
+
+  TransactionId read_tid;
+  auto [ptr, sz] = concurrency_control_->ReadDirect(key, index_leaf, read_tid);
+  if (IsAborted()) return {nullptr, 0};
+
+  // Add lightweight entry for NWR validation (16B vs 288B Snapshot)
+  size_t scan_idx = scan_validation_set_.size();
+  scan_validation_set_.push_back({index_leaf, read_tid});
+
+  // Tag with SCAN_ENTRY_BIT so Read()/Write() can detect scan entries
+  const size_t prefix_len = lookup_key_buf.size();
+  lookup_key_buf.append(key);
+  read_set_index_.emplace(lookup_key_buf, SCAN_ENTRY_BIT | scan_idx);
+  lookup_key_buf.resize(prefix_len);
+
+  if (ptr != nullptr && sz != 0) {
+    return {ptr, sz};
+  } else {
+    return {nullptr, 0};
+  }
+}
+
+// ScanRead with pre-cached DataItem*: skips GetOrInsert hash lookup,
+// skips validation_set_ push (uses scan_validation_set_ instead),
+// and skips read_set_index_ population (only needed for Read/Write-after-Scan).
+const std::pair<const std::byte* const, const size_t>
+Transaction::Impl::ScanRead(const std::string_view key,
+                            DataItem* index_leaf) {
+  TransactionId read_tid;
+  auto [ptr, sz] =
+      concurrency_control_->ReadDirectForScan(key, index_leaf, read_tid);
+  if (IsAborted()) return {nullptr, 0};
+
+  scan_validation_set_.push_back({index_leaf, read_tid});
+
+  if (ptr != nullptr && sz != 0) {
+    return {ptr, sz};
   } else {
     return {nullptr, 0};
   }
@@ -211,7 +286,12 @@ void Transaction::Impl::Write(const std::string_view key,
   auto rit = read_set_index_.find(lookup_key);
   if (rit != read_set_index_.end()) {
     is_rmf = true;
-    read_set_[rit->second].is_read_modify_write = true;
+    size_t ridx = rit->second;
+    if (!(ridx & SCAN_ENTRY_BIT)) {
+      read_set_[ridx].is_read_modify_write = true;
+    }
+    // For scan entries, is_rmf is still set — the write_set entry's
+    // is_read_modify_write flag (set below) is what NWR checks.
   }
 
   auto wit = write_set_index_.find(lookup_key);
@@ -406,11 +486,12 @@ const std::optional<size_t> Transaction::Impl::Scan(
   // deleted or does not exist. SQL NULL values should be handled within the
   // byte array value, not by nullptr.
 
-  // Step 1: Collect keys from index
-  std::set<std::string> index_keys;
+  // Step 1: Collect keys from index (PL::Scan returns sorted order).
+  // Only keys are collected under the PL lock to minimize lock hold time.
+  std::vector<std::pair<std::string, DataItem*>> index_entries;
   auto index_result = current_table_->GetPrimaryIndex().Scan(
       begin, end, [&](std::string_view key) {
-        index_keys.insert(std::string(key));
+        index_entries.emplace_back(std::string(key), nullptr);
         return false;  // Continue to collect all keys
       });
 
@@ -419,65 +500,103 @@ const std::optional<size_t> Transaction::Impl::Scan(
     return std::nullopt;
   }
 
+  // Step 1.5: Bulk-resolve DataItem* pointers outside PL lock.
+  // This avoids per-key GetOrInsert in Step 4's ScanRead.
+  for (auto& entry : index_entries) {
+    entry.second = current_table_->GetPrimaryIndex().GetOrInsert(entry.first);
+  }
+
   // Step 2: Collect keys from write_set
-  std::set<std::string> write_set_keys;
+  std::vector<std::string> write_set_keys;
   for (const auto& snapshot : write_set_) {
     if (snapshot.table_name != current_table_->GetTableName()) continue;
     if (!snapshot.index_name.empty()) continue;  // base-table scan only
     if (snapshot.key < begin) continue;
     if (end.has_value() && snapshot.key > end.value()) continue;
-    write_set_keys.insert(snapshot.key);
+    write_set_keys.emplace_back(snapshot.key);
   }
+  std::sort(write_set_keys.begin(), write_set_keys.end());
 
-  // Step 3: Merge and sort all keys (std::set automatically keeps them sorted)
-  std::set<std::string> all_keys;
-  all_keys.insert(index_keys.begin(), index_keys.end());
-  all_keys.insert(write_set_keys.begin(), write_set_keys.end());
+  // Step 3: Pre-allocate scan_validation_set_ and read_set_index_ capacity.
+  // ScanRead adds 16B entries to scan_validation_set_ instead of 288B
+  // Snapshots to read_set_, so reserve is much cheaper.
+  size_t estimated_reads = index_entries.size();
+  scan_validation_set_.reserve(scan_validation_set_.size() + estimated_reads);
+  // read_set_index_ no longer populated for scan entries (skipped in ScanRead)
 
-  // Step 4: Process keys in sorted order
+  // lookup_key_buf still needed for the non-cached ScanRead path
+  const auto& table_name = current_table_->GetTableName();
+  std::string lookup_key_buf;
+  lookup_key_buf.reserve(table_name.size() + 1 + 64);
+  lookup_key_buf.append(table_name);
+  lookup_key_buf.push_back('\0');
+
+  // Step 4: Two-pointer sorted merge + process
   size_t total_count = 0;
-  for (const auto& key : all_keys) {
-    if (IsAborted()) return std::nullopt;
 
-    // Check if key is in write_set
-    // if the key exists, use write_set data (without Transaction#Read)
-    bool found_in_write_set = false;
+  auto process_write_set_key = [&](const std::string& key) -> std::optional<size_t> {
     for (const auto& snapshot : write_set_) {
       if (snapshot.table_name != current_table_->GetTableName()) continue;
-      if (!snapshot.index_name.empty()) continue;  // base-table scan only
+      if (!snapshot.index_name.empty()) continue;
       if (snapshot.key != key) continue;
 
-      found_in_write_set = true;
-
-      // If the key is deleted within this transaction, break the loop
-      if (!snapshot.data_item_copy.IsInitialized()) {
-        break;
-      }
+      if (!snapshot.data_item_copy.IsInitialized()) return std::nullopt;
 
       std::pair<const void*, const size_t> value_pair = {
           snapshot.data_item_copy.value(), snapshot.data_item_copy.size()};
       bool stop_scan = operation(key, value_pair);
       total_count++;
       if (stop_scan) return total_count;
-
-      break;
+      return std::nullopt;
     }
+    return std::nullopt;
+  };
 
-    // If not in write_set, invoke Transaction#Read to get the value
-    if (!found_in_write_set) {
-      const auto read_result = Read(key);
-      // The pair "nullptr, 0" means deleted (or uninitialized) data. See
-      // include/lineairdb/transaction.h
-      const bool is_uninitialized =
-          read_result.first == nullptr && read_result.second == 0;
+  auto process_index_entry = [&](const std::string& key, DataItem* item) -> std::optional<size_t> {
+    const auto read_result = ScanRead(key, item);
+    const bool is_uninitialized =
+        read_result.first == nullptr && read_result.second == 0;
 
-      // If the data item exists, continue scanning with the data
-      if (!is_uninitialized) {
-        bool stop_scan = operation(key, read_result);
-        total_count++;
-        if (stop_scan) return total_count;
-      }
+    if (!is_uninitialized) {
+      bool stop_scan = operation(key, read_result);
+      total_count++;
+      if (stop_scan) return total_count;
     }
+    return std::nullopt;
+  };
+
+  size_t i = 0, w = 0;
+  while (i < index_entries.size() && w < write_set_keys.size()) {
+    if (IsAborted()) return std::nullopt;
+
+    if (index_entries[i].first < write_set_keys[w]) {
+      // Index-only key
+      auto result = process_index_entry(index_entries[i].first, index_entries[i].second);
+      if (result.has_value()) return result;
+      ++i;
+    } else if (index_entries[i].first > write_set_keys[w]) {
+      // Write-set-only key (newly inserted)
+      auto result = process_write_set_key(write_set_keys[w]);
+      if (result.has_value()) return result;
+      ++w;
+    } else {
+      // Key exists in both — write_set takes priority
+      auto result = process_write_set_key(write_set_keys[w]);
+      if (result.has_value()) return result;
+      ++i; ++w;
+    }
+  }
+  while (i < index_entries.size()) {
+    if (IsAborted()) return std::nullopt;
+    auto result = process_index_entry(index_entries[i].first, index_entries[i].second);
+    if (result.has_value()) return result;
+    ++i;
+  }
+  while (w < write_set_keys.size()) {
+    if (IsAborted()) return std::nullopt;
+    auto result = process_write_set_key(write_set_keys[w]);
+    if (result.has_value()) return result;
+    ++w;
   }
 
   // TODO: we now only consider the insertion, but we should consider the case
@@ -498,11 +617,11 @@ const std::optional<size_t> Transaction::Impl::ScanReverse(
   // deleted or does not exist. SQL NULL values should be handled within the
   // byte array value, not by nullptr.
 
-  // Step 1: Collect keys from index
-  std::set<std::string> index_keys;
+  // Step 1: Collect keys from index (ScanReverse returns reverse-sorted order)
+  std::vector<std::string> index_keys;
   auto index_result = current_table_->GetPrimaryIndex().ScanReverse(
       begin, end, [&](std::string_view key) {
-        index_keys.insert(std::string(key));
+        index_keys.emplace_back(key);
         return false;  // Continue to collect all keys
       });
 
@@ -510,60 +629,85 @@ const std::optional<size_t> Transaction::Impl::ScanReverse(
     Abort();
     return std::nullopt;
   }
+  // index_keys is in reverse order from ScanReverse; reverse to ascending
+  std::reverse(index_keys.begin(), index_keys.end());
 
   // Step 2: Collect keys from write_set
-  std::set<std::string> write_set_keys;
+  std::vector<std::string> write_set_keys;
   for (const auto& snapshot : write_set_) {
     if (snapshot.table_name != current_table_->GetTableName()) continue;
     if (!snapshot.index_name.empty()) continue;  // base-table scan only
     if (snapshot.key < begin) continue;
     if (end.has_value() && snapshot.key > end.value()) continue;
-    write_set_keys.insert(snapshot.key);
+    write_set_keys.emplace_back(snapshot.key);
   }
+  std::sort(write_set_keys.begin(), write_set_keys.end());
 
-  // Step 3: Merge and sort all keys (std::set automatically keeps them sorted)
-  std::set<std::string> all_keys;
-  all_keys.insert(index_keys.begin(), index_keys.end());
-  all_keys.insert(write_set_keys.begin(), write_set_keys.end());
-
-  // Step 4: Process keys in reverse order
+  // Step 3+4: Two-pointer reverse merge + process
   size_t total_count = 0;
-  for (auto it = all_keys.rbegin(); it != all_keys.rend(); ++it) {
-    if (IsAborted()) return std::nullopt;
 
-    const auto& key = *it;
-    bool found_in_write_set = false;
+  auto process_write_set_key = [&](const std::string& key) -> std::optional<size_t> {
     for (const auto& snapshot : write_set_) {
       if (snapshot.table_name != current_table_->GetTableName()) continue;
-      if (!snapshot.index_name.empty()) continue;  // base-table scan only
+      if (!snapshot.index_name.empty()) continue;
       if (snapshot.key != key) continue;
 
-      found_in_write_set = true;
-
-      if (!snapshot.data_item_copy.IsInitialized()) {
-        break;
-      }
+      if (!snapshot.data_item_copy.IsInitialized()) return std::nullopt;
 
       std::pair<const void*, const size_t> value_pair = {
           snapshot.data_item_copy.value(), snapshot.data_item_copy.size()};
       bool stop_scan = operation(key, value_pair);
       total_count++;
       if (stop_scan) return total_count;
-
-      break;
+      return std::nullopt;
     }
+    return std::nullopt;
+  };
 
-    if (!found_in_write_set) {
-      const auto read_result = Read(key);
-      const bool is_uninitialized =
-          read_result.first == nullptr && read_result.second == 0;
+  auto process_index_key = [&](const std::string& key) -> std::optional<size_t> {
+    const auto read_result = Read(key);
+    const bool is_uninitialized =
+        read_result.first == nullptr && read_result.second == 0;
 
-      if (!is_uninitialized) {
-        bool stop_scan = operation(key, read_result);
-        total_count++;
-        if (stop_scan) return total_count;
-      }
+    if (!is_uninitialized) {
+      bool stop_scan = operation(key, read_result);
+      total_count++;
+      if (stop_scan) return total_count;
     }
+    return std::nullopt;
+  };
+
+  // Reverse iteration via signed indices from the end
+  int64_t i = static_cast<int64_t>(index_keys.size()) - 1;
+  int64_t w = static_cast<int64_t>(write_set_keys.size()) - 1;
+  while (i >= 0 && w >= 0) {
+    if (IsAborted()) return std::nullopt;
+
+    if (index_keys[i] > write_set_keys[w]) {
+      auto result = process_index_key(index_keys[i]);
+      if (result.has_value()) return result;
+      --i;
+    } else if (index_keys[i] < write_set_keys[w]) {
+      auto result = process_write_set_key(write_set_keys[w]);
+      if (result.has_value()) return result;
+      --w;
+    } else {
+      auto result = process_write_set_key(write_set_keys[w]);
+      if (result.has_value()) return result;
+      --i; --w;
+    }
+  }
+  while (i >= 0) {
+    if (IsAborted()) return std::nullopt;
+    auto result = process_index_key(index_keys[i]);
+    if (result.has_value()) return result;
+    --i;
+  }
+  while (w >= 0) {
+    if (IsAborted()) return std::nullopt;
+    auto result = process_write_set_key(write_set_keys[w]);
+    if (result.has_value()) return result;
+    --w;
   }
 
   return total_count;
@@ -582,10 +726,10 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndex(
     return {};
   }
 
-  // Step 1: Collect keys from secondary index
-  std::set<std::string> index_keys;
+  // Step 1: Collect keys from secondary index (sorted order from index)
+  std::vector<std::string> index_keys;
   auto index_result = index->Scan(begin, end, [&](std::string_view key) {
-    index_keys.insert(std::string(key));
+    index_keys.emplace_back(key);
     return false;  // Continue to collect all keys
   });
 
@@ -595,74 +739,89 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndex(
   }
 
   // Step 2: Collect keys from write_set (for this secondary index)
-  std::set<std::string> write_set_keys;
+  std::vector<std::string> write_set_keys;
   for (const auto& snapshot : write_set_) {
     if (snapshot.table_name != current_table_->GetTableName()) continue;
-    if (snapshot.index_name != index_name)
-      continue;  // セカンダリインデックス名でフィルタ
+    if (snapshot.index_name != index_name) continue;
     if (snapshot.key < begin) continue;
     if (end.has_value() && snapshot.key > end.value()) continue;
-    write_set_keys.insert(snapshot.key);
+    write_set_keys.emplace_back(snapshot.key);
   }
+  std::sort(write_set_keys.begin(), write_set_keys.end());
 
-  // Step 3: Merge and sort all keys
-  std::set<std::string> all_keys;
-  all_keys.insert(index_keys.begin(), index_keys.end());
-  all_keys.insert(write_set_keys.begin(), write_set_keys.end());
-
-  // Step 4: Process keys in sorted order
+  // Step 3+4: Two-pointer merge + process
   size_t total_count = 0;
-  for (const auto& key : all_keys) {
-    if (IsAborted()) return std::nullopt;
 
-    // Check if key is in write_set
-    bool found_in_write_set = false;
+  auto process_ws_key = [&](const std::string& key) -> std::optional<size_t> {
     for (const auto& snapshot : write_set_) {
       if (snapshot.table_name != current_table_->GetTableName()) continue;
       if (snapshot.index_name != index_name) continue;
       if (snapshot.key != key) continue;
 
-      // Use write_set data directly
       std::vector<std::string> primary_keys;
       primary_keys.reserve(snapshot.data_item_copy.primary_keys.size());
       for (const auto& pk : snapshot.data_item_copy.primary_keys) {
         primary_keys.emplace_back(pk);
       }
-
-      // Skip deleted keys (empty primary_keys means the entry was deleted)
-      if (primary_keys.empty()) {
-        found_in_write_set = true;
-        break;
-      }
+      if (primary_keys.empty()) return std::nullopt;
 
       total_count++;
       bool stop_scan = operation(key, primary_keys);
       if (stop_scan) return total_count;
-
-      found_in_write_set = true;
-      break;
+      return std::nullopt;
     }
+    return std::nullopt;
+  };
 
-    // If not in write_set, invoke ReadSecondaryIndex
-    if (!found_in_write_set) {
-      const auto read_result = ReadSecondaryIndex(index_name, key);
+  auto process_idx_key = [&](const std::string& key) -> std::optional<size_t> {
+    const auto read_result = ReadSecondaryIndex(index_name, key);
+    if (IsAborted()) return total_count;  // signal abort
+
+    std::vector<std::string> primary_keys;
+    primary_keys.reserve(read_result.size());
+    for (const auto& primary_key : read_result) {
+      primary_keys.emplace_back(
+          reinterpret_cast<const char*>(primary_key.first),
+          primary_key.second);
+    }
+    if (primary_keys.empty()) return std::nullopt;
+
+    total_count++;
+    bool stop_scan = operation(key, primary_keys);
+    if (stop_scan) return total_count;
+    return std::nullopt;
+  };
+
+  size_t si = 0, sw = 0;
+  while (si < index_keys.size() && sw < write_set_keys.size()) {
+    if (IsAborted()) return std::nullopt;
+    if (index_keys[si] < write_set_keys[sw]) {
+      auto result = process_idx_key(index_keys[si]);
       if (IsAborted()) return std::nullopt;
-
-      std::vector<std::string> primary_keys;
-      primary_keys.reserve(read_result.size());
-      for (const auto& primary_key : read_result) {
-        primary_keys.emplace_back(
-            reinterpret_cast<const char*>(primary_key.first),
-            primary_key.second);
-      }
-
-      // Skip deleted keys
-      if (primary_keys.empty()) continue;
-
-      total_count++;
-      bool stop_scan = operation(key, primary_keys);
-      if (stop_scan) return total_count;
+      if (result.has_value()) return result;
+      ++si;
+    } else if (index_keys[si] > write_set_keys[sw]) {
+      auto result = process_ws_key(write_set_keys[sw]);
+      if (result.has_value()) return result;
+      ++sw;
+    } else {
+      auto result = process_ws_key(write_set_keys[sw]);
+      if (result.has_value()) return result;
+      ++si; ++sw;
     }
+  }
+  while (si < index_keys.size()) {
+    if (IsAborted()) return std::nullopt;
+    auto result = process_idx_key(index_keys[si]);
+    if (IsAborted()) return std::nullopt;
+    if (result.has_value()) return result;
+    ++si;
+  }
+  while (sw < write_set_keys.size()) {
+    if (IsAborted()) return std::nullopt;
+    auto result = process_ws_key(write_set_keys[sw]);
+    if (result.has_value()) return result;
+    ++sw;
   }
 
   return total_count;
@@ -681,10 +840,10 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndexReverse(
     return {};
   }
 
-  // Step 1: Collect keys from secondary index
-  std::set<std::string> index_keys;
+  // Step 1: Collect keys from secondary index (reverse order)
+  std::vector<std::string> index_keys;
   auto index_result = index->ScanReverse(begin, end, [&](std::string_view key) {
-    index_keys.insert(std::string(key));
+    index_keys.emplace_back(key);
     return false;  // Continue to collect all keys
   });
 
@@ -692,30 +851,24 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndexReverse(
     Abort();
     return std::nullopt;
   }
+  // Reverse to ascending order for merge
+  std::reverse(index_keys.begin(), index_keys.end());
 
   // Step 2: Collect keys from write_set (for this secondary index)
-  std::set<std::string> write_set_keys;
+  std::vector<std::string> write_set_keys;
   for (const auto& snapshot : write_set_) {
     if (snapshot.table_name != current_table_->GetTableName()) continue;
-    if (snapshot.index_name != index_name)
-      continue;  // セカンダリインデックス名でフィルタ
+    if (snapshot.index_name != index_name) continue;
     if (snapshot.key < begin) continue;
     if (end.has_value() && snapshot.key > end.value()) continue;
-    write_set_keys.insert(snapshot.key);
+    write_set_keys.emplace_back(snapshot.key);
   }
+  std::sort(write_set_keys.begin(), write_set_keys.end());
 
-  // Step 3: Merge and sort all keys
-  std::set<std::string> all_keys;
-  all_keys.insert(index_keys.begin(), index_keys.end());
-  all_keys.insert(write_set_keys.begin(), write_set_keys.end());
-
-  // Step 4: Process keys in reverse order
+  // Step 3+4: Two-pointer reverse merge + process
   size_t total_count = 0;
-  for (auto it = all_keys.rbegin(); it != all_keys.rend(); ++it) {
-    if (IsAborted()) return std::nullopt;
 
-    const auto& key = *it;
-    bool found_in_write_set = false;
+  auto process_ws_key = [&](const std::string& key) -> std::optional<size_t> {
     for (const auto& snapshot : write_set_) {
       if (snapshot.table_name != current_table_->GetTableName()) continue;
       if (snapshot.index_name != index_name) continue;
@@ -727,39 +880,67 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndexReverse(
         primary_keys.emplace_back(pk);
       }
       std::reverse(primary_keys.begin(), primary_keys.end());
-
-      if (primary_keys.empty()) {
-        found_in_write_set = true;
-        break;
-      }
+      if (primary_keys.empty()) return std::nullopt;
 
       total_count++;
       bool stop_scan = operation(key, primary_keys);
       if (stop_scan) return total_count;
-
-      found_in_write_set = true;
-      break;
+      return std::nullopt;
     }
+    return std::nullopt;
+  };
 
-    if (!found_in_write_set) {
-      const auto read_result = ReadSecondaryIndex(index_name, key);
+  auto process_idx_key = [&](const std::string& key) -> std::optional<size_t> {
+    const auto read_result = ReadSecondaryIndex(index_name, key);
+    if (IsAborted()) return total_count;
+
+    std::vector<std::string> primary_keys;
+    primary_keys.reserve(read_result.size());
+    for (const auto& primary_key : read_result) {
+      primary_keys.emplace_back(
+          reinterpret_cast<const char*>(primary_key.first),
+          primary_key.second);
+    }
+    std::reverse(primary_keys.begin(), primary_keys.end());
+    if (primary_keys.empty()) return std::nullopt;
+
+    total_count++;
+    bool stop_scan = operation(key, primary_keys);
+    if (stop_scan) return total_count;
+    return std::nullopt;
+  };
+
+  int64_t si = static_cast<int64_t>(index_keys.size()) - 1;
+  int64_t sw = static_cast<int64_t>(write_set_keys.size()) - 1;
+  while (si >= 0 && sw >= 0) {
+    if (IsAborted()) return std::nullopt;
+    if (index_keys[si] > write_set_keys[sw]) {
+      auto result = process_idx_key(index_keys[si]);
       if (IsAborted()) return std::nullopt;
-
-      std::vector<std::string> primary_keys;
-      primary_keys.reserve(read_result.size());
-      for (const auto& primary_key : read_result) {
-        primary_keys.emplace_back(
-            reinterpret_cast<const char*>(primary_key.first),
-            primary_key.second);
-      }
-      std::reverse(primary_keys.begin(), primary_keys.end());
-
-      if (primary_keys.empty()) continue;
-
-      total_count++;
-      bool stop_scan = operation(key, primary_keys);
-      if (stop_scan) return total_count;
+      if (result.has_value()) return result;
+      --si;
+    } else if (index_keys[si] < write_set_keys[sw]) {
+      auto result = process_ws_key(write_set_keys[sw]);
+      if (result.has_value()) return result;
+      --sw;
+    } else {
+      auto result = process_ws_key(write_set_keys[sw]);
+      if (result.has_value()) return result;
+      --si; --sw;
     }
+  }
+  while (si >= 0) {
+    if (IsAborted()) return std::nullopt;
+    auto result = process_idx_key(index_keys[si]);
+    if (IsAborted()) return std::nullopt;
+    if (result.has_value()) return result;
+    --si;
+  }
+  while (sw >= 0) {
+    if (IsAborted()) return std::nullopt;
+    auto result = process_ws_key(write_set_keys[sw]);
+    if (result.has_value()) return result;
+    --sw;
   }
 
   return total_count;
@@ -1031,6 +1212,12 @@ void Transaction::Impl::Abort() {
 }
 bool Transaction::Impl::Precommit() {
   if (IsAborted()) return false;
+
+  OrdoProfile::ScopedTimer precommit_timer("ldb.tx.precommit.total");
+  OrdoProfile::AddSample("ldb.tx.precommit.read_set_size", read_set_.size());
+  OrdoProfile::AddSample("ldb.tx.precommit.write_set_size", write_set_.size());
+  OrdoProfile::AddSample("ldb.tx.precommit.scan_validation_size",
+                         scan_validation_set_.size());
 
   const bool need_to_checkpoint =
       (db_pimpl_->GetConfig().enable_checkpointing &&

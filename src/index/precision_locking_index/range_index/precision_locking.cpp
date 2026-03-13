@@ -100,6 +100,7 @@ std::optional<size_t> PrecisionLockingIndex::Scan(
 
   std::lock_guard<decltype(plock_)> p_guard(plock_);
   std::shared_lock<decltype(ulock_)> u_guard(ulock_);
+
   if (IsOverlapWithInsertOrDelete(b, e)) {
     return std::nullopt;
   }

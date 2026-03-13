@@ -81,6 +81,12 @@ std::optional<size_t> ConcurrentTable::Scan(
 };
 
 std::optional<size_t> ConcurrentTable::Scan(
+    const std::string_view begin, const std::optional<std::string_view> end,
+    std::function<bool(std::string_view, DataItem&)> operation) {
+  return index_->Scan(begin, end, operation);
+};
+
+std::optional<size_t> ConcurrentTable::Scan(
     const std::string_view begin, const std::string_view end,
     std::function<bool(std::string_view, DataItem&)> operation) {
   return index_->Scan(begin, end, operation);

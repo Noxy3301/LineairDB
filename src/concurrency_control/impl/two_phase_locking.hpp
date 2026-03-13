@@ -69,6 +69,37 @@ class TwoPhaseLockingImpl final : public ConcurrencyControlBase {
 
     return snapshot_item;
   };
+
+  std::pair<const std::byte*, size_t> ReadDirect(
+      const std::string_view, DataItem* index_leaf,
+      TransactionId& out_tid) final override {
+    assert(index_leaf != nullptr);
+    auto& rw_lock = index_leaf->GetRWLockRef();
+
+    auto lock_acquired = rw_lock.TryLock(
+        std::remove_reference<decltype(rw_lock)>::type::LockType::Shared);
+
+    if (!lock_acquired) {
+      if constexpr (deadlock_avoidance_type == DeadLockAvoidanceType::NoWait) {
+        Abort();
+        out_tid = TransactionId{};
+        return {nullptr, 0};
+      } else {
+        SPDLOG_ERROR(
+            "Selected deadlock-avoidance algorithm is not implemented.");
+        exit(EXIT_FAILURE);
+      }
+    }
+    read_lock_set_.emplace(index_leaf);
+    out_tid = index_leaf->transaction_id.load();
+    return {index_leaf->buffer.value, index_leaf->buffer.size};
+  };
+  // 2PL: ReadDirectForScan same as ReadDirect (lock acquisition required)
+  std::pair<const std::byte*, size_t> ReadDirectForScan(
+      const std::string_view key, DataItem* index_leaf,
+      TransactionId& out_tid) final override {
+    return ReadDirect(key, index_leaf, out_tid);
+  };
   void Write(const std::string_view key, const std::byte* const value,
              const size_t size, DataItem* index_leaf) final override {
     assert(index_leaf != nullptr);

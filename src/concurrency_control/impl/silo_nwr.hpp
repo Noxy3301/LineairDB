@@ -28,6 +28,7 @@
 #include "concurrency_control/pivot_object.hpp"
 #include "types/data_item.hpp"
 #include "types/definitions.h"
+#include "../../util/ordo_profile.hpp"
 
 namespace LineairDB {
 
@@ -83,32 +84,113 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
       }
     }
   };
+
+  std::pair<const std::byte*, size_t> ReadDirect(
+      const std::string_view, DataItem* index_leaf,
+      TransactionId& out_tid) final override {
+    assert(index_leaf != nullptr);
+
+    for (;;) {
+      auto tx_id = index_leaf->transaction_id.load();
+
+      if (tx_id.tid & 1u) {
+        std::this_thread::yield();
+        continue;
+      }
+
+      // Read pointer and size without copying the buffer
+      const std::byte* val = index_leaf->buffer.value;
+      size_t sz = index_leaf->buffer.size;
+
+      // Verify no writer was active during our reads
+      if (index_leaf->transaction_id.load() == tx_id) {
+        validation_set_.push_back({index_leaf, tx_id});
+        out_tid = tx_id;
+        return {val, sz};
+      }
+    }
+  };
+  // Scan-optimized: skips validation_set_ push since scan entries are
+  // tracked in scan_validation_set_ instead. Same TID double-check.
+  std::pair<const std::byte*, size_t> ReadDirectForScan(
+      const std::string_view, DataItem* index_leaf,
+      TransactionId& out_tid) final override {
+    assert(index_leaf != nullptr);
+
+    for (;;) {
+      auto tx_id = index_leaf->transaction_id.load();
+
+      if (tx_id.tid & 1u) {
+        std::this_thread::yield();
+        continue;
+      }
+
+      const std::byte* val = index_leaf->buffer.value;
+      size_t sz = index_leaf->buffer.size;
+
+      if (index_leaf->transaction_id.load() == tx_id) {
+        // Skip validation_set_ push — caller adds to scan_validation_set_
+        out_tid = tx_id;
+        return {val, sz};
+      }
+    }
+  };
   void Write(const std::string_view, const std::byte* const, const size_t,
              DataItem*) final override{};
   void Abort() final override{};
   bool Precommit(bool need_to_checkpoint) final override {
+    const uint64_t precommit_start_ns =
+        OrdoProfile::Enabled() ? OrdoProfile::NowNs() : 0;
+
     /** Sorting write set to prevent deadlock **/
-    std::sort(tx_ref_.write_set_ref_.begin(), tx_ref_.write_set_ref_.end(),
-              Snapshot::Compare);
+    const uint64_t sort_start_ns =
+        OrdoProfile::Enabled() ? OrdoProfile::NowNs() : 0;
+    if (!std::is_sorted(tx_ref_.write_set_ref_.begin(),
+                        tx_ref_.write_set_ref_.end(), Snapshot::Compare)) {
+      std::sort(tx_ref_.write_set_ref_.begin(), tx_ref_.write_set_ref_.end(),
+                Snapshot::Compare);
+    }
+    if (OrdoProfile::Enabled()) {
+      OrdoProfile::AddDuration("ldb.silo.precommit.sort",
+                               OrdoProfile::NowNs() - sort_start_ns);
+    }
 
     if constexpr (EnableNWR) {
+      const uint64_t omittable_start_ns =
+          OrdoProfile::Enabled() ? OrdoProfile::NowNs() : 0;
       if (!IsReadOnly() && IsOmittable()) {
         // we can safely clear writeset since all versions x_j in writeset_j are
         // omittable.
         tx_ref_.write_set_ref_.clear();
+        if (OrdoProfile::Enabled()) {
+          OrdoProfile::AddDuration("ldb.silo.precommit.is_omittable",
+                                   OrdoProfile::NowNs() - omittable_start_ns);
+          OrdoProfile::AddDuration("ldb.silo.precommit.total",
+                                   OrdoProfile::NowNs() - precommit_start_ns);
+        }
         return true;
       } else {
         // Preemptive abort: if anti_dependency validation of omittable version
         // order has failed, it is meaningless to acquire exclusive lockings
         // since the subsequent validation of Silo's version order will also
         // fail.
+        if (OrdoProfile::Enabled()) {
+          OrdoProfile::AddDuration("ldb.silo.precommit.is_omittable",
+                                   OrdoProfile::NowNs() - omittable_start_ns);
+        }
         if (nwr_validation_result_ == NWRValidationResult::ANTI_DEPENDENCY) {
+          if (OrdoProfile::Enabled()) {
+            OrdoProfile::AddDuration("ldb.silo.precommit.total",
+                                     OrdoProfile::NowNs() - precommit_start_ns);
+          }
           return false;
         }
       }
     }
 
     /** Acquire Lock **/
+    const uint64_t lock_start_ns =
+        OrdoProfile::Enabled() ? OrdoProfile::NowNs() : 0;
     for (auto& snapshot : tx_ref_.write_set_ref_) {
       auto* item = snapshot.index_cache;
       assert(item != nullptr);
@@ -136,40 +218,96 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
               break;
             }
           }
+          // Also check scan validation entries (no break — duplicates possible
+          // when the same key is scanned twice in one transaction)
+          for (auto& scan_item : tx_ref_.scan_validation_ref_) {
+            if (scan_item.index_cache == item) {
+              scan_item.tid.tid++;
+            }
+          }
           break;
         }
       }
     }
+    if (OrdoProfile::Enabled()) {
+      OrdoProfile::AddDuration("ldb.silo.precommit.lock",
+                               OrdoProfile::NowNs() - lock_start_ns);
+    }
+
     if (need_to_checkpoint) {
+      const uint64_t checkpoint_start_ns =
+          OrdoProfile::Enabled() ? OrdoProfile::NowNs() : 0;
       for (auto& snapshot : tx_ref_.write_set_ref_) {
         snapshot.index_cache->CopyLiveVersionToStableVersion();
+      }
+      if (OrdoProfile::Enabled()) {
+        OrdoProfile::AddDuration("ldb.silo.precommit.checkpoint_copy",
+                                 OrdoProfile::NowNs() - checkpoint_start_ns);
       }
     }
 
     /** Update Metadata for NWR **/
     if constexpr (EnableNWR) {
+      const uint64_t pivot_start_ns =
+          OrdoProfile::Enabled() ? OrdoProfile::NowNs() : 0;
       UpdatePivotObjects();
+      if (OrdoProfile::Enabled()) {
+        OrdoProfile::AddDuration("ldb.silo.precommit.update_pivot",
+                                 OrdoProfile::NowNs() - pivot_start_ns);
+      }
     }
 
     // CompilerFence();
+    const uint64_t epoch_start_ns =
+        OrdoProfile::Enabled() ? OrdoProfile::NowNs() : 0;
     tx_ref_.epoch_framework_ref_.MakeMeOffline();
     tx_ref_.epoch_framework_ref_.MakeMeOnline();
+    if (OrdoProfile::Enabled()) {
+      OrdoProfile::AddDuration("ldb.silo.precommit.epoch_refresh",
+                               OrdoProfile::NowNs() - epoch_start_ns);
+    }
     // CompilerFence();
 
     /** Validation Phase **/
+    const uint64_t validation_start_ns =
+        OrdoProfile::Enabled() ? OrdoProfile::NowNs() : 0;
     if (!AntiDependencyValidation()) {
+      if (OrdoProfile::Enabled()) {
+        OrdoProfile::AddDuration("ldb.silo.precommit.validate",
+                                 OrdoProfile::NowNs() - validation_start_ns);
+      }
       // if validation failed, unlock all objects
+      const uint64_t unlock_start_ns =
+          OrdoProfile::Enabled() ? OrdoProfile::NowNs() : 0;
       for (auto& snapshot : tx_ref_.write_set_ref_) {
         auto current = snapshot.index_cache->transaction_id.load();
         current.tid--;
         snapshot.index_cache->transaction_id.store(current);
       }
+      if (OrdoProfile::Enabled()) {
+        OrdoProfile::AddDuration("ldb.silo.precommit.unlock_on_abort",
+                                 OrdoProfile::NowNs() - unlock_start_ns);
+        OrdoProfile::AddDuration("ldb.silo.precommit.total",
+                                 OrdoProfile::NowNs() - precommit_start_ns);
+      }
       return false;
+    }
+    if (OrdoProfile::Enabled()) {
+      OrdoProfile::AddDuration("ldb.silo.precommit.validate",
+                               OrdoProfile::NowNs() - validation_start_ns);
     }
 
     /** Buffer Update **/
+    const uint64_t update_start_ns =
+        OrdoProfile::Enabled() ? OrdoProfile::NowNs() : 0;
     for (auto& snapshot : tx_ref_.write_set_ref_) {
       *snapshot.index_cache = snapshot.data_item_copy;
+    }
+    if (OrdoProfile::Enabled()) {
+      OrdoProfile::AddDuration("ldb.silo.precommit.buffer_update",
+                               OrdoProfile::NowNs() - update_start_ns);
+      OrdoProfile::AddDuration("ldb.silo.precommit.total",
+                               OrdoProfile::NowNs() - precommit_start_ns);
     }
 
     return true;
@@ -213,6 +351,14 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
         return false;
       }
     }
+    // Also validate scan entries (tracked separately from validation_set_)
+    for (auto& entry : tx_ref_.scan_validation_ref_) {
+      auto* item = entry.index_cache;
+      auto tx_id = item->transaction_id.load();
+      if (tx_id != entry.tid) {
+        return false;
+      }
+    }
     return true;
   }
 
@@ -249,6 +395,15 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
                                                  PivotObjectSnapshot::READSET};
         pivot_object_snapshots_.emplace_back(pv_snapshot);
       }
+      // from scan_validation (lightweight scan entries)
+      for (auto& entry : tx_ref_.scan_validation_ref_) {
+        auto* value_ptr = entry.index_cache;
+        assert(value_ptr != nullptr);
+        const auto pivot_object = value_ptr->pivot_object.load();
+        const PivotObjectSnapshot pv_snapshot = {value_ptr, pivot_object,
+                                                 PivotObjectSnapshot::READSET};
+        pivot_object_snapshots_.emplace_back(pv_snapshot);
+      }
     }
 
     // We now validate Linearizability.
@@ -276,7 +431,7 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
     my_pivot_object_.versions.epoch = current_epoch;
     {  // make t_j's squashed read/write set
 
-      // MergedRS
+      // MergedRS (point reads)
       for (auto& snapshot : tx_ref_.read_set_ref_) {
         const auto value_ptr = snapshot.index_cache;
         auto tid = snapshot.data_item_copy.transaction_id.load();
@@ -290,6 +445,16 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
         // representation.
         if (tid.epoch == current_epoch) {
           my_pivot_object_.msets.rset.PutHigherside(value_ptr, tid.tid);
+        } else {
+          my_pivot_object_.msets.rset.PutHigherside(value_ptr, 1);
+        }
+      }
+      // MergedRS (scan entries — lightweight, TID already non-atomic)
+      for (auto& entry : tx_ref_.scan_validation_ref_) {
+        const auto value_ptr = entry.index_cache;
+        assert(value_ptr != nullptr);
+        if (entry.tid.epoch == current_epoch) {
+          my_pivot_object_.msets.rset.PutHigherside(value_ptr, entry.tid.tid);
         } else {
           my_pivot_object_.msets.rset.PutHigherside(value_ptr, 1);
         }
@@ -424,13 +589,23 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
     my_pivot_object_.versions.epoch = current_epoch;
     {  // make t_j's squashed read/write set
 
-      // MergedRS
+      // MergedRS (point reads)
       for (auto& snapshot : tx_ref_.read_set_ref_) {
         const auto* value_ptr = snapshot.index_cache;
         auto tid = snapshot.data_item_copy.transaction_id.load();
         assert(value_ptr != nullptr);
         if (tid.epoch == current_epoch) {
           my_pivot_object_.msets.rset.PutLowerside(value_ptr, tid.tid);
+        } else {
+          my_pivot_object_.msets.rset.PutLowerside(value_ptr, 1);
+        }
+      }
+      // MergedRS (scan entries)
+      for (auto& entry : tx_ref_.scan_validation_ref_) {
+        const auto* value_ptr = entry.index_cache;
+        assert(value_ptr != nullptr);
+        if (entry.tid.epoch == current_epoch) {
+          my_pivot_object_.msets.rset.PutLowerside(value_ptr, entry.tid.tid);
         } else {
           my_pivot_object_.msets.rset.PutLowerside(value_ptr, 1);
         }
