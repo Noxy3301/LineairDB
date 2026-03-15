@@ -96,6 +96,29 @@ struct DataItem {
     return *this;
   }
 
+  DataItem(DataItem&& rhs) noexcept
+      : transaction_id(rhs.transaction_id.load()),
+        initialized(rhs.initialized),
+        buffer(std::move(rhs.buffer)),
+        primary_keys(std::move(rhs.primary_keys)),
+        checkpoint_primary_keys(std::move(rhs.checkpoint_primary_keys)),
+        checkpoint_primary_keys_captured(rhs.checkpoint_primary_keys_captured),
+        checkpoint_buffer(std::move(rhs.checkpoint_buffer)),
+        pivot_object(rhs.pivot_object.load()),
+        readers_writers_lock() {}
+
+  DataItem& operator=(DataItem&& rhs) noexcept {
+    transaction_id.store(rhs.transaction_id.load());
+    initialized = rhs.initialized;
+    buffer = std::move(rhs.buffer);
+    primary_keys = std::move(rhs.primary_keys);
+    checkpoint_primary_keys = std::move(rhs.checkpoint_primary_keys);
+    checkpoint_primary_keys_captured = rhs.checkpoint_primary_keys_captured;
+    checkpoint_buffer = std::move(rhs.checkpoint_buffer);
+    pivot_object.store(rhs.pivot_object.load());
+    return *this;
+  }
+
   void Reset(const std::byte* v, const size_t s, TransactionId tid = 0) {
     buffer.Reset(v, s);
     if (!tid.IsEmpty()) transaction_id.store(tid);
