@@ -69,6 +69,16 @@ class TwoPhaseLockingImpl final : public ConcurrencyControlBase {
 
     return snapshot_item;
   };
+
+  // STUB: Falls back to full Read().
+  std::pair<const std::byte*, size_t> ReadDirect(
+      const std::string_view, DataItem* index_leaf,
+      TransactionId& out_tid) final override {
+    auto item = Read("", index_leaf);
+    out_tid = item.transaction_id.load();
+    return {item.buffer.value, item.buffer.size};
+  };
+
   void Write(const std::string_view key, const std::byte* const value,
              const size_t size, DataItem* index_leaf) final override {
     assert(index_leaf != nullptr);

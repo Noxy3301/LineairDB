@@ -83,6 +83,38 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
       }
     }
   };
+  // See concurrency_control_base.h for why ReadDirect exists (Scan perf).
+  // TID double-check protocol ensures the returned pointer is consistent.
+  std::pair<const std::byte*, size_t> ReadDirect(
+      const std::string_view, DataItem* index_leaf,
+      TransactionId& out_tid) final override {
+    assert(index_leaf != nullptr);
+
+    for (;;) {
+      // Step 1: Load TID. Writers set the lock bit (LSB) before modifying data.
+      auto tx_id = index_leaf->transaction_id.load();
+
+      // Step 2: If lock bit is set, a writer holds this record. Spin until released.
+      if (tx_id.tid & 1u) {
+        std::this_thread::yield();
+        continue;
+      }
+
+      // Step 3: Read value pointer + size from DataItem buffer (no memcpy).
+      const std::byte* val = index_leaf->buffer.value;
+      size_t sz = index_leaf->buffer.size;
+
+      // Step 4: Re-check TID. If unchanged, no concurrent writer modified the
+      // data between Step 1 and Step 3, so the pointer is safe to return.
+      if (index_leaf->transaction_id.load() == tx_id) {
+        validation_set_.push_back({index_leaf, tx_id});
+        out_tid = tx_id;
+        return {val, sz};
+      }
+      // TID changed → a writer intervened. Retry from Step 1.
+    }
+  };
+
   void Write(const std::string_view, const std::byte* const, const size_t,
              DataItem*) final override{};
   void Abort() final override{};

@@ -39,6 +39,13 @@ class ConcurrencyControlBase {
   ConcurrencyControlBase(TransactionReferences&& tx) : tx_ref_(tx) {}
   virtual ~ConcurrencyControlBase(){};
   virtual const DataItem Read(std::string_view, DataItem*) = 0;
+  // Zero-copy read for Scan. Returns pointer + size, no DataItem copy.
+  // Scan only forwards raw bytes and never inspects DataItem internals
+  // (e.g. primary_keys), so the pointer is sufficient.
+  // Use Read() when the full DataItem structure is needed.
+  virtual std::pair<const std::byte*, size_t> ReadDirect(
+      std::string_view key, DataItem* index_leaf,
+      TransactionId& out_tid) = 0;
   virtual void Write(const std::string_view key, const std::byte* const value,
                      const size_t size, DataItem*) = 0;
   virtual void Abort() = 0;
