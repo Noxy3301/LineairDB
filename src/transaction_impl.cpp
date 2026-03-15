@@ -463,17 +463,18 @@ const std::optional<size_t> Transaction::Impl::Scan(
       break;
     }
 
-    // If not in write_set, invoke Transaction#Read to get the value
+    // If not in write_set, use ReadDirect (zero-copy) instead of Read.
+    // This avoids creating a full Snapshot (288B) per scan entry.
+    // Only {DataItem*, TID} is stored in scan_set_ for validation tracking.
     if (!found_in_write_set) {
-      const auto read_result = Read(key);
-      // The pair "nullptr, 0" means deleted (or uninitialized) data. See
-      // include/lineairdb/transaction.h
-      const bool is_uninitialized =
-          read_result.first == nullptr && read_result.second == 0;
+      auto* index_leaf = current_table_->GetPrimaryIndex().GetOrInsert(key);
+      TransactionId scan_tid;
+      auto [ptr, sz] = concurrency_control_->ReadDirect(key, index_leaf, scan_tid);
+      if (IsAborted()) return std::nullopt;
 
-      // If the data item exists, continue scanning with the data
-      if (!is_uninitialized) {
-        bool stop_scan = operation(key, read_result);
+      if (ptr != nullptr && sz != 0) {
+        scan_set_.push_back({index_leaf, scan_tid});
+        bool stop_scan = operation(key, {ptr, sz});
         total_count++;
         if (stop_scan) return total_count;
       }
@@ -554,12 +555,14 @@ const std::optional<size_t> Transaction::Impl::ScanReverse(
     }
 
     if (!found_in_write_set) {
-      const auto read_result = Read(key);
-      const bool is_uninitialized =
-          read_result.first == nullptr && read_result.second == 0;
+      auto* index_leaf = current_table_->GetPrimaryIndex().GetOrInsert(key);
+      TransactionId scan_tid;
+      auto [ptr, sz] = concurrency_control_->ReadDirect(key, index_leaf, scan_tid);
+      if (IsAborted()) return std::nullopt;
 
-      if (!is_uninitialized) {
-        bool stop_scan = operation(key, read_result);
+      if (ptr != nullptr && sz != 0) {
+        scan_set_.push_back({index_leaf, scan_tid});
+        bool stop_scan = operation(key, {ptr, sz});
         total_count++;
         if (stop_scan) return total_count;
       }
