@@ -406,11 +406,14 @@ const std::optional<size_t> Transaction::Impl::Scan(
   // deleted or does not exist. SQL NULL values should be handled within the
   // byte array value, not by nullptr.
 
-  // Step 1: Collect keys from index
-  std::set<std::string> index_keys;
+  // Step 1: Collect keys from index.
+  // Keys come out sorted from PrecisionLocking's std::map, so we use a vector
+  // instead of std::set to avoid per-key heap allocations.
+  std::vector<std::string> index_keys;
+  index_keys.reserve(4096);
   auto index_result = current_table_->GetPrimaryIndex().Scan(
       begin, end, [&](std::string_view key) {
-        index_keys.insert(std::string(key));
+        index_keys.emplace_back(key);
         return false;  // Continue to collect all keys
       });
 
@@ -420,19 +423,27 @@ const std::optional<size_t> Transaction::Impl::Scan(
   }
 
   // Step 2: Collect keys from write_set
-  std::set<std::string> write_set_keys;
+  std::vector<std::string> write_set_keys;
   for (const auto& snapshot : write_set_) {
     if (snapshot.table_name != current_table_->GetTableName()) continue;
     if (!snapshot.index_name.empty()) continue;  // base-table scan only
     if (snapshot.key < begin) continue;
     if (end.has_value() && snapshot.key > end.value()) continue;
-    write_set_keys.insert(snapshot.key);
+    write_set_keys.emplace_back(snapshot.key);
   }
+  std::sort(write_set_keys.begin(), write_set_keys.end());  // std::merge requires sorted inputs
 
-  // Step 3: Merge and sort all keys (std::set automatically keeps them sorted)
-  std::set<std::string> all_keys;
-  all_keys.insert(index_keys.begin(), index_keys.end());
-  all_keys.insert(write_set_keys.begin(), write_set_keys.end());
+  // Step 3: Merge sorted index_keys and write_set_keys
+  std::vector<std::string> all_keys;
+  all_keys.reserve(index_keys.size() + write_set_keys.size());
+  std::merge(index_keys.begin(), index_keys.end(),
+             write_set_keys.begin(), write_set_keys.end(),
+             std::back_inserter(all_keys));
+  // Deduplicate: index_keys and write_set_keys may overlap (std::set handled this implicitly)
+  all_keys.erase(std::unique(all_keys.begin(), all_keys.end()), all_keys.end());
+
+  // Reserve scan_set_ capacity to avoid per-entry reallocation
+  scan_set_.reserve(scan_set_.size() + all_keys.size());
 
   // Step 4: Process keys in sorted order
   size_t total_count = 0;
@@ -499,11 +510,12 @@ const std::optional<size_t> Transaction::Impl::ScanReverse(
   // deleted or does not exist. SQL NULL values should be handled within the
   // byte array value, not by nullptr.
 
-  // Step 1: Collect keys from index
-  std::set<std::string> index_keys;
+  // Step 1: Collect keys from index (reverse order from PL's map)
+  std::vector<std::string> index_keys;
+  index_keys.reserve(4096);
   auto index_result = current_table_->GetPrimaryIndex().ScanReverse(
       begin, end, [&](std::string_view key) {
-        index_keys.insert(std::string(key));
+        index_keys.emplace_back(key);
         return false;  // Continue to collect all keys
       });
 
@@ -513,19 +525,25 @@ const std::optional<size_t> Transaction::Impl::ScanReverse(
   }
 
   // Step 2: Collect keys from write_set
-  std::set<std::string> write_set_keys;
+  std::vector<std::string> write_set_keys;
   for (const auto& snapshot : write_set_) {
     if (snapshot.table_name != current_table_->GetTableName()) continue;
     if (!snapshot.index_name.empty()) continue;  // base-table scan only
     if (snapshot.key < begin) continue;
     if (end.has_value() && snapshot.key > end.value()) continue;
-    write_set_keys.insert(snapshot.key);
+    write_set_keys.emplace_back(snapshot.key);
   }
+  std::sort(write_set_keys.begin(), write_set_keys.end());  // std::merge requires sorted inputs
 
-  // Step 3: Merge and sort all keys (std::set automatically keeps them sorted)
-  std::set<std::string> all_keys;
-  all_keys.insert(index_keys.begin(), index_keys.end());
-  all_keys.insert(write_set_keys.begin(), write_set_keys.end());
+  // Step 3: Merge sorted keys (index_keys are in reverse order, so reverse first)
+  std::reverse(index_keys.begin(), index_keys.end());
+  std::vector<std::string> all_keys;
+  all_keys.reserve(index_keys.size() + write_set_keys.size());
+  std::merge(index_keys.begin(), index_keys.end(),
+             write_set_keys.begin(), write_set_keys.end(),
+             std::back_inserter(all_keys));
+  // Deduplicate: index_keys and write_set_keys may overlap (std::set handled this implicitly)
+  all_keys.erase(std::unique(all_keys.begin(), all_keys.end()), all_keys.end());
 
   // Step 4: Process keys in reverse order
   size_t total_count = 0;
