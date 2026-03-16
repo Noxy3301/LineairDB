@@ -43,7 +43,7 @@ PrecisionLockingIndex::PrecisionLockingIndex(LineairDB::EpochFramework& e)
             {
               // Clear predicate list
               auto it = predicate_list_.begin();
-              if (it->first <= stable_epoch) {
+              if (it != predicate_list_.end() && it->first <= stable_epoch) {
                 const auto beg = it;
                 while (it != predicate_list_.end() &&
                        it->first <= stable_epoch) {
@@ -55,7 +55,7 @@ PrecisionLockingIndex::PrecisionLockingIndex(LineairDB::EpochFramework& e)
             {
               // Clear insert_or_delete_keys
               auto it = insert_or_delete_key_set_.begin();
-              if (it->first <= stable_epoch) {
+              if (it != insert_or_delete_key_set_.end() && it->first <= stable_epoch) {
                 const auto beg = it;
                 while (it != insert_or_delete_key_set_.end() &&
                        it->first <= stable_epoch) {
