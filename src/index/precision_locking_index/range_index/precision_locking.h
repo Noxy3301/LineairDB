@@ -100,7 +100,7 @@ class PrecisionLockingIndex {
 
   PredicateList predicate_list_;
   std::shared_mutex plock_;
-  std::mutex predicate_append_lock_;
+  std::atomic_flag predicate_append_spinlock_ = ATOMIC_FLAG_INIT;
   InsertOrDeleteKeySet insert_or_delete_key_set_;
   std::shared_mutex ulock_;
   ROWEXRangeIndexContainer container_;

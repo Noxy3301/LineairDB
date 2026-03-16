@@ -121,9 +121,12 @@ std::optional<size_t> PrecisionLockingIndex::Scan(
   const auto epoch = epoch_manager_ref_.GetMyThreadLocalEpoch();
 
   {
-    std::lock_guard<std::mutex> append_guard(predicate_append_lock_);
+    while (predicate_append_spinlock_.test_and_set(std::memory_order_acquire)) {
+      // Spin — critical section is very short (one emplace_back)
+    }
     predicate_list_[epoch].emplace_back(b, e);
     predicate_list_[epoch].back().tx_context = GetCurrentTransactionContext();
+    predicate_append_spinlock_.clear(std::memory_order_release);
   }
 
   return hit;
@@ -164,9 +167,12 @@ std::optional<size_t> PrecisionLockingIndex::ScanReverse(
   const auto epoch = epoch_manager_ref_.GetMyThreadLocalEpoch();
 
   {
-    std::lock_guard<std::mutex> append_guard(predicate_append_lock_);
+    while (predicate_append_spinlock_.test_and_set(std::memory_order_acquire)) {
+      // Spin — critical section is very short (one emplace_back)
+    }
     predicate_list_[epoch].emplace_back(b, e);
     predicate_list_[epoch].back().tx_context = GetCurrentTransactionContext();
+    predicate_append_spinlock_.clear(std::memory_order_release);
   }
 
   return hit;
