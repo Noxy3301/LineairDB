@@ -82,14 +82,6 @@ struct Snapshot {
 using ReadSetType = std::vector<Snapshot>;
 using WriteSetType = std::vector<Snapshot>;
 
-// Lightweight entry for scan results: only DataItem* + TID for validation.
-// No value copy — Scan results are consumed immediately by the RPC callback.
-struct ScanEntry {
-  DataItem* index_cache;
-  TransactionId tid;
-};
-using ScanSetType = std::vector<ScanEntry>;
-
 }  // namespace LineairDB
 
 #endif /* LINEAIRDB_SNAPSHOT_HPP */

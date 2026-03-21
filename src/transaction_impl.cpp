@@ -442,16 +442,12 @@ const std::optional<size_t> Transaction::Impl::Scan(
   // Deduplicate: index_keys and write_set_keys may overlap (std::set handled this implicitly)
   all_keys.erase(std::unique(all_keys.begin(), all_keys.end()), all_keys.end());
 
-  // Reserve scan_set_ capacity to avoid per-entry reallocation
-  scan_set_.reserve(scan_set_.size() + all_keys.size());
-
   // Step 4: Process keys in sorted order
   size_t total_count = 0;
   for (const auto& key : all_keys) {
     if (IsAborted()) return std::nullopt;
 
-    // Check if key is in write_set
-    // if the key exists, use write_set data (without Transaction#Read)
+    // Check write_set first (RYOW: return locally buffered writes)
     bool found_in_write_set = false;
     for (const auto& snapshot : write_set_) {
       if (snapshot.table_name != current_table_->GetTableName()) continue;
@@ -460,7 +456,7 @@ const std::optional<size_t> Transaction::Impl::Scan(
 
       found_in_write_set = true;
 
-      // If the key is deleted within this transaction, break the loop
+      // If the key is deleted within this transaction, skip it
       if (!snapshot.data_item_copy.IsInitialized()) {
         break;
       }
@@ -474,17 +470,36 @@ const std::optional<size_t> Transaction::Impl::Scan(
       break;
     }
 
-    // If not in write_set, use ReadDirect (zero-copy) instead of Read.
-    // This avoids creating a full Snapshot (288B) per scan entry.
-    // Only {DataItem*, TID} is stored in scan_set_ for validation tracking.
     if (!found_in_write_set) {
+      // Check read_set_ to avoid duplicate validation_set_ registration.
+      // Read() already registered this key in validation_set_ via CC::Read();
+      // calling ReadDirect again would create a duplicate entry.
+      std::string lookup_key =
+          current_table_->GetTableName() + std::string(1, '\0') +
+          std::string(key);
+      auto rit = read_set_index_.find(lookup_key);
+      if (rit != read_set_index_.end()) {
+        auto& snapshot = read_set_[rit->second];
+        if (snapshot.data_item_copy.IsInitialized()) {
+          std::pair<const void*, const size_t> value_pair = {
+              snapshot.data_item_copy.value(),
+              snapshot.data_item_copy.size()};
+          bool stop_scan = operation(key, value_pair);
+          total_count++;
+          if (stop_scan) return total_count;
+        }
+        continue;
+      }
+
+      // Not in write_set or read_set: use ReadDirect (zero-copy).
+      // This avoids creating a full Snapshot (288B) per scan entry.
+      // Validation is tracked via CC's validation_set_ inside ReadDirect.
       auto* index_leaf = current_table_->GetPrimaryIndex().GetOrInsert(key);
       TransactionId scan_tid;
       auto [ptr, sz] = concurrency_control_->ReadDirect(key, index_leaf, scan_tid);
       if (IsAborted()) return std::nullopt;
 
       if (ptr != nullptr && sz != 0) {
-        scan_set_.push_back({index_leaf, scan_tid});
         bool stop_scan = operation(key, {ptr, sz});
         total_count++;
         if (stop_scan) return total_count;
@@ -573,13 +588,30 @@ const std::optional<size_t> Transaction::Impl::ScanReverse(
     }
 
     if (!found_in_write_set) {
+      // Check read_set_ to avoid duplicate validation_set_ registration.
+      std::string lookup_key =
+          current_table_->GetTableName() + std::string(1, '\0') +
+          std::string(key);
+      auto rit = read_set_index_.find(lookup_key);
+      if (rit != read_set_index_.end()) {
+        auto& snapshot = read_set_[rit->second];
+        if (snapshot.data_item_copy.IsInitialized()) {
+          std::pair<const void*, const size_t> value_pair = {
+              snapshot.data_item_copy.value(),
+              snapshot.data_item_copy.size()};
+          bool stop_scan = operation(key, value_pair);
+          total_count++;
+          if (stop_scan) return total_count;
+        }
+        continue;
+      }
+
       auto* index_leaf = current_table_->GetPrimaryIndex().GetOrInsert(key);
       TransactionId scan_tid;
       auto [ptr, sz] = concurrency_control_->ReadDirect(key, index_leaf, scan_tid);
       if (IsAborted()) return std::nullopt;
 
       if (ptr != nullptr && sz != 0) {
-        scan_set_.push_back({index_leaf, scan_tid});
         bool stop_scan = operation(key, {ptr, sz});
         total_count++;
         if (stop_scan) return total_count;

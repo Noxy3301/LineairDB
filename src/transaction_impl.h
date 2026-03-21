@@ -139,11 +139,6 @@ class Transaction::Impl {
 
   ReadSetType read_set_;
   WriteSetType write_set_;
-  // Lightweight entries for Scan results: {DataItem*, TID} only.
-  // Scan rows are consumed immediately by the RPC callback and don't need
-  // the full Snapshot (288B). Validation is handled by CC's validation_set_.
-  ScanSetType scan_set_;
-
   // Hash map index for O(1) lookup in read_set_ and write_set_.
   // Key: "table_name\0key", Value: index into respective vector.
   std::unordered_map<std::string, size_t> read_set_index_;
