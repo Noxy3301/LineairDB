@@ -85,6 +85,20 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
   };
   // See concurrency_control_base.h for why ReadDirect exists (Scan perf).
   // TID double-check protocol ensures the returned pointer is consistent.
+  //
+  // FIXME: ReadDirect is a Scan-specific lightweight path that registers
+  // into validation_set_ without creating a Snapshot in read_set_. This
+  // works for research purposes but breaks LineairDB's CC-switchable
+  // design, as validation_set_ is Silo-specific internal state.
+  //
+  // The root issue is Snapshot cost: 384B + heap-copied row data per entry.
+  // Under scan-heavy workloads, this doesn't scale: memory allocation cost
+  // grows with client count and scan size, eventually causing OOM.
+  //
+  // Possible directions:
+  // - Scan-mode Snapshot that skips data_item_copy (validation-only)
+  // - Thread-local pooled allocator for Snapshot / DataBuffer
+  // - Decouple validation tracking from read_set_ at the CC interface level
   std::pair<const std::byte*, size_t> ReadDirect(
       const std::string_view, DataItem* index_leaf,
       TransactionId& out_tid) final override {
