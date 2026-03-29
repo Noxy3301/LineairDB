@@ -23,7 +23,6 @@
 #include <functional>
 #include <map>
 #include <optional>
-#include <mutex>
 #include <shared_mutex>
 #include <string_view>
 
@@ -48,6 +47,12 @@ namespace Index {
  * be applied as a batch by the special thread. If a transaction detects that
  * the addition of an element to L_u satisfies with some predicate in L_p, or
  * vice versa, we will fail the transaction because a phantom may exist.
+ *
+ * Register-then-Check pattern: Both Scan and Insert/Delete register their
+ * entries FIRST, then check the other's list. A seq_cst fence between
+ * registration and check ensures that at least one side detects a conflict.
+ * This eliminates the need for an exclusive lock (plock_) that previously
+ * serialized Insert vs Scan.
  *
  * @ref [1] https://dl.acm.org/doi/pdf/10.1145/582318.582340
  *
@@ -98,12 +103,19 @@ class PrecisionLockingIndex {
       std::map<EpochNumber, std::vector<InsertOrDeleteEvent>>;
   using ROWEXRangeIndexContainer = std::map<std::string, IndexItem>;
 
+  // --- Predicate set (L_p) ---
   PredicateList predicate_list_;
-  std::shared_mutex plock_;
-  std::atomic_flag predicate_append_spinlock_ = ATOMIC_FLAG_INIT;
+  std::shared_mutex predicate_lock_;  // guards predicate_list_
+
+  // --- Insert/Delete key set (L_u) ---
   InsertOrDeleteKeySet insert_or_delete_key_set_;
-  std::shared_mutex ulock_;
+  std::shared_mutex update_lock_;     // guards insert_or_delete_key_set_
+
+  // --- Range index container: sorted key set for Scan/ScanReverse ---
   ROWEXRangeIndexContainer container_;
+  std::shared_mutex container_lock_;  // guards container_
+
+  // --- Epoch & lifecycle ---
   EpochFramework& epoch_manager_ref_;
   std::atomic<bool> manager_stop_flag_;
   std::atomic<EpochNumber> last_processed_epoch_{0};

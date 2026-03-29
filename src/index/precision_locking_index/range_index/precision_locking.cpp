@@ -37,46 +37,54 @@ PrecisionLockingIndex::PrecisionLockingIndex(LineairDB::EpochFramework& e)
           const auto global = epoch_manager_ref_.GetGlobalEpoch();
           const auto stable_epoch = global - 2;
 
+          // Clear predicate list
           {
-            std::lock_guard<decltype(plock_)> p_guard(plock_);
-            std::lock_guard<decltype(ulock_)> u_guard(ulock_);
-            {
-              // Clear predicate list
-              auto it = predicate_list_.begin();
-              if (it != predicate_list_.end() && it->first <= stable_epoch) {
-                const auto beg = it;
-                while (it != predicate_list_.end() &&
-                       it->first <= stable_epoch) {
-                  it++;
-                }
-                predicate_list_.erase(beg, it);
+            std::lock_guard<std::shared_mutex> p_guard(predicate_lock_);
+            auto it = predicate_list_.begin();
+            if (it != predicate_list_.end() && it->first <= stable_epoch) {
+              const auto beg = it;
+              while (it != predicate_list_.end() &&
+                     it->first <= stable_epoch) {
+                it++;
               }
+              predicate_list_.erase(beg, it);
             }
-            {
-              // Clear insert_or_delete_keys
-              auto it = insert_or_delete_key_set_.begin();
-              if (it != insert_or_delete_key_set_.end() && it->first <= stable_epoch) {
-                const auto beg = it;
-                while (it != insert_or_delete_key_set_.end() &&
-                       it->first <= stable_epoch) {
-                  it++;
-                }
-                const auto end = it;
-
-                // Before deleting the set of insert_or_delete_keys, we update
-                // the index container to apply such outdated (already
-                // committed) insertions and deletions.
-                for (it = beg; it != end; it++) {
-                  for (const auto& event : it->second) {
-                    container_[event.key].is_deleted = event.is_delete_event;
-                  }
-                }
-                insert_or_delete_key_set_.erase(beg, end);
-                last_processed_epoch_.store(stable_epoch,
-                                            std::memory_order_release);
+          }
+          // Clear insert_or_delete_keys and update container.
+          // 3-phase staging (copy -> apply -> erase): entries must remain
+          // in insert_or_delete_key_set_ until container_ is updated,
+          // otherwise Scan could miss a conflict and read stale data (phantom anomaly).
+          std::vector<InsertOrDeleteEvent> ready;
+          {
+            // Phase 1: copy events (entries stay in map for Scan visibility)
+            std::shared_lock<std::shared_mutex> u_guard(update_lock_);
+            auto end_it = insert_or_delete_key_set_.upper_bound(stable_epoch);
+            for (auto it = insert_or_delete_key_set_.begin(); it != end_it; ++it) {
+              for (const auto& event : it->second) {
+                ready.push_back(event);
               }
             }
           }
+          if (!ready.empty()) {
+            // Phase 2: apply to container.
+            // Before deleting the set of insert_or_delete_keys, we update
+            // the index container to apply such outdated (already
+            // committed) insertions and deletions.
+            {
+              std::lock_guard<std::shared_mutex> c_guard(container_lock_);
+              for (const auto& event : ready) {
+                container_[event.key].is_deleted = event.is_delete_event;
+              }
+            }
+            // Phase 3: erase from map
+            {
+              std::lock_guard<std::shared_mutex> u_guard(update_lock_);
+              auto end_it = insert_or_delete_key_set_.upper_bound(stable_epoch);
+              insert_or_delete_key_set_.erase(insert_or_delete_key_set_.begin(), end_it);
+            }
+          }
+          last_processed_epoch_.store(stable_epoch,
+                                      std::memory_order_release);
           // Sleep to avoid busy-wait; GC only needs to run once per epoch
           // FIXME: replace sleep loop with condition_variable notified on
           //        epoch advancement for responsive, adaptive GC timing.
@@ -100,13 +108,43 @@ std::optional<size_t> PrecisionLockingIndex::Scan(
     if (end < begin) return std::nullopt;
   }
 
-  std::shared_lock<decltype(plock_)> p_guard(plock_);
-  std::shared_lock<decltype(ulock_)> u_guard(ulock_);
-  if (IsOverlapWithInsertOrDelete(b, e)) {
+  const auto epoch = epoch_manager_ref_.GetMyThreadLocalEpoch();
+  void* ctx = GetCurrentTransactionContext();
+
+  // Register-then-Check: register predicate FIRST, then check for conflicts.
+  {
+    std::lock_guard<std::shared_mutex> p_guard(predicate_lock_);
+    predicate_list_[epoch].emplace_back(b, e);
+    predicate_list_[epoch].back().tx_context = ctx;
+  }
+
+  // seq_cst fence: ensure our predicate registration is visible to all threads
+  // before we check insert_or_delete_key_set_ (protected by a different mutex).
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+
+  // Check for conflicting inserts (release update_lock_ before rollback)
+  bool conflict = false;
+  {
+    std::shared_lock<std::shared_mutex> u_guard(update_lock_);
+    conflict = IsOverlapWithInsertOrDelete(b, e);
+  }
+
+  if (conflict) {
+    // Rollback: remove the predicate we just registered (no other lock held)
+    std::lock_guard<std::shared_mutex> p_guard(predicate_lock_);
+    auto& vec = predicate_list_[epoch];
+    for (auto it = vec.rbegin(); it != vec.rend(); ++it) {
+      if (it->tx_context == ctx && it->begin == std::string(b) && it->end == e) {
+        vec.erase(std::next(it).base());
+        break;
+      }
+    }
     return std::nullopt;
   }
 
+  // Container traversal
   {
+    std::shared_lock<std::shared_mutex> c_guard(container_lock_);
     auto it = container_.lower_bound(begin);
     auto it_end = container_.end();
     if (e.has_value()) {
@@ -118,17 +156,6 @@ std::optional<size_t> PrecisionLockingIndex::Scan(
       auto cancel = operation(it->first);
       if (cancel) break;
     }
-  }
-
-  const auto epoch = epoch_manager_ref_.GetMyThreadLocalEpoch();
-
-  {
-    while (predicate_append_spinlock_.test_and_set(std::memory_order_acquire)) {
-      // Spin — critical section is very short (one emplace_back)
-    }
-    predicate_list_[epoch].emplace_back(b, e);
-    predicate_list_[epoch].back().tx_context = GetCurrentTransactionContext();
-    predicate_append_spinlock_.clear(std::memory_order_release);
   }
 
   return hit;
@@ -145,13 +172,43 @@ std::optional<size_t> PrecisionLockingIndex::ScanReverse(
     if (end < begin) return std::nullopt;
   }
 
-  std::shared_lock<decltype(plock_)> p_guard(plock_);
-  std::shared_lock<decltype(ulock_)> u_guard(ulock_);
-  if (IsOverlapWithInsertOrDelete(b, e)) {
+  const auto epoch = epoch_manager_ref_.GetMyThreadLocalEpoch();
+  void* ctx = GetCurrentTransactionContext();
+
+  // Register-then-Check: register predicate FIRST, then check for conflicts.
+  {
+    std::lock_guard<std::shared_mutex> p_guard(predicate_lock_);
+    predicate_list_[epoch].emplace_back(b, e);
+    predicate_list_[epoch].back().tx_context = ctx;
+  }
+
+  // seq_cst fence: ensure our predicate registration is visible to all threads
+  // before we check insert_or_delete_key_set_ (protected by a different mutex).
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+
+  // Check for conflicting inserts (release update_lock_ before rollback)
+  bool conflict = false;
+  {
+    std::shared_lock<std::shared_mutex> u_guard(update_lock_);
+    conflict = IsOverlapWithInsertOrDelete(b, e);
+  }
+
+  if (conflict) {
+    // Rollback: remove the predicate we just registered (no other lock held)
+    std::lock_guard<std::shared_mutex> p_guard(predicate_lock_);
+    auto& vec = predicate_list_[epoch];
+    for (auto it = vec.rbegin(); it != vec.rend(); ++it) {
+      if (it->tx_context == ctx && it->begin == std::string(b) && it->end == e) {
+        vec.erase(std::next(it).base());
+        break;
+      }
+    }
     return std::nullopt;
   }
 
+  // Container traversal
   {
+    std::shared_lock<std::shared_mutex> c_guard(container_lock_);
     auto it = container_.end();
     auto it_end = container_.lower_bound(begin);
     if (e.has_value()) {
@@ -166,59 +223,91 @@ std::optional<size_t> PrecisionLockingIndex::ScanReverse(
     }
   }
 
-  const auto epoch = epoch_manager_ref_.GetMyThreadLocalEpoch();
-
-  {
-    while (predicate_append_spinlock_.test_and_set(std::memory_order_acquire)) {
-      // Spin — critical section is very short (one emplace_back)
-    }
-    predicate_list_[epoch].emplace_back(b, e);
-    predicate_list_[epoch].back().tx_context = GetCurrentTransactionContext();
-    predicate_append_spinlock_.clear(std::memory_order_release);
-  }
-
   return hit;
 };
 
 bool PrecisionLockingIndex::Insert(const std::string_view key) {
-  std::lock_guard<decltype(plock_)> p_guard(plock_);
-  if (IsInPredicateSet(key)) {
-    return false;
+  const auto epoch = epoch_manager_ref_.GetMyThreadLocalEpoch();
+  void* ctx = GetCurrentTransactionContext();
+
+  // Register-then-Check: register insert FIRST, then check predicates.
+  {
+    std::lock_guard<std::shared_mutex> u_guard(update_lock_);
+    insert_or_delete_key_set_[epoch].emplace_back(key, false);
+    insert_or_delete_key_set_[epoch].back().tx_context = ctx;
   }
 
-  const auto epoch = epoch_manager_ref_.GetMyThreadLocalEpoch();
-  std::lock_guard<decltype(ulock_)> u_guard(ulock_);
-  insert_or_delete_key_set_[epoch].emplace_back(key, false);
-  insert_or_delete_key_set_[epoch].back().tx_context =
-      GetCurrentTransactionContext();
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+
+  // Check predicates (release predicate_lock_ before rollback)
+  bool conflict = false;
+  {
+    std::shared_lock<std::shared_mutex> p_guard(predicate_lock_);
+    conflict = IsInPredicateSet(key);
+  }
+
+  if (conflict) {
+    // Rollback: remove the entry we just added (no other lock held)
+    std::lock_guard<std::shared_mutex> u_guard(update_lock_);
+    auto& vec = insert_or_delete_key_set_[epoch];
+    for (auto it = vec.rbegin(); it != vec.rend(); ++it) {
+      if (it->tx_context == ctx && it->key == key && !it->is_delete_event) {
+        vec.erase(std::next(it).base());
+        break;
+      }
+    }
+    return false;
+  }
 
   return true;
 };
 
 void PrecisionLockingIndex::ForceInsert(const std::string_view key) {
   const auto epoch = epoch_manager_ref_.GetMyThreadLocalEpoch();
-  std::lock_guard<decltype(ulock_)> u_guard(ulock_);
+  std::lock_guard<std::shared_mutex> u_guard(update_lock_);
   insert_or_delete_key_set_[epoch].emplace_back(key, false);
   insert_or_delete_key_set_[epoch].back().tx_context =
       GetCurrentTransactionContext();
 }
 
 bool PrecisionLockingIndex::Delete(const std::string_view key) {
-  std::lock_guard<decltype(plock_)> p_guard(plock_);
-  if (IsInPredicateSet(key)) {
+  const auto epoch = epoch_manager_ref_.GetMyThreadLocalEpoch();
+  void* ctx = GetCurrentTransactionContext();
+
+  // Register-then-Check: register delete FIRST, then check predicates.
+  {
+    std::lock_guard<std::shared_mutex> u_guard(update_lock_);
+    insert_or_delete_key_set_[epoch].emplace_back(key, true);
+    insert_or_delete_key_set_[epoch].back().tx_context = ctx;
+  }
+
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+
+  // Check predicates (release predicate_lock_ before rollback)
+  bool conflict = false;
+  {
+    std::shared_lock<std::shared_mutex> p_guard(predicate_lock_);
+    conflict = IsInPredicateSet(key);
+  }
+
+  if (conflict) {
+    // Rollback: remove the entry we just added (no other lock held)
+    std::lock_guard<std::shared_mutex> u_guard(update_lock_);
+    auto& vec = insert_or_delete_key_set_[epoch];
+    for (auto it = vec.rbegin(); it != vec.rend(); ++it) {
+      if (it->tx_context == ctx && it->key == key && it->is_delete_event) {
+        vec.erase(std::next(it).base());
+        break;
+      }
+    }
     return false;
   }
-  const auto epoch = epoch_manager_ref_.GetMyThreadLocalEpoch();
-  std::lock_guard<decltype(ulock_)> u_guard(ulock_);
-  insert_or_delete_key_set_[epoch].emplace_back(key, true);
-  insert_or_delete_key_set_[epoch].back().tx_context =
-      GetCurrentTransactionContext();
 
   return true;
 };
 
 bool PrecisionLockingIndex::Contains(const std::string_view key) {
-  std::shared_lock<decltype(ulock_)> u_guard(ulock_);
+  std::shared_lock<std::shared_mutex> c_guard(container_lock_);
   auto it = container_.find(std::string(key));
   if (it == container_.end()) return false;
   return !it->second.is_deleted;
