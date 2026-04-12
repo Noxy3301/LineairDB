@@ -161,7 +161,7 @@ class CPRManager {
                         const auto& primary_keys =
                             data_item.HasCheckpointPrimaryKeys()
                                 ? data_item.GetCheckpointPrimaryKeys()
-                                : data_item.primary_keys;
+                                : data_item.primary_keys();
                         if (primary_keys.empty()) {
                           data_item.ClearCheckpointPrimaryKeys();
                           data_item.ExclusiveUnlock();

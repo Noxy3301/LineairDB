@@ -333,7 +333,7 @@ class Database::Impl {
               "  Recovery: Secondary index '{0}' restored key '{1}' with {2} "
               "primary keys",
               recovery_set.index_name, recovery_set.key,
-              recovery_set.data_item_copy.primary_keys.size());
+              recovery_set.data_item_copy.primary_keys().size());
         } else {
           SPDLOG_ERROR(
               "Recovery failed: Could not create secondary index {0} for "

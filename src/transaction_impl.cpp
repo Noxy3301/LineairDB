@@ -142,8 +142,8 @@ Transaction::Impl::ReadSecondaryIndex(const std::string_view index_name,
         snapshot.table_name == current_table_->GetTableName() &&
         snapshot.index_name == index_name) {
       std::vector<std::pair<const std::byte* const, const size_t>> result;
-      if (!snapshot.data_item_copy.primary_keys.empty()) {
-        for (auto& primary_key : snapshot.data_item_copy.primary_keys) {
+      if (!snapshot.data_item_copy.primary_keys().empty()) {
+        for (auto& primary_key : snapshot.data_item_copy.primary_keys()) {
           result.emplace_back(
               reinterpret_cast<const std::byte*>(primary_key.data()),
               primary_key.size());
@@ -158,8 +158,8 @@ Transaction::Impl::ReadSecondaryIndex(const std::string_view index_name,
         snapshot.table_name == current_table_->GetTableName() &&
         snapshot.index_name == index_name) {
       std::vector<std::pair<const std::byte* const, const size_t>> result;
-      if (!snapshot.data_item_copy.primary_keys.empty()) {
-        for (auto& primary_key : snapshot.data_item_copy.primary_keys) {
+      if (!snapshot.data_item_copy.primary_keys().empty()) {
+        for (auto& primary_key : snapshot.data_item_copy.primary_keys()) {
           result.emplace_back(
               reinterpret_cast<const std::byte*>(primary_key.data()),
               primary_key.size());
@@ -177,8 +177,8 @@ Transaction::Impl::ReadSecondaryIndex(const std::string_view index_name,
   auto& ref = read_set_.emplace_back(std::move(snapshot));
   if (ref.data_item_copy.IsInitialized()) {
     std::vector<std::pair<const std::byte* const, const size_t>> result;
-    if (!ref.data_item_copy.primary_keys.empty()) {
-      for (auto& primary_key : ref.data_item_copy.primary_keys) {
+    if (!ref.data_item_copy.primary_keys().empty()) {
+      for (auto& primary_key : ref.data_item_copy.primary_keys()) {
         result.emplace_back(
             reinterpret_cast<const std::byte*>(primary_key.data()),
             primary_key.size());
@@ -677,8 +677,8 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndex(
 
       // Use write_set data directly
       std::vector<std::string> primary_keys;
-      primary_keys.reserve(snapshot.data_item_copy.primary_keys.size());
-      for (const auto& pk : snapshot.data_item_copy.primary_keys) {
+      primary_keys.reserve(snapshot.data_item_copy.primary_keys().size());
+      for (const auto& pk : snapshot.data_item_copy.primary_keys()) {
         primary_keys.emplace_back(pk);
       }
 
@@ -775,8 +775,8 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndexReverse(
       if (snapshot.key != key) continue;
 
       std::vector<std::string> primary_keys;
-      primary_keys.reserve(snapshot.data_item_copy.primary_keys.size());
-      for (const auto& pk : snapshot.data_item_copy.primary_keys) {
+      primary_keys.reserve(snapshot.data_item_copy.primary_keys().size());
+      for (const auto& pk : snapshot.data_item_copy.primary_keys()) {
         primary_keys.emplace_back(pk);
       }
       std::reverse(primary_keys.begin(), primary_keys.end());
@@ -865,7 +865,7 @@ void Transaction::Impl::DeleteSecondaryIndex(
                                                       primary_key_size);
     snapshot.RecordSecondaryIndexDelta(primary_key_view,
                                        SecondaryIndexOp::Remove);
-    if (snapshot.data_item_copy.primary_keys.empty()) {
+    if (snapshot.data_item_copy.primary_keys().empty()) {
       if (!index->Delete(secondary_key)) {
         Abort();
         return;
@@ -898,7 +898,7 @@ void Transaction::Impl::DeleteSecondaryIndex(
     sp.data_item_copy.RemoveSecondaryIndexValue(primary_key_buffer,
                                                 primary_key_size);
 
-    if (sp.data_item_copy.primary_keys.empty()) {
+    if (sp.data_item_copy.primary_keys().empty()) {
       if (!index->Delete(secondary_key)) {
         Abort();
         return;
@@ -958,7 +958,7 @@ void Transaction::Impl::UpdateSecondaryIndex(
                                                       primary_key_size);
     snapshot.RecordSecondaryIndexDelta(primary_key_view,
                                        SecondaryIndexOp::Remove);
-    if (snapshot.data_item_copy.primary_keys.empty()) {
+    if (snapshot.data_item_copy.primary_keys().empty()) {
       if (!index->Delete(old_secondary_key)) {
         Abort();
         return;
@@ -991,7 +991,7 @@ void Transaction::Impl::UpdateSecondaryIndex(
     sp.data_item_copy.RemoveSecondaryIndexValue(primary_key_buffer,
                                                 primary_key_size);
 
-    if (sp.data_item_copy.primary_keys.empty()) {
+    if (sp.data_item_copy.primary_keys().empty()) {
       if (!index->Delete(old_secondary_key)) {
         Abort();
         return;

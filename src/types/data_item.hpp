@@ -24,6 +24,7 @@
 #include <cstring>
 #include <memory>
 #include <msgpack.hpp>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -41,7 +42,7 @@ struct DataItem {
   DataBuffer buffer;
   // std::stringのvectorを保持する
   // lineairdvkeyみたいなエイリアス
-  std::vector<std::string> primary_keys;
+  std::shared_ptr<std::vector<std::string>> primary_keys_ptr;
   std::vector<std::string> checkpoint_primary_keys;
   bool checkpoint_primary_keys_captured;
   /* std::unique_ptr<std::vector<DataBuffer>> sec_idx_buffers; */
@@ -53,6 +54,20 @@ struct DataItem {
   const std::byte* value() const { return &buffer.value[0]; }
   size_t size() const { return buffer.size; }
   bool IsInitialized() const { return initialized; }
+
+  // primary_keys accessor (read-only, copy-on-write)
+  const std::vector<std::string>& primary_keys() const {
+    static const std::vector<std::string> empty;
+    if (primary_keys_ptr) return *primary_keys_ptr;
+    return empty;
+  }
+
+  void SetPrimaryKeys(const std::vector<std::string>& pks) {
+    primary_keys_ptr = std::make_shared<std::vector<std::string>>(pks);
+  }
+  void SetPrimaryKeys(std::vector<std::string>&& pks) {
+    primary_keys_ptr = std::make_shared<std::vector<std::string>>(std::move(pks));
+  }
 
   DataItem()
       : transaction_id(0),
@@ -69,6 +84,7 @@ struct DataItem {
   DataItem(const DataItem& rhs)
       : transaction_id(rhs.transaction_id.load()),
         initialized(rhs.initialized),
+        primary_keys_ptr(rhs.primary_keys_ptr),  // shared_ptr copy = refcount++
         checkpoint_primary_keys_captured(false),
         pivot_object(NWRPivotObject()) {
     buffer.Reset(rhs.buffer);
@@ -76,7 +92,6 @@ struct DataItem {
       sec_idx_buffers =
           std::make_unique<std::vector<DataBuffer>>(*rhs.sec_idx_buffers);
     } */
-    primary_keys = rhs.primary_keys;
   }
 
   DataItem& operator=(const DataItem& rhs) {
@@ -92,7 +107,7 @@ struct DataItem {
     } else {
       sec_idx_buffers = nullptr;
     } */
-    primary_keys = rhs.primary_keys;
+    primary_keys_ptr = rhs.primary_keys_ptr;  // refcount++
     return *this;
   }
 
@@ -100,7 +115,7 @@ struct DataItem {
       : transaction_id(rhs.transaction_id.load()),
         initialized(rhs.initialized),
         buffer(std::move(rhs.buffer)),
-        primary_keys(std::move(rhs.primary_keys)),
+        primary_keys_ptr(std::move(rhs.primary_keys_ptr)),
         checkpoint_primary_keys(std::move(rhs.checkpoint_primary_keys)),
         checkpoint_primary_keys_captured(rhs.checkpoint_primary_keys_captured),
         checkpoint_buffer(std::move(rhs.checkpoint_buffer)),
@@ -111,7 +126,7 @@ struct DataItem {
     transaction_id.store(rhs.transaction_id.load());
     initialized = rhs.initialized;
     buffer = std::move(rhs.buffer);
-    primary_keys = std::move(rhs.primary_keys);
+    primary_keys_ptr = std::move(rhs.primary_keys_ptr);
     checkpoint_primary_keys = std::move(rhs.checkpoint_primary_keys);
     checkpoint_primary_keys_captured = rhs.checkpoint_primary_keys_captured;
     checkpoint_buffer = std::move(rhs.checkpoint_buffer);
@@ -122,25 +137,27 @@ struct DataItem {
   void Reset(const std::byte* v, const size_t s, TransactionId tid = 0) {
     buffer.Reset(v, s);
     if (!tid.IsEmpty()) transaction_id.store(tid);
-    initialized = (v != nullptr && s != 0) || !primary_keys.empty();
+    initialized = (v != nullptr && s != 0) ||
+                  (primary_keys_ptr && !primary_keys_ptr->empty());
   }
 
   void AddSecondaryIndexValue(const std::byte* v, size_t s) {
+    auto& pks = MutablePrimaryKeys();
     std::string new_key(reinterpret_cast<const char*>(v), s);
-    auto it =
-        std::lower_bound(primary_keys.begin(), primary_keys.end(), new_key);
-    if (it != primary_keys.end() && *it == new_key) return;
-    primary_keys.insert(it, std::move(new_key));
-    initialized = buffer.size != 0 || !primary_keys.empty();
+    auto it = std::lower_bound(pks.begin(), pks.end(), new_key);
+    if (it != pks.end() && *it == new_key) return;
+    pks.insert(it, std::move(new_key));
+    initialized = buffer.size != 0 || !pks.empty();
   }
 
   void RemoveSecondaryIndexValue(const std::byte* v, size_t s) {
+    if (!primary_keys_ptr || primary_keys_ptr->empty()) return;
+    auto& pks = MutablePrimaryKeys();
     const std::string target(reinterpret_cast<const char*>(v), s);
-    auto it =
-        std::lower_bound(primary_keys.begin(), primary_keys.end(), target);
-    if (it == primary_keys.end() || *it != target) return;
-    primary_keys.erase(it);
-    initialized = buffer.size != 0 || !primary_keys.empty();
+    auto it = std::lower_bound(pks.begin(), pks.end(), target);
+    if (it == pks.end() || *it != target) return;
+    pks.erase(it);
+    initialized = buffer.size != 0 || !pks.empty();
   }
 
   void CopyLiveVersionToStableVersion() {
@@ -150,7 +167,7 @@ struct DataItem {
       checkpoint_buffer.Reset(buffer);
     }
     if (!checkpoint_primary_keys_captured) {
-      checkpoint_primary_keys = primary_keys;
+      checkpoint_primary_keys = primary_keys();  // deep copy from shared
       checkpoint_primary_keys_captured = true;
     }
   }
@@ -167,6 +184,19 @@ struct DataItem {
     checkpoint_primary_keys.clear();
     checkpoint_primary_keys_captured = false;
   }
+
+ private:
+  // copy-on-write: returns a mutable reference, making a private copy if shared
+  std::vector<std::string>& MutablePrimaryKeys() {
+    if (!primary_keys_ptr) {
+      primary_keys_ptr = std::make_shared<std::vector<std::string>>();
+    } else if (primary_keys_ptr.use_count() > 1) {
+      primary_keys_ptr = std::make_shared<std::vector<std::string>>(*primary_keys_ptr);
+    }
+    return *primary_keys_ptr;
+  }
+
+ public:
 
   void ExclusiveLock() {
     // Acquire exclusive locking for all protocols:
