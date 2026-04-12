@@ -94,8 +94,6 @@ void Transaction::Impl::Reset(Database::Impl* db_pimpl) {
       reinterpret_cast<void*>(tx_context_thread_tag | (++tx_context_seq & 0xFFFFFFFF));
   read_set_.clear();
   write_set_.clear();
-  read_set_index_.clear();
-  write_set_index_.clear();
   remainingNotNullSkWrites_.clear();
 
   TransactionReferences new_ref{read_set_, write_set_,
@@ -113,27 +111,22 @@ const std::pair<const std::byte* const, const size_t> Transaction::Impl::Read(
 
   const auto& table_name = current_table_->GetTableName();
 
-  // Build lookup key: "table_name\0key" (primary index only, index_name empty)
-  std::string lookup_key;
-  lookup_key.reserve(table_name.size() + 1 + key.size());
-  lookup_key.append(table_name);
-  lookup_key.push_back('\0');
-  lookup_key.append(key);
-
-  // O(1) lookup in write_set
-  auto wit = write_set_index_.find(lookup_key);
-  if (wit != write_set_index_.end()) {
-    auto& snapshot = write_set_[wit->second];
-    return std::make_pair(snapshot.data_item_copy.value(),
-                          snapshot.data_item_copy.size());
+  // Linear search in write_set
+  for (auto& snapshot : write_set_) {
+    if (snapshot.key == key && snapshot.table_name == table_name &&
+        snapshot.index_name.empty()) {
+      return std::make_pair(snapshot.data_item_copy.value(),
+                            snapshot.data_item_copy.size());
+    }
   }
 
-  // O(1) lookup in read_set
-  auto rit = read_set_index_.find(lookup_key);
-  if (rit != read_set_index_.end()) {
-    auto& snapshot = read_set_[rit->second];
-    return std::make_pair(snapshot.data_item_copy.value(),
-                          snapshot.data_item_copy.size());
+  // Linear search in read_set
+  for (auto& snapshot : read_set_) {
+    if (snapshot.key == key && snapshot.table_name == table_name &&
+        snapshot.index_name.empty()) {
+      return std::make_pair(snapshot.data_item_copy.value(),
+                            snapshot.data_item_copy.size());
+    }
   }
 
   auto* index_leaf = current_table_->GetPrimaryIndex().GetOrInsert(key);
@@ -141,9 +134,7 @@ const std::pair<const std::byte* const, const size_t> Transaction::Impl::Read(
       key, nullptr, 0, index_leaf, current_table_->GetTableName(), ""};
 
   snapshot.data_item_copy = concurrency_control_->Read(key, index_leaf);
-  size_t idx = read_set_.size();
   auto& ref = read_set_.emplace_back(std::move(snapshot));
-  read_set_index_.emplace(std::move(lookup_key), idx);
   if (ref.data_item_copy.IsInitialized()) {
     return {ref.data_item_copy.value(), ref.data_item_copy.size()};
   } else {
@@ -228,25 +219,23 @@ void Transaction::Impl::Write(const std::string_view key,
 
   const auto& table_name = current_table_->GetTableName();
 
-  std::string lookup_key;
-  lookup_key.reserve(table_name.size() + 1 + key.size());
-  lookup_key.append(table_name);
-  lookup_key.push_back('\0');
-  lookup_key.append(key);
-
   bool is_rmf = false;
-  auto rit = read_set_index_.find(lookup_key);
-  if (rit != read_set_index_.end()) {
-    is_rmf = true;
-    read_set_[rit->second].is_read_modify_write = true;
+  for (auto& snapshot : read_set_) {
+    if (snapshot.key == key && snapshot.table_name == table_name &&
+        snapshot.index_name.empty()) {
+      is_rmf = true;
+      snapshot.is_read_modify_write = true;
+      break;
+    }
   }
 
-  auto wit = write_set_index_.find(lookup_key);
-  if (wit != write_set_index_.end()) {
-    auto& snapshot = write_set_[wit->second];
-    snapshot.data_item_copy.Reset(value, size);
-    if (is_rmf) snapshot.is_read_modify_write = true;
-    return;
+  for (auto& snapshot : write_set_) {
+    if (snapshot.key == key && snapshot.table_name == table_name &&
+        snapshot.index_name.empty()) {
+      snapshot.data_item_copy.Reset(value, size);
+      if (is_rmf) snapshot.is_read_modify_write = true;
+      return;
+    }
   }
 
   auto* index_leaf = current_table_->GetPrimaryIndex().GetOrInsert(key);
@@ -255,9 +244,7 @@ void Transaction::Impl::Write(const std::string_view key,
   Snapshot sp(key, value, size, index_leaf, current_table_->GetTableName(), "",
               {});
   if (is_rmf) sp.is_read_modify_write = true;
-  size_t idx = write_set_.size();
   write_set_.emplace_back(std::move(sp));
-  write_set_index_.emplace(std::move(lookup_key), idx);
 }
 
 void Transaction::Impl::WriteSecondaryIndex(
@@ -501,12 +488,12 @@ const std::optional<size_t> Transaction::Impl::Scan(
       // Check read_set_ to avoid duplicate validation_set_ registration.
       // Read() already registered this key in validation_set_ via CC::Read();
       // calling ReadDirect again would create a duplicate entry.
-      std::string lookup_key =
-          current_table_->GetTableName() + std::string(1, '\0') +
-          std::string(key);
-      auto rit = read_set_index_.find(lookup_key);
-      if (rit != read_set_index_.end()) {
-        auto& snapshot = read_set_[rit->second];
+      const auto& scan_table = current_table_->GetTableName();
+      bool found_in_read_set = false;
+      for (auto& snapshot : read_set_) {
+        if (snapshot.key != key || snapshot.table_name != scan_table ||
+            !snapshot.index_name.empty()) continue;
+        found_in_read_set = true;
         if (snapshot.data_item_copy.IsInitialized()) {
           std::pair<const void*, const size_t> value_pair = {
               snapshot.data_item_copy.value(),
@@ -515,8 +502,9 @@ const std::optional<size_t> Transaction::Impl::Scan(
           total_count++;
           if (stop_scan) return total_count;
         }
-        continue;
+        break;
       }
+      if (found_in_read_set) continue;
 
       // Not in write_set or read_set: use ReadDirect (zero-copy).
       // This avoids creating a full Snapshot (288B) per scan entry.
@@ -616,12 +604,12 @@ const std::optional<size_t> Transaction::Impl::ScanReverse(
 
     if (!found_in_write_set) {
       // Check read_set_ to avoid duplicate validation_set_ registration.
-      std::string lookup_key =
-          current_table_->GetTableName() + std::string(1, '\0') +
-          std::string(key);
-      auto rit = read_set_index_.find(lookup_key);
-      if (rit != read_set_index_.end()) {
-        auto& snapshot = read_set_[rit->second];
+      const auto& scan_table = current_table_->GetTableName();
+      bool found_in_read_set = false;
+      for (auto& snapshot : read_set_) {
+        if (snapshot.key != key || snapshot.table_name != scan_table ||
+            !snapshot.index_name.empty()) continue;
+        found_in_read_set = true;
         if (snapshot.data_item_copy.IsInitialized()) {
           std::pair<const void*, const size_t> value_pair = {
               snapshot.data_item_copy.value(),
@@ -630,8 +618,9 @@ const std::optional<size_t> Transaction::Impl::ScanReverse(
           total_count++;
           if (stop_scan) return total_count;
         }
-        continue;
+        break;
       }
+      if (found_in_read_set) continue;
 
       auto* index_leaf = current_table_->GetPrimaryIndex().GetOrInsert(key);
       TransactionId scan_tid;
