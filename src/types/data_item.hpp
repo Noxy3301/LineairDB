@@ -143,19 +143,21 @@ struct DataItem {
 
   void AddSecondaryIndexValue(const std::byte* v, size_t s) {
     auto& pks = MutablePrimaryKeys();
-    std::string new_key(reinterpret_cast<const char*>(v), s);
-    auto it = std::lower_bound(pks.begin(), pks.end(), new_key);
-    if (it != pks.end() && *it == new_key) return;
-    pks.insert(it, std::move(new_key));
+    std::string_view new_key(reinterpret_cast<const char*>(v), s);
+    auto cmp = [](const std::string& a, std::string_view b) { return a < b; };
+    auto it = std::lower_bound(pks.begin(), pks.end(), new_key, cmp);
+    if (it != pks.end() && std::string_view(*it) == new_key) return;
+    pks.emplace(it, new_key);
     initialized = buffer.size != 0 || !pks.empty();
   }
 
   void RemoveSecondaryIndexValue(const std::byte* v, size_t s) {
     if (!primary_keys_ptr || primary_keys_ptr->empty()) return;
     auto& pks = MutablePrimaryKeys();
-    const std::string target(reinterpret_cast<const char*>(v), s);
-    auto it = std::lower_bound(pks.begin(), pks.end(), target);
-    if (it == pks.end() || *it != target) return;
+    std::string_view target(reinterpret_cast<const char*>(v), s);
+    auto cmp = [](const std::string& a, std::string_view b) { return a < b; };
+    auto it = std::lower_bound(pks.begin(), pks.end(), target, cmp);
+    if (it == pks.end() || std::string_view(*it) != target) return;
     pks.erase(it);
     initialized = buffer.size != 0 || !pks.empty();
   }
