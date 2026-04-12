@@ -30,16 +30,18 @@ namespace LineairDB {
 struct DataBuffer {
   std::byte* value;
   size_t size;
+  size_t capacity;
 
-  DataBuffer() : size(0) { value = nullptr; }
+  DataBuffer() : value(nullptr), size(0), capacity(0) {}
   ~DataBuffer() {
     if (value != nullptr) delete[] value;
   }
 
   DataBuffer(DataBuffer&& other) noexcept
-      : value(other.value), size(other.size) {
+      : value(other.value), size(other.size), capacity(other.capacity) {
     other.value = nullptr;
     other.size = 0;
+    other.capacity = 0;
   }
 
   DataBuffer& operator=(DataBuffer&& other) noexcept {
@@ -47,13 +49,15 @@ struct DataBuffer {
       delete[] value;
       value = other.value;
       size = other.size;
+      capacity = other.capacity;
       other.value = nullptr;
       other.size = 0;
+      other.capacity = 0;
     }
     return *this;
   }
 
-  DataBuffer(const DataBuffer& other) : value(nullptr), size(0) {
+  DataBuffer(const DataBuffer& other) : value(nullptr), size(0), capacity(0) {
     Reset(other.value, other.size);
   }
 
@@ -64,16 +68,16 @@ struct DataBuffer {
     return *this;
   }
 
+  // NOTE: capacity only grows; consider shrink-to-fit if large records cause bloat.
   void Reset(const std::byte* v, const size_t s) {
     if (v == nullptr) {
-      delete[] value;
-      value = nullptr;
       size = 0;
       return;
     }
-    if (size < s) {
+    if (capacity < s) {
       delete[] value;
       value = new std::byte[s];
+      capacity = s;
     }
     size = s;
     std::memcpy(value, v, s);
