@@ -641,7 +641,7 @@ const std::optional<size_t> Transaction::Impl::ScanReverse(
 const std::optional<size_t> Transaction::Impl::ScanSecondaryIndex(
     const std::string_view index_name, const std::string_view begin,
     const std::optional<std::string_view> end,
-    std::function<bool(std::string_view, const std::vector<std::string>)>
+    std::function<bool(std::string_view, const std::vector<std::string>&)>
         operation) {
   EnsureCurrentTable();
   Index::SecondaryIndex* index = current_table_->GetSecondaryIndex(index_name);
@@ -651,10 +651,15 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndex(
     return {};
   }
 
-  // Step 1: Collect keys from secondary index
-  std::set<std::string> index_keys;
+  const auto& si_table_name = current_table_->GetTableName();
+
+  // Step 1: Collect keys from secondary index.
+  // SI Scan returns keys in sorted order, so we can use a vector directly
+  // instead of std::set (which allocates per-node).
+  std::vector<std::string> index_keys;
+  index_keys.reserve(64);
   auto index_result = index->Scan(begin, end, [&](std::string_view key) {
-    index_keys.insert(std::string(key));
+    index_keys.emplace_back(key);
     return false;  // Continue to collect all keys
   });
 
@@ -662,22 +667,26 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndex(
     Abort();
     return std::nullopt;
   }
+  std::sort(index_keys.begin(), index_keys.end());
 
   // Step 2: Collect keys from write_set (for this secondary index)
-  std::set<std::string> write_set_keys;
+  std::vector<std::string> write_set_keys;
   for (const auto& snapshot : write_set_) {
-    if (snapshot.table_name != current_table_->GetTableName()) continue;
-    if (snapshot.index_name != index_name)
-      continue;  // セカンダリインデックス名でフィルタ
+    if (snapshot.table_name != si_table_name) continue;
+    if (snapshot.index_name != index_name) continue;
     if (snapshot.key < begin) continue;
     if (end.has_value() && snapshot.key > end.value()) continue;
-    write_set_keys.insert(snapshot.key);
+    write_set_keys.emplace_back(snapshot.key);
   }
+  std::sort(write_set_keys.begin(), write_set_keys.end());
 
-  // Step 3: Merge and sort all keys
-  std::set<std::string> all_keys;
-  all_keys.insert(index_keys.begin(), index_keys.end());
-  all_keys.insert(write_set_keys.begin(), write_set_keys.end());
+  // Step 3: Merge sorted index_keys and write_set_keys, deduplicate
+  std::vector<std::string> all_keys;
+  all_keys.reserve(index_keys.size() + write_set_keys.size());
+  std::merge(index_keys.begin(), index_keys.end(),
+             write_set_keys.begin(), write_set_keys.end(),
+             std::back_inserter(all_keys));
+  all_keys.erase(std::unique(all_keys.begin(), all_keys.end()), all_keys.end());
 
   // Step 4: Process keys in sorted order
   size_t total_count = 0;
@@ -687,25 +696,20 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndex(
     // Check if key is in write_set
     bool found_in_write_set = false;
     for (const auto& snapshot : write_set_) {
-      if (snapshot.table_name != current_table_->GetTableName()) continue;
+      if (snapshot.table_name != si_table_name) continue;
       if (snapshot.index_name != index_name) continue;
       if (snapshot.key != key) continue;
 
-      // Use write_set data directly
-      std::vector<std::string> primary_keys;
-      primary_keys.reserve(snapshot.data_item_copy.primary_keys().size());
-      for (const auto& pk : snapshot.data_item_copy.primary_keys()) {
-        primary_keys.emplace_back(pk);
-      }
+      const auto& pks = snapshot.data_item_copy.primary_keys();
 
       // Skip deleted keys (empty primary_keys means the entry was deleted)
-      if (primary_keys.empty()) {
+      if (pks.empty()) {
         found_in_write_set = true;
         break;
       }
 
       total_count++;
-      bool stop_scan = operation(key, primary_keys);
+      bool stop_scan = operation(key, pks);
       if (stop_scan) return total_count;
 
       found_in_write_set = true;
@@ -740,7 +744,7 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndex(
 const std::optional<size_t> Transaction::Impl::ScanSecondaryIndexReverse(
     const std::string_view index_name, const std::string_view begin,
     const std::optional<std::string_view> end,
-    std::function<bool(std::string_view, const std::vector<std::string>)>
+    std::function<bool(std::string_view, const std::vector<std::string>&)>
         operation) {
   EnsureCurrentTable();
   Index::SecondaryIndex* index = current_table_->GetSecondaryIndex(index_name);
@@ -750,10 +754,13 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndexReverse(
     return {};
   }
 
-  // Step 1: Collect keys from secondary index
-  std::set<std::string> index_keys;
+  const auto& si_table_name = current_table_->GetTableName();
+
+  // Step 1: Collect keys from secondary index (sorted order from SI)
+  std::vector<std::string> index_keys;
+  index_keys.reserve(64);
   auto index_result = index->ScanReverse(begin, end, [&](std::string_view key) {
-    index_keys.insert(std::string(key));
+    index_keys.emplace_back(key);
     return false;  // Continue to collect all keys
   });
 
@@ -761,24 +768,32 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndexReverse(
     Abort();
     return std::nullopt;
   }
+  // ScanReverse returns keys in reverse order; re-sort ascending for merge
+  std::sort(index_keys.begin(), index_keys.end());
 
   // Step 2: Collect keys from write_set (for this secondary index)
-  std::set<std::string> write_set_keys;
+  std::vector<std::string> write_set_keys;
   for (const auto& snapshot : write_set_) {
-    if (snapshot.table_name != current_table_->GetTableName()) continue;
-    if (snapshot.index_name != index_name)
-      continue;  // セカンダリインデックス名でフィルタ
+    if (snapshot.table_name != si_table_name) continue;
+    if (snapshot.index_name != index_name) continue;
     if (snapshot.key < begin) continue;
     if (end.has_value() && snapshot.key > end.value()) continue;
-    write_set_keys.insert(snapshot.key);
+    write_set_keys.emplace_back(snapshot.key);
   }
+  std::sort(write_set_keys.begin(), write_set_keys.end());
 
-  // Step 3: Merge and sort all keys
-  std::set<std::string> all_keys;
-  all_keys.insert(index_keys.begin(), index_keys.end());
-  all_keys.insert(write_set_keys.begin(), write_set_keys.end());
+  // Step 3: Merge sorted keys, deduplicate
+  std::vector<std::string> all_keys;
+  all_keys.reserve(index_keys.size() + write_set_keys.size());
+  std::merge(index_keys.begin(), index_keys.end(),
+             write_set_keys.begin(), write_set_keys.end(),
+             std::back_inserter(all_keys));
+  all_keys.erase(std::unique(all_keys.begin(), all_keys.end()), all_keys.end());
 
   // Step 4: Process keys in reverse order
+  // Forward scan passes primary_keys by const ref directly, but reverse scan
+  // needs a reversed copy. Reuse this buffer across iterations to keep capacity.
+  std::vector<std::string> reversed_pks;
   size_t total_count = 0;
   for (auto it = all_keys.rbegin(); it != all_keys.rend(); ++it) {
     if (IsAborted()) return std::nullopt;
@@ -786,24 +801,21 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndexReverse(
     const auto& key = *it;
     bool found_in_write_set = false;
     for (const auto& snapshot : write_set_) {
-      if (snapshot.table_name != current_table_->GetTableName()) continue;
+      if (snapshot.table_name != si_table_name) continue;
       if (snapshot.index_name != index_name) continue;
       if (snapshot.key != key) continue;
 
-      std::vector<std::string> primary_keys;
-      primary_keys.reserve(snapshot.data_item_copy.primary_keys().size());
-      for (const auto& pk : snapshot.data_item_copy.primary_keys()) {
-        primary_keys.emplace_back(pk);
-      }
-      std::reverse(primary_keys.begin(), primary_keys.end());
+      const auto& pks = snapshot.data_item_copy.primary_keys();
 
-      if (primary_keys.empty()) {
+      // Skip deleted keys (empty primary_keys means the entry was deleted)
+      if (pks.empty()) {
         found_in_write_set = true;
         break;
       }
 
+      reversed_pks.assign(pks.rbegin(), pks.rend());
       total_count++;
-      bool stop_scan = operation(key, primary_keys);
+      bool stop_scan = operation(key, reversed_pks);
       if (stop_scan) return total_count;
 
       found_in_write_set = true;
@@ -814,19 +826,20 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndexReverse(
       const auto read_result = ReadSecondaryIndex(index_name, key);
       if (IsAborted()) return std::nullopt;
 
-      std::vector<std::string> primary_keys;
-      primary_keys.reserve(read_result.size());
+      reversed_pks.clear();
+      reversed_pks.reserve(read_result.size());
       for (const auto& primary_key : read_result) {
-        primary_keys.emplace_back(
+        reversed_pks.emplace_back(
             reinterpret_cast<const char*>(primary_key.first),
             primary_key.second);
       }
-      std::reverse(primary_keys.begin(), primary_keys.end());
+      std::reverse(reversed_pks.begin(), reversed_pks.end());
 
-      if (primary_keys.empty()) continue;
+      // Skip deleted keys
+      if (reversed_pks.empty()) continue;
 
       total_count++;
-      bool stop_scan = operation(key, primary_keys);
+      bool stop_scan = operation(key, reversed_pks);
       if (stop_scan) return total_count;
     }
   }
@@ -1203,7 +1216,7 @@ const std::optional<size_t> Transaction::ScanReverse(
 const std::optional<size_t> Transaction::ScanSecondaryIndex(
     const std::string_view index_name, const std::string_view begin,
     const std::optional<std::string_view> end,
-    std::function<bool(std::string_view, const std::vector<std::string>)>
+    std::function<bool(std::string_view, const std::vector<std::string>&)>
         operation) {
   return tx_pimpl_->ScanSecondaryIndex(index_name, begin, end, operation);
 }
@@ -1211,7 +1224,7 @@ const std::optional<size_t> Transaction::ScanSecondaryIndex(
 const std::optional<size_t> Transaction::ScanSecondaryIndexReverse(
     const std::string_view index_name, const std::string_view begin,
     const std::optional<std::string_view> end,
-    std::function<bool(std::string_view, const std::vector<std::string>)>
+    std::function<bool(std::string_view, const std::vector<std::string>&)>
         operation) {
   return tx_pimpl_->ScanSecondaryIndexReverse(index_name, begin, end,
                                               operation);

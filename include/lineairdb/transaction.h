@@ -375,13 +375,13 @@ class Transaction {
   const std::optional<size_t> ScanSecondaryIndex(
       const std::string_view index_name, const std::string_view begin,
       const std::optional<std::string_view> end,
-      std::function<bool(std::string_view, const std::vector<std::string>)>
+      std::function<bool(std::string_view, const std::vector<std::string>&)>
           operation);
 
   const std::optional<size_t> ScanSecondaryIndexReverse(
       const std::string_view index_name, const std::string_view begin,
       const std::optional<std::string_view> end,
-      std::function<bool(std::string_view, const std::vector<std::string>)>
+      std::function<bool(std::string_view, const std::vector<std::string>&)>
           operation);
 
   template <typename T>
@@ -393,7 +393,7 @@ class Transaction {
                   "LineairDB expects to trivially copyable types.");
     return ScanSecondaryIndex(
         index_name, begin, end,
-        [&](auto key, std::vector<std::string> primary_keys) {
+        [&](auto key, const std::vector<std::string>& primary_keys) {
           std::vector<T> copy_constructed_results;
           for (auto& primary_key : primary_keys) {
             copy_constructed_results.push_back(
@@ -412,7 +412,7 @@ class Transaction {
                   "LineairDB expects to trivially copyable types.");
     return ScanSecondaryIndexReverse(
         index_name, begin, end,
-        [&](auto key, std::vector<std::string> primary_keys) {
+        [&](auto key, const std::vector<std::string>& primary_keys) {
           std::vector<T> copy_constructed_results;
           for (auto& primary_key : primary_keys) {
             copy_constructed_results.push_back(
