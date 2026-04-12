@@ -77,8 +77,6 @@ PrecisionLockingIndex::PrecisionLockingIndex(LineairDB::EpochFramework& e)
               }
             }
           }
-          // Sleep to avoid busy-wait; GC only needs to run once per epoch
-          std::this_thread::sleep_for(std::chrono::milliseconds(40));
         }
       }){};
 

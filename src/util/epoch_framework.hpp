@@ -85,6 +85,8 @@ class EpochFramework {
   }
 
   EpochNumber Sync() {
+    // FIXME(perf): yield-spin here costs ~2.8% CPU under load.
+    // Replace with condition_variable or std::atomic::wait (C++20).
     assert(GetMyThreadLocalEpoch() == THREAD_OFFLINE);
     size_t reload_count = 0;
     for (;;) {
