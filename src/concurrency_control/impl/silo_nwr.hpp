@@ -60,6 +60,17 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
         nwr_validation_result_(NWRValidationResult::NOT_YET_VALIDATED){};
   ~SiloNWRTyped() final override{};
 
+  // TransactionReferences has reference members, so normal assignment (=) is
+  // not possible. Destroy-then-placement-new rebinds the references in place.
+  void Reset(TransactionReferences&& new_ref) override {
+    tx_ref_.~TransactionReferences();
+    new (&tx_ref_) TransactionReferences(std::move(new_ref));
+    validation_set_.clear();
+    nwr_validation_result_ = NWRValidationResult::NOT_YET_VALIDATED;
+    my_pivot_object_ = NWRPivotObject();
+    pivot_object_snapshots_.clear();
+  }
+
   const DataItem Read(const std::string_view,
                       DataItem* index_leaf) final override {
     assert(index_leaf != nullptr);

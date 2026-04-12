@@ -136,15 +136,27 @@ class Database::Impl {
     }
   }
 
+  // FIXME: TLS workspace assumes one active tx per thread and same CC protocol
+  // across Database instances. Calling BeginTransaction twice without End will
+  // reset the first tx. Switching Database with a different CC protocol will
+  // use the old CC implementation.
   Transaction& BeginTransaction() {
     epoch_framework_.MakeMeOnline();
-    return *(new Transaction(this));
+    thread_local Transaction* tls_workspace = nullptr;
+    if (tls_workspace != nullptr) {
+      tls_workspace->tx_pimpl_->Reset(this);
+      return *tls_workspace;
+    }
+    auto* tx = new Transaction(this);
+    tx->reusable_ = true;
+    tls_workspace = tx;
+    return *tx;
   }
 
   bool EndTransaction(Transaction& tx, CallbackType clbk) {
     if (tx.IsAborted()) {
       clbk(TxStatus::Aborted);
-      delete &tx;
+      if (!tx.reusable_) delete &tx;
       epoch_framework_.MakeMeOffline();
       return false;
     }
@@ -172,7 +184,7 @@ class Database::Impl {
       logger_.TruncateLogs(checkpoint_completed);
     }
 
-    delete &tx;
+    if (!tx.reusable_) delete &tx;
     return committed;
   }
 

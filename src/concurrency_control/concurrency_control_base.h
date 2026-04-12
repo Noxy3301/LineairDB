@@ -51,6 +51,7 @@ class ConcurrencyControlBase {
   virtual void Abort() = 0;
   virtual bool Precommit(bool) = 0;
   virtual void PostProcessing(TxStatus) = 0;
+  virtual void Reset(TransactionReferences&& new_ref) = 0;
 
   bool IsReadOnly() { return (0 == tx_ref_.write_set_ref_.size()); }
   bool IsWriteOnly() { return (0 == tx_ref_.read_set_ref_.size()); }
