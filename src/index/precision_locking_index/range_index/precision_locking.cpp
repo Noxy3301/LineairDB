@@ -72,8 +72,12 @@ PrecisionLockingIndex::PrecisionLockingIndex(LineairDB::EpochFramework& e)
                   }
                 }
                 insert_or_delete_key_set_.erase(beg, end);
-                last_processed_epoch_.store(stable_epoch,
-                                            std::memory_order_release);
+                {
+                  std::lock_guard<std::mutex> lk(pl_cv_mtx_);
+                  last_processed_epoch_.store(stable_epoch,
+                                              std::memory_order_release);
+                }
+                pl_cv_.notify_all();
               }
             }
           }
@@ -265,9 +269,12 @@ void PrecisionLockingIndex::WaitForIndexIsLinearizable() {
   const auto stable_epoch_target =
       target_epoch - 2;  // It assumes EpochManager#Sync()
 
-  while (last_processed_epoch_.load(std::memory_order_acquire) <
-         stable_epoch_target) {
-    std::this_thread::yield();
+  {
+    std::unique_lock<std::mutex> lk(pl_cv_mtx_);
+    pl_cv_.wait(lk, [&] {
+      return last_processed_epoch_.load(std::memory_order_acquire) >=
+             stable_epoch_target;
+    });
   }
 }
 

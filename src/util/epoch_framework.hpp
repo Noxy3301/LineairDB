@@ -20,6 +20,8 @@
 #include <assert.h>
 
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 
 #include "util/thread_key_storage.h"
@@ -85,18 +87,18 @@ class EpochFramework {
   }
 
   EpochNumber Sync() {
-    // FIXME(perf): yield-spin here costs ~2.8% CPU under load.
-    // Replace with condition_variable or std::atomic::wait (C++20).
     assert(GetMyThreadLocalEpoch() == THREAD_OFFLINE);
     size_t reload_count = 0;
     for (;;) {
       auto current_epoch = global_epoch_.load();
-      auto reload_epoch = global_epoch_.load();
-      while (current_epoch == reload_epoch) {
-        if (stop_.load()) return reload_epoch;
-        std::this_thread::yield();
-        reload_epoch = global_epoch_.load();
+      {
+        std::unique_lock<std::mutex> lk(epoch_mtx_);
+        epoch_cv_.wait(lk, [&] {
+          return stop_.load() || (global_epoch_.load() != current_epoch);
+        });
       }
+      auto reload_epoch = global_epoch_.load();
+      if (stop_.load()) return reload_epoch;
       reload_count++;
 
       // Note that each thread always belongs to either one of the two epochs,
@@ -108,9 +110,19 @@ class EpochFramework {
     }
   }
 
-  void Start() { start_.store(true); }
+  void Start() {
+    {
+      std::lock_guard<std::mutex> lk(epoch_mtx_);
+      start_.store(true);
+    }
+    epoch_cv_.notify_all();
+  }
   void Stop() {
-    stop_.store(true);
+    {
+      std::lock_guard<std::mutex> lk(epoch_mtx_);
+      stop_.store(true);
+    }
+    epoch_cv_.notify_all();
     if (epoch_writer_.joinable()) epoch_writer_.join();
   }
 
@@ -129,14 +141,25 @@ class EpochFramework {
 
   void EpochWriterJob(size_t epoch_duration_ms) {
     const uint64_t epoch_duration = epoch_duration_ms * 1000 * 1000;
-    while (!start_.load()) std::this_thread::yield();
+    {
+      std::unique_lock<std::mutex> lk(epoch_mtx_);
+      epoch_cv_.wait(lk, [&] { return start_.load(); });
+    }
 
     for (;;) {
       std::this_thread::sleep_for(std::chrono::nanoseconds(epoch_duration));
       EpochNumber min_epoch = GetSmallestEpoch();
       EpochNumber old_epoch = global_epoch_;
       if (min_epoch == THREAD_OFFLINE || min_epoch == old_epoch) {
-        EpochNumber updated = global_epoch_.fetch_add(1);
+        {
+          // fetch_add is atomic, but we hold epoch_mtx_ here to
+          // ensure Sync()'s cv.wait does not miss the subsequent
+          // notify_all (prevents lost-wake race).
+          std::lock_guard<std::mutex> lk(epoch_mtx_);
+          global_epoch_.fetch_add(1);
+        }
+        EpochNumber updated = global_epoch_.load();
+        epoch_cv_.notify_all();
         if (publish_target_) publish_target_(updated);
       }
       if (stop_.load() && min_epoch == THREAD_OFFLINE) break;
@@ -147,6 +170,8 @@ class EpochFramework {
   std::atomic<bool> start_;
   std::atomic<bool> stop_;
   std::atomic<EpochNumber> global_epoch_;
+  std::mutex epoch_mtx_;
+  std::condition_variable epoch_cv_;
   const std::function<void(EpochNumber)> publish_target_;
   std::thread epoch_writer_;
   ThreadKeyStorage<EpochNumber> tls_;

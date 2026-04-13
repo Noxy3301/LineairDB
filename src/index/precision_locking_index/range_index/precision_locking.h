@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -107,6 +108,8 @@ class PrecisionLockingIndex {
   EpochFramework& epoch_manager_ref_;
   std::atomic<bool> manager_stop_flag_;
   std::atomic<EpochNumber> last_processed_epoch_{0};
+  std::mutex pl_cv_mtx_;
+  std::condition_variable pl_cv_;
   std::thread manager_;
 };
 }  // namespace Index

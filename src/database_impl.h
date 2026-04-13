@@ -22,6 +22,8 @@
 #include <lineairdb/tx_status.h>
 #include <table/table.h>
 
+#include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <shared_mutex>
 #include <tuple>
@@ -80,7 +82,7 @@ class Database::Impl {
     checkpoint_manager_.Stop();
     epoch_framework_.Stop();
     while (!thread_pool_.IsEmpty()) {
-      std::this_thread::yield();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     thread_pool_.Shutdown();
     SPDLOG_DEBUG(
@@ -217,9 +219,11 @@ class Database::Impl {
     epoch_framework_.Sync();
     thread_pool_.WaitForQueuesToBecomeEmpty();
     callback_manager_.WaitForAllCallbacksToBeExecuted();
-    // Spin-wait with yield for better performance in the critical path
-    while (latest_callbacked_epoch_.load() < current_epoch) {
-      std::this_thread::yield();
+    {
+      std::unique_lock<std::mutex> lk(fence_mtx_);
+      fence_cv_.wait(lk, [&] {
+        return latest_callbacked_epoch_.load() >= current_epoch;
+      });
     }
     // Wait for all index updates to be linearizable
     // This ensures that all insertions/deletions are visible in the index
@@ -244,7 +248,11 @@ class Database::Impl {
       // Execute Callbacks
       thread_pool_.EnqueueForAllThreads([&, old_epoch]() {
         callback_manager_.ExecuteCallbacks(old_epoch);
-        latest_callbacked_epoch_.store(old_epoch);
+        {
+          std::lock_guard<std::mutex> lk(fence_mtx_);
+          latest_callbacked_epoch_.store(old_epoch);
+        }
+        fence_cv_.notify_all();
       });
 
       if (config_.enable_checkpointing) {
@@ -369,6 +377,8 @@ class Database::Impl {
   EpochFramework epoch_framework_;
   TableDictionary table_dictionary_;
   std::atomic<EpochNumber> latest_callbacked_epoch_{1};
+  std::mutex fence_mtx_;
+  std::condition_variable fence_cv_;
   Recovery::CPRManager checkpoint_manager_;
   mutable std::shared_mutex schema_mutex_;
 };
