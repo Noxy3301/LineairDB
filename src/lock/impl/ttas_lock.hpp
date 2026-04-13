@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <xmmintrin.h>
 
 #include "lock/lock.h"
 
@@ -40,7 +41,7 @@ class alignas(64) TTASLockImpl
         std::this_thread::sleep_for(std::chrono::nanoseconds(sleep_ns));
         sleep_ns *= 2;  // Exponential Backoff
       } else {
-        std::this_thread::yield();
+        _mm_pause();
       }
     }
   }

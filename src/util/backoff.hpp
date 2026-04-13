@@ -19,6 +19,7 @@
 #define LINEAIRDB_BACKOFF_HPP
 
 #include <chrono>
+#include <xmmintrin.h>
 #include <functional>
 #include <thread>
 
@@ -39,7 +40,7 @@ static inline bool RetryWithExponentialBackoff(std::function<bool()>&& f,
       std::this_thread::sleep_for(std::chrono::nanoseconds(sleep_ns));
       sleep_ns *= 2;
     } else {
-      std::this_thread::yield();
+      _mm_pause();
     }
   }
 }

@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstring>
+#include <xmmintrin.h>
 #include <vector>
 
 #include "concurrency_control/concurrency_control_base.h"
@@ -80,9 +81,7 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
       auto tx_id = index_leaf->transaction_id.load();
 
       if (tx_id.tid & 1u) {  // locked
-                             // WANTFIX user-space adaptive mutex locking may
-                             // improve the performance
-        std::this_thread::yield();
+        _mm_pause();
         continue;
       }
 
@@ -121,7 +120,7 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
 
       // Step 2: If lock bit is set, a writer holds this record. Spin until released.
       if (tx_id.tid & 1u) {
-        std::this_thread::yield();
+        _mm_pause();
         continue;
       }
 
@@ -174,9 +173,7 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
       for (;;) {
         auto current = item->transaction_id.load();
         if (current.tid & 1llu) {
-          // WANTFIX user-space adaptive mutex locking may
-          // improve the performance
-          std::this_thread::yield();
+          _mm_pause();
           continue;
         }
         auto desired = current;

@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstring>
+#include <xmmintrin.h>
 #include <memory>
 #include <msgpack.hpp>
 #include <string>
@@ -208,7 +209,7 @@ struct DataItem {
       for (;;) {
         auto tid = transaction_id.load();
         if (tid.tid & 1llu) {
-          std::this_thread::yield();
+          _mm_pause();
           continue;
         }
         auto new_tid = tid;

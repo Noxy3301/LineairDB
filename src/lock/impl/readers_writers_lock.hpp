@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <xmmintrin.h>
 #include <thread>
 
 #include "lock/lock.h"
@@ -42,7 +43,7 @@ class alignas(64) ReadersWritersLockImpl
     } else {
       for (;;) {
         if (TryLock(type)) break;
-        std::this_thread::yield();
+        _mm_pause();
       }
     }
   }
