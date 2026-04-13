@@ -87,25 +87,27 @@ void ThreadLocalCallbackManager::ExecuteCallbacks(EpochNumber stable_epoch) {
   }
 }
 void ThreadLocalCallbackManager::WaitForAllCallbacksToBeExecuted() {
-  thread_key_storage_.ForEach(
-      [&](const ThreadLocalStorageNode* thread_local_node) {
-        auto& queue = thread_local_node->callback_queue;
-        for (;;) {
-          if (queue.empty()) {
-            break;
-          }
-          std::this_thread::yield();
-        }
-      });
+  // Wait for thread-local queues to drain
+  for (;;) {
+    bool all_empty = true;
+    thread_key_storage_.ForEach(
+        [&](const ThreadLocalStorageNode* thread_local_node) {
+          if (!thread_local_node->callback_queue.empty()) all_empty = false;
+        });
+    if (all_empty) break;
+    std::unique_lock<std::mutex> lk(wait_mtx_);
+    wait_cv_.wait_for(lk, std::chrono::milliseconds(1));
+  }
 
-  size_t checked = 0;
+  // Wait for work-stealing queues to drain
   const size_t work_steal_queue_size = work_steal_queue_size_.load();
   if (0 == work_steal_queue_size) return;
+  size_t checked = 0;
   auto itr = work_steal_queues_.begin();
   for (;;) {
-    for (;;) {
-      if (itr->queue.size_approx() == 0) break;
-      std::this_thread::yield();
+    while (itr->queue.size_approx() != 0) {
+      std::unique_lock<std::mutex> lk(wait_mtx_);
+      wait_cv_.wait_for(lk, std::chrono::milliseconds(1));
     }
     checked++;
     if (checked == work_steal_queue_size) break;

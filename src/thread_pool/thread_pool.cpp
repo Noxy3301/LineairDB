@@ -17,6 +17,8 @@
 #include "thread_pool.h"
 
 #include <concurrentqueue.h>  // moodycamel::concurrentqueue
+#include <condition_variable>
+#include <mutex>
 
 #ifndef __APPLE__
 #include <numa.h>
@@ -115,13 +117,22 @@ bool ThreadPool::IsEmpty() {
 
 void ThreadPool::WaitForQueuesToBecomeEmpty() {
   std::atomic<size_t> ends(0);
+  const size_t target = worker_threads_.size();
+  std::mutex local_mtx;
+  std::condition_variable local_cv;
   for (auto& queue : no_steal_queues_) {
     for (;;) {
-      bool success = queue.enqueue([&]() { ends.fetch_add(1); });
+      bool success = queue.enqueue([&]() {
+        if (ends.fetch_add(1) + 1 == target) {
+          std::lock_guard<std::mutex> lk(local_mtx);
+          local_cv.notify_one();
+        }
+      });
       if (success) break;
     }
   }
-  while (ends.load() < worker_threads_.size()) std::this_thread::yield();
+  std::unique_lock<std::mutex> lk(local_mtx);
+  local_cv.wait(lk, [&] { return ends.load() >= target; });
 }
 
 void ThreadPool::Dequeue() {
@@ -141,7 +152,7 @@ void ThreadPool::Dequeue() {
 
       // It seems that there does not exist any active transaction
       if (my_queue == selected_queue) {
-        std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
         return;
       }
     }

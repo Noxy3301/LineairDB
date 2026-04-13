@@ -18,6 +18,7 @@
 #define LINEAIRDB_THREAD_LOCAL_CALLBACK_MANAGER_BASE_H
 
 #include <atomic>
+#include <condition_variable>
 #include <list>
 #include <mutex>
 #include <queue>
@@ -61,6 +62,8 @@ class ThreadLocalCallbackManager final : public CallbackManagerBase {
   ThreadKeyStorage<WorkStealingQueueNode*> thread_local_work_steal_queue_;
   std::mutex list_lock_;
   std::atomic<size_t> work_steal_queue_size_;
+  std::mutex wait_mtx_;
+  std::condition_variable wait_cv_;
 };
 
 }  // namespace Callback
