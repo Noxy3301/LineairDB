@@ -138,27 +138,18 @@ class Database::Impl {
     }
   }
 
-  // FIXME: TLS workspace assumes one active tx per thread and same CC protocol
-  // across Database instances. Calling BeginTransaction twice without End will
-  // reset the first tx. Switching Database with a different CC protocol will
-  // use the old CC implementation.
+  // Thread-pool safe: always allocate a fresh Transaction per call.
+  // Worker must be OFFLINE when calling this (thread pool pins the worker
+  // to one connection during an active transaction).
   Transaction& BeginTransaction() {
     epoch_framework_.MakeMeOnline();
-    thread_local Transaction* tls_workspace = nullptr;
-    if (tls_workspace != nullptr) {
-      tls_workspace->tx_pimpl_->Reset(this);
-      return *tls_workspace;
-    }
-    auto* tx = new Transaction(this);
-    tx->reusable_ = true;
-    tls_workspace = tx;
-    return *tx;
+    return *(new Transaction(this));
   }
 
   bool EndTransaction(Transaction& tx, CallbackType clbk) {
     if (tx.IsAborted()) {
       clbk(TxStatus::Aborted);
-      if (!tx.reusable_) delete &tx;
+      delete &tx;
       epoch_framework_.MakeMeOffline();
       return false;
     }
@@ -186,7 +177,7 @@ class Database::Impl {
       logger_.TruncateLogs(checkpoint_completed);
     }
 
-    if (!tx.reusable_) delete &tx;
+    delete &tx;
     return committed;
   }
 
@@ -298,6 +289,20 @@ class Database::Impl {
 
   std::optional<Table*> GetTable(const std::string_view table_name) {
     return table_dictionary_.GetTable(table_name);
+  }
+
+  void EnsureThreadOnline() {
+    auto& epoch = epoch_framework_.GetMyThreadLocalEpoch();
+    if (epoch == EpochFramework::THREAD_OFFLINE) {
+      epoch_framework_.MakeMeOnline();
+    }
+  }
+
+  void EnsureThreadOffline() {
+    auto& epoch = epoch_framework_.GetMyThreadLocalEpoch();
+    if (epoch != EpochFramework::THREAD_OFFLINE) {
+      epoch_framework_.MakeMeOffline();
+    }
   }
 
  private:

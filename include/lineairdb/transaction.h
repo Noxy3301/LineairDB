@@ -484,7 +484,6 @@ class Transaction {
  private:
   class Impl;
   const std::unique_ptr<Impl> tx_pimpl_;
-  bool reusable_ = false;
   friend class Database;
 };
 

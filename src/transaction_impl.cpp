@@ -45,7 +45,7 @@ void* GetCurrentTransactionContext() { return current_transaction_context; }
 Transaction::Impl::Impl(Database::Impl* db_pimpl) noexcept
     : current_status_(TxStatus::Running),
       db_pimpl_(db_pimpl),
-      config_ptr_(&db_pimpl_->GetConfig()),
+      config_ref_(db_pimpl_->GetConfig()),
       current_table_(nullptr) {
   current_transaction_context =
       reinterpret_cast<void*>(tx_context_thread_tag | (++tx_context_seq & 0xFFFFFFFF));
@@ -57,7 +57,7 @@ Transaction::Impl::Impl(Database::Impl* db_pimpl) noexcept
   // Here we allocate one (derived) concurrency control instance per
   // transactions. It may be worse on performance because of heap
   // memory allocation. Need to re-implement with composition or templates.
-  switch (config_ptr_->concurrency_control_protocol) {
+  switch (config_ref_.concurrency_control_protocol) {
     case Config::ConcurrencyControl::SiloNWR:
       concurrency_control_ = std::make_unique<ConcurrencyControl::SiloNWR>(
           std::forward<TransactionReferences>(tx));
@@ -81,25 +81,6 @@ Transaction::Impl::Impl(Database::Impl* db_pimpl) noexcept
 }
 
 Transaction::Impl::~Impl() noexcept { current_transaction_context = nullptr; }
-
-void Transaction::Impl::Reset(Database::Impl* db_pimpl) {
-  current_status_ = TxStatus::Running;
-  db_pimpl_ = db_pimpl;
-  config_ptr_ = &db_pimpl_->GetConfig();
-  current_table_ = nullptr;
-  // Generate a unique tx_context per transaction so that PrecisionLocking
-  // can distinguish successive transactions on the same thread.
-  // Upper 32 bits: thread identity, lower 32 bits: per-thread sequence.
-  current_transaction_context =
-      reinterpret_cast<void*>(tx_context_thread_tag | (++tx_context_seq & 0xFFFFFFFF));
-  read_set_.clear();
-  write_set_.clear();
-  remainingNotNullSkWrites_.clear();
-
-  TransactionReferences new_ref{read_set_, write_set_,
-                                db_pimpl_->epoch_framework_, current_status_};
-  concurrency_control_->Reset(std::move(new_ref));
-}
 
 TxStatus Transaction::Impl::GetCurrentStatus() { return current_status_; }
 
@@ -1130,7 +1111,7 @@ void Transaction::Impl::PostProcessing(TxStatus status) {
 void Transaction::Impl::EnsureCurrentTable() {
   if (current_table_ == nullptr) {
     current_table_ =
-        db_pimpl_->GetTable(config_ptr_->anonymous_table_name).value();
+        db_pimpl_->GetTable(config_ref_.anonymous_table_name).value();
   }
 }
 

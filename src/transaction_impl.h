@@ -124,7 +124,6 @@ class Transaction::Impl {
    * We assume that #PostProcessing will be invoked after #Precommit().
    */
   void PostProcessing(TxStatus);
-  void Reset(Database::Impl* db_pimpl);
 
   bool SetTable(const std::string_view table_name);
 
@@ -135,7 +134,7 @@ class Transaction::Impl {
  private:
   TxStatus current_status_;
   Database::Impl* db_pimpl_;
-  const Config* config_ptr_;
+  const Config& config_ref_;
   std::unique_ptr<ConcurrencyControlBase> concurrency_control_;
 
   ReadSetType read_set_;

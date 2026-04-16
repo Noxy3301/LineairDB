@@ -46,15 +46,6 @@ class TwoPhaseLockingImpl final : public ConcurrencyControlBase {
 
   ~TwoPhaseLockingImpl() final override{};
 
-  // TransactionReferences has reference members, so normal assignment (=) is
-  // not possible. Destroy-then-placement-new rebinds the references in place.
-  void Reset(TransactionReferences&& new_ref) override {
-    tx_ref_.~TransactionReferences();
-    new (&tx_ref_) TransactionReferences(std::move(new_ref));
-    undo_set_.clear();
-    read_lock_set_.clear();
-  }
-
   const DataItem Read(const std::string_view,
                       DataItem* index_leaf) final override {
     assert(index_leaf != nullptr);

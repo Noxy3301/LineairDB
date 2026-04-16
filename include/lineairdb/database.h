@@ -151,6 +151,18 @@ class Database {
    */
   void RequestCallbacks();
 
+  /**
+   * @brief Thread-pool helper: ensure the calling thread is marked online in
+   * the epoch framework.  No-op if already online.
+   */
+  void EnsureThreadOnline();
+
+  /**
+   * @brief Thread-pool helper: ensure the calling thread is marked offline in
+   * the epoch framework.  No-op if already offline.
+   */
+  void EnsureThreadOffline();
+
   bool CreateSecondaryIndex(const std::string_view table_name,
                             const std::string_view index_name,
                             const uint index_type);
