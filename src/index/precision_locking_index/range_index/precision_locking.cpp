@@ -72,14 +72,17 @@ PrecisionLockingIndex::PrecisionLockingIndex(LineairDB::EpochFramework& e)
                   }
                 }
                 insert_or_delete_key_set_.erase(beg, end);
-                {
-                  std::lock_guard<std::mutex> lk(pl_cv_mtx_);
-                  last_processed_epoch_.store(stable_epoch,
-                                              std::memory_order_release);
-                }
-                pl_cv_.notify_all();
               }
             }
+            // Always update last_processed_epoch_ so that
+            // WaitForIndexIsLinearizable can proceed even when
+            // no insert/delete events exist (e.g., PK-only tables).
+            {
+              std::lock_guard<std::mutex> lk(pl_cv_mtx_);
+              last_processed_epoch_.store(stable_epoch,
+                                          std::memory_order_release);
+            }
+            pl_cv_.notify_all();
           }
         }
       }){};
