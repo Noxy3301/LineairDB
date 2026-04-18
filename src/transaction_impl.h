@@ -140,6 +140,11 @@ class Transaction::Impl {
 
   ReadSetType read_set_;
   WriteSetType write_set_;
+  // Side indexes mapping (table_name, index_name, key) -> slot in the
+  // corresponding vector. Replaces the per-operation O(N) linear dedup scans
+  // over read_set_/write_set_ that dominated handleTxBatchWrite.
+  std::unordered_map<std::string, size_t> read_set_idx_;
+  std::unordered_map<std::string, size_t> write_set_idx_;
   struct NotNullProgress {
     size_t remainingWrites;
     std::unordered_set<std::string> satisfiedIndexNames;
