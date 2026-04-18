@@ -56,6 +56,11 @@ struct Snapshot {
   }
   Snapshot(const Snapshot&) = default;
   Snapshot& operator=(const Snapshot&) = default;
+  // Declaring copy ctor/assign above suppresses implicit move generation;
+  // emplace_back(std::move(snapshot)) in transaction_impl.cpp would otherwise
+  // silently fall back to the deep copy path below
+  Snapshot(Snapshot&&) = default;
+  Snapshot& operator=(Snapshot&&) = default;
 
   void RecordSecondaryIndexDelta(const std::string_view primary_key,
                                  SecondaryIndexOp op) {
