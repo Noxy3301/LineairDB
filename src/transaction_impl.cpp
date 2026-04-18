@@ -154,10 +154,10 @@ Transaction::Impl::ReadSecondaryIndex(const std::string_view index_name,
   }
 
   EnsureCurrentTable();
+  const auto& table_name = current_table_->GetTableName();
 
   for (auto& snapshot : write_set_) {
-    if (snapshot.key == key &&
-        snapshot.table_name == current_table_->GetTableName() &&
+    if (snapshot.key == key && snapshot.table_name == table_name &&
         snapshot.index_name == index_name) {
       std::vector<std::pair<const std::byte* const, const size_t>> result;
       if (!snapshot.data_item_copy.primary_keys().empty()) {
@@ -172,8 +172,7 @@ Transaction::Impl::ReadSecondaryIndex(const std::string_view index_name,
   }
 
   for (auto& snapshot : read_set_) {
-    if (snapshot.key == key &&
-        snapshot.table_name == current_table_->GetTableName() &&
+    if (snapshot.key == key && snapshot.table_name == table_name &&
         snapshot.index_name == index_name) {
       std::vector<std::pair<const std::byte* const, const size_t>> result;
       if (!snapshot.data_item_copy.primary_keys().empty()) {
@@ -253,6 +252,7 @@ void Transaction::Impl::WriteSecondaryIndex(
   if (IsAborted()) return;
 
   EnsureCurrentTable();
+  const auto& table_name = current_table_->GetTableName();
   const std::string_view primary_key_view(
       reinterpret_cast<const char*>(primary_key_buffer), primary_key_size);
 
@@ -283,8 +283,7 @@ void Transaction::Impl::WriteSecondaryIndex(
   bool is_rmf = false;
   const DataItem* base_data = nullptr;
   for (auto& snapshot : read_set_) {
-    if (snapshot.key == key &&
-        snapshot.table_name == current_table_->GetTableName() &&
+    if (snapshot.key == key && snapshot.table_name == table_name &&
         snapshot.index_name == index_name) {
       is_rmf = true;
       base_data = &snapshot.data_item_copy;
@@ -295,8 +294,7 @@ void Transaction::Impl::WriteSecondaryIndex(
 
   // unique constraint check in the transaction
   for (auto& snapshot : write_set_) {
-    if (snapshot.key != key ||
-        snapshot.table_name != current_table_->GetTableName() ||
+    if (snapshot.key != key || snapshot.table_name != table_name ||
         snapshot.index_name != index_name)
       continue;
     if (index->IsUnique()) {
@@ -362,13 +360,13 @@ void Transaction::Impl::Update(const std::string_view key,
                                const std::byte value[], const size_t size) {
   if (IsAborted()) return;
   EnsureCurrentTable();
+  const auto& table_name = current_table_->GetTableName();
 
   // If key exists in this transaction's write_set_ (e.g., Insert() then
   // Update() in the same transaction), Update() should succeed even if the
   // index entry has not been updated yet.
   for (auto& snapshot : write_set_) {
-    if (snapshot.key == key &&
-        snapshot.table_name == current_table_->GetTableName()) {
+    if (snapshot.key == key && snapshot.table_name == table_name) {
       // If the key was deleted within this transaction, Update should fail.
       if (!snapshot.data_item_copy.IsInitialized()) {
         Abort();
@@ -438,8 +436,9 @@ const std::optional<size_t> Transaction::Impl::Scan(
 
   // Step 2: Collect keys from write_set
   std::vector<std::string> write_set_keys;
+  const auto& table_name = current_table_->GetTableName();
   for (const auto& snapshot : write_set_) {
-    if (snapshot.table_name != current_table_->GetTableName()) continue;
+    if (snapshot.table_name != table_name) continue;
     if (!snapshot.index_name.empty()) continue;  // base-table scan only
     if (snapshot.key < begin) continue;
     if (end.has_value() && snapshot.key > end.value()) continue;
@@ -556,8 +555,9 @@ const std::optional<size_t> Transaction::Impl::ScanReverse(
 
   // Step 2: Collect keys from write_set
   std::vector<std::string> write_set_keys;
+  const auto& table_name = current_table_->GetTableName();
   for (const auto& snapshot : write_set_) {
-    if (snapshot.table_name != current_table_->GetTableName()) continue;
+    if (snapshot.table_name != table_name) continue;
     if (!snapshot.index_name.empty()) continue;  // base-table scan only
     if (snapshot.key < begin) continue;
     if (end.has_value() && snapshot.key > end.value()) continue;
