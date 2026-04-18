@@ -97,7 +97,10 @@ class PrecisionLockingIndex {
   using PredicateList = std::map<EpochNumber, std::vector<Predicate>>;
   using InsertOrDeleteKeySet =
       std::map<EpochNumber, std::vector<InsertOrDeleteEvent>>;
-  using ROWEXRangeIndexContainer = std::map<std::string, IndexItem>;
+  // std::less<> enables heterogeneous lookup: find(string_view) no longer
+  // allocates a temporary std::string. See C++14 [associative.reqmts.general]
+  using ROWEXRangeIndexContainer =
+      std::map<std::string, IndexItem, std::less<>>;
 
   PredicateList predicate_list_;
   std::shared_mutex plock_;

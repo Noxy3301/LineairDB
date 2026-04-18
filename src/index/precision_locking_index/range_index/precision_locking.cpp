@@ -219,7 +219,7 @@ bool PrecisionLockingIndex::Delete(const std::string_view key) {
 
 bool PrecisionLockingIndex::Contains(const std::string_view key) {
   std::shared_lock<decltype(ulock_)> u_guard(ulock_);
-  auto it = container_.find(std::string(key));
+  auto it = container_.find(key);
   if (it == container_.end()) return false;
   return !it->second.is_deleted;
 }
