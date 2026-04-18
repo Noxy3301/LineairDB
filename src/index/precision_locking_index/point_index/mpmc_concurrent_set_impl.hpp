@@ -147,8 +147,13 @@ T* MPMCConcurrentSetImpl<T>::Get(const std::string_view key) {
   // Hoisted outside the probe loop: the prefix is a pure function of `key`
   // and doesn't change across iterations
   const uint64_t key_prefix = string_to_uint64_t(key);
+  // Cache the TLS epoch slot once to avoid pthread_getspecific on every
+  // online/offline toggle below (MakeMeOnline + MakeMeOffline would call it
+  // twice per Get, and Get is the hottest symbol in TPC-C)
+  EpochNumber& my_epoch = epoch_framework_.GetMyThreadLocalEpoch();
 get_start:
-  epoch_framework_.MakeMeOnline();
+  assert(my_epoch == EpochFramework::THREAD_OFFLINE);
+  my_epoch = epoch_framework_.GetGlobalEpoch();
   auto* table = table_.load(std::memory_order::memory_order_relaxed);
   __builtin_prefetch(table, 0, PREFETCH_LOCALITY);
   size_t hash = Hash(key, table);
@@ -188,7 +193,7 @@ get_start:
     }
     bucket_p = (*table)[hash].load(std::memory_order::memory_order_relaxed);
     if (count > 100) {
-      epoch_framework_.MakeMeOffline();
+      my_epoch = EpochFramework::THREAD_OFFLINE;
       force_rehash_flag_.store(true);
       rehash_cv_.notify_all();  // rehash the table to reduce the probing length
       epoch_framework_.Sync();
@@ -197,7 +202,7 @@ get_start:
     }
   }
 
-  epoch_framework_.MakeMeOffline();
+  my_epoch = EpochFramework::THREAD_OFFLINE;
   return return_value_p;
 }
 
@@ -207,8 +212,12 @@ bool MPMCConcurrentSetImpl<T>::Put(const std::string_view key,
   // Hoisted outside the probe loop: the prefix is a pure function of `key`
   // and doesn't change across iterations
   const uint64_t key_prefix = string_to_uint64_t(key);
+  // Cache the TLS epoch slot once to avoid pthread_getspecific on every
+  // online/offline toggle below
+  EpochNumber& my_epoch = epoch_framework_.GetMyThreadLocalEpoch();
 put_start:
-  epoch_framework_.MakeMeOnline();
+  assert(my_epoch == EpochFramework::THREAD_OFFLINE);
+  my_epoch = epoch_framework_.GetGlobalEpoch();
   auto* table = table_.load(std::memory_order::memory_order_seq_cst);
   size_t hash = Hash(key, table);
   auto* new_node = new TableNode(key, value_p);
@@ -237,7 +246,7 @@ put_start:
         const size_t current_stored = populated_count_.fetch_add(1);
         const double current_fill_rate =
             (current_stored / static_cast<double>(table->size()));
-        epoch_framework_.MakeMeOffline();
+        my_epoch = EpochFramework::THREAD_OFFLINE;
         if (rehash_threshold_ < current_fill_rate) {
           rehash_cv_.notify_one();
         }
@@ -251,7 +260,7 @@ put_start:
     if (node->key_8b_prefix == key_prefix) {
       if (node->key == key) {
         delete new_node;
-        epoch_framework_.MakeMeOffline();
+        my_epoch = EpochFramework::THREAD_OFFLINE;
         return false;
       }
     }
@@ -263,7 +272,7 @@ put_start:
     }
 
     if (count > 100) {
-      epoch_framework_.MakeMeOffline();
+      my_epoch = EpochFramework::THREAD_OFFLINE;
       force_rehash_flag_.store(true);
       rehash_cv_.notify_all();  // rehash the table to reduce the probing length
       epoch_framework_.Sync();
