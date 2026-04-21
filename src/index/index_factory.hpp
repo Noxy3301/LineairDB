@@ -5,6 +5,7 @@
 
 #include <memory>
 
+#include "index/impl/masstree_index.hpp"
 #include "index/impl/pl_index.hpp"
 #include "index/index_base.h"
 #include "util/epoch_framework.hpp"
@@ -16,6 +17,8 @@ inline std::unique_ptr<IndexBase> MakeIndex(Config c, EpochFramework& e) {
   switch (c.index_structure) {
     case Config::IndexStructure::HashTableWithPrecisionLockingIndex:
       return std::make_unique<PLIndex>(c, e);
+    case Config::IndexStructure::Masstree:
+      return std::make_unique<MasstreeIndex>(c, e);
     default:
       return std::make_unique<PLIndex>(c, e);
   }

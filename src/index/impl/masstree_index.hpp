@@ -1,0 +1,58 @@
+#ifndef LINEAIRDB_INDEX_IMPL_MASSTREE_INDEX_HPP
+#define LINEAIRDB_INDEX_IMPL_MASSTREE_INDEX_HPP
+
+#include <lineairdb/config.h>
+
+#include <memory>
+
+#include "index/index_base.h"
+#include "util/epoch_framework.hpp"
+
+namespace LineairDB {
+namespace Index {
+
+// PImpl wrapper around masstree-beta. Masstree headers are confined to
+// masstree_index.cpp; this header stays free of masstree to avoid leaking
+// its templates / macros through index_factory.hpp -> secondary_index.h
+// into the rest of LDB (and through there, into tests that do not have
+// masstree on their include path).
+class MasstreeIndex final : public IndexBase {
+ public:
+  MasstreeIndex(Config c, EpochFramework& e);
+  ~MasstreeIndex() override;
+
+  DataItem* Get(std::string_view key) override;
+  bool Put(std::string_view key, DataItem&& rhs) override;
+  bool Insert(std::string_view key) override;
+  bool Delete(std::string_view key) override;
+
+  void ForcePutBlankEntry(std::string_view key) override;
+  bool EnsureVisibleForSecondaryWrite(std::string_view key) override;
+
+  std::optional<size_t> Scan(
+      std::string_view begin, std::optional<std::string_view> end,
+      std::function<bool(std::string_view)> operation) override;
+  std::optional<size_t> Scan(
+      std::string_view begin, std::string_view end,
+      std::function<bool(std::string_view, DataItem&)> operation) override;
+  std::optional<size_t> ScanReverse(
+      std::string_view begin, std::optional<std::string_view> end,
+      std::function<bool(std::string_view)> operation) override;
+  std::optional<size_t> ScanReverse(
+      std::string_view begin, std::string_view end,
+      std::function<bool(std::string_view, DataItem&)> operation) override;
+
+  void ForEach(
+      std::function<bool(std::string_view, DataItem&)> operation) override;
+
+  void WaitForIndexIsLinearizable() override;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+}  // namespace Index
+}  // namespace LineairDB
+
+#endif /* LINEAIRDB_INDEX_IMPL_MASSTREE_INDEX_HPP */
