@@ -18,7 +18,7 @@
 
 #include <functional>
 
-#include "index/precision_locking_index/index.hpp"
+#include "index/index_factory.hpp"
 #include "lineairdb/config.h"
 #include "types/data_item.hpp"
 #include "types/definitions.h"
@@ -28,21 +28,11 @@ namespace Index {
 
 ConcurrentTable::ConcurrentTable(EpochFramework& epoch_framework, Config config,
                                  WriteSetType recovery_set)
-    : epoch_manager_ref_(epoch_framework) {
-  switch (config.index_structure) {
-    case Config::IndexStructure::HashTableWithPrecisionLockingIndex:
-      index_ = std::make_unique<HashTableWithPrecisionLockingIndex<DataItem>>(
-          config, epoch_manager_ref_);
-      break;
-    default:
-      index_ = std::make_unique<HashTableWithPrecisionLockingIndex<DataItem>>(
-          config, epoch_manager_ref_);
-      break;
-  }
-
+    : index_(MakeIndex(config, epoch_framework)),
+      epoch_manager_ref_(epoch_framework) {
   if (recovery_set.empty()) return;
   for (auto& entry : recovery_set) {
-    index_->Put(entry.key, *entry.index_cache);
+    index_->Put(entry.key, DataItem(*entry.index_cache));
   }
 }
 

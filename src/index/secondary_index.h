@@ -1,6 +1,8 @@
-#pragma once
+#ifndef LINEAIRDB_SECONDARY_INDEX_H
+#define LINEAIRDB_SECONDARY_INDEX_H
 
-#include "index/concurrent_table.h"
+#include "index/index_base.h"
+#include "index/index_factory.hpp"
 #include "index/secondary_index_type.h"
 #include "util/epoch_framework.hpp"
 
@@ -12,11 +14,8 @@ class SecondaryIndex {
   SecondaryIndex(EpochFramework& epoch_framework, Config config = Config(),
                  SecondaryIndexType index_type = SecondaryIndexType(),
                  [[maybe_unused]] WriteSetType recovery_set = WriteSetType())
-      : index_type_(index_type) {
-    secondary_index_ =
-        std::make_unique<HashTableWithPrecisionLockingIndex<DataItem>>(
-            config, epoch_framework);
-  }
+      : index_type_(index_type),
+        secondary_index_(MakeIndex(config, epoch_framework)) {}
 
   DataItem* Get(std::string_view key) { return secondary_index_->Get(key); }
 
@@ -75,8 +74,9 @@ class SecondaryIndex {
 
  private:
   SecondaryIndexType index_type_;
-  std::unique_ptr<HashTableWithPrecisionLockingIndex<DataItem>>
-      secondary_index_;
+  std::unique_ptr<IndexBase> secondary_index_;
 };
 }  // namespace Index
 }  // namespace LineairDB
+
+#endif /* LINEAIRDB_SECONDARY_INDEX_H */

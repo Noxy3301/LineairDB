@@ -20,10 +20,11 @@
 #include <lineairdb/config.h>
 
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 
-#include "index/precision_locking_index/index.hpp"
+#include "index/index_base.h"
 #include "types/data_item.hpp"
 #include "types/definitions.h"
 #include "types/snapshot.hpp"
@@ -60,7 +61,7 @@ class ConcurrentTable {
   void WaitForIndexIsLinearizable();
 
  private:
-  std::unique_ptr<HashTableWithPrecisionLockingIndex<DataItem>> index_;
+  std::unique_ptr<IndexBase> index_;
   LineairDB::EpochFramework& epoch_manager_ref_;
 };
 }  // namespace Index
