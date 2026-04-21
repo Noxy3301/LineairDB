@@ -34,25 +34,29 @@ class PLIndex final : public IndexBase {
 
   std::optional<size_t> Scan(
       std::string_view begin, std::optional<std::string_view> end,
-      std::function<bool(std::string_view)> operation) override {
+      std::function<bool(std::string_view)> operation,
+      std::vector<NodeVersionEntry>* /*out_versions*/ = nullptr) override {
     return impl_.Scan(begin, end, operation);
   }
 
   std::optional<size_t> Scan(
       std::string_view begin, std::string_view end,
-      std::function<bool(std::string_view, DataItem&)> operation) override {
+      std::function<bool(std::string_view, DataItem&)> operation,
+      std::vector<NodeVersionEntry>* /*out_versions*/ = nullptr) override {
     return impl_.Scan(begin, std::optional<std::string_view>(end), operation);
   }
 
   std::optional<size_t> ScanReverse(
       std::string_view begin, std::optional<std::string_view> end,
-      std::function<bool(std::string_view)> operation) override {
+      std::function<bool(std::string_view)> operation,
+      std::vector<NodeVersionEntry>* /*out_versions*/ = nullptr) override {
     return impl_.ScanReverse(begin, end, operation);
   }
 
   std::optional<size_t> ScanReverse(
       std::string_view begin, std::string_view end,
-      std::function<bool(std::string_view, DataItem&)> operation) override {
+      std::function<bool(std::string_view, DataItem&)> operation,
+      std::vector<NodeVersionEntry>* /*out_versions*/ = nullptr) override {
     return impl_.ScanReverse(begin, std::optional<std::string_view>(end),
                              operation);
   }
@@ -64,6 +68,13 @@ class PLIndex final : public IndexBase {
 
   void WaitForIndexIsLinearizable() override {
     impl_.WaitForIndexIsLinearizable();
+  }
+
+  // PL already rejects phantoms at Scan time (nullopt return), so deferred
+  // validation is a no-op.
+  bool ValidatePhantoms(
+      const std::vector<NodeVersionEntry>& /*entries*/) override {
+    return true;
   }
 
  private:

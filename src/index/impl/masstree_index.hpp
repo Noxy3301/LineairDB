@@ -31,21 +31,28 @@ class MasstreeIndex final : public IndexBase {
 
   std::optional<size_t> Scan(
       std::string_view begin, std::optional<std::string_view> end,
-      std::function<bool(std::string_view)> operation) override;
+      std::function<bool(std::string_view)> operation,
+      std::vector<NodeVersionEntry>* out_versions = nullptr) override;
   std::optional<size_t> Scan(
       std::string_view begin, std::string_view end,
-      std::function<bool(std::string_view, DataItem&)> operation) override;
+      std::function<bool(std::string_view, DataItem&)> operation,
+      std::vector<NodeVersionEntry>* out_versions = nullptr) override;
   std::optional<size_t> ScanReverse(
       std::string_view begin, std::optional<std::string_view> end,
-      std::function<bool(std::string_view)> operation) override;
+      std::function<bool(std::string_view)> operation,
+      std::vector<NodeVersionEntry>* out_versions = nullptr) override;
   std::optional<size_t> ScanReverse(
       std::string_view begin, std::string_view end,
-      std::function<bool(std::string_view, DataItem&)> operation) override;
+      std::function<bool(std::string_view, DataItem&)> operation,
+      std::vector<NodeVersionEntry>* out_versions = nullptr) override;
 
   void ForEach(
       std::function<bool(std::string_view, DataItem&)> operation) override;
 
   void WaitForIndexIsLinearizable() override;
+
+  bool ValidatePhantoms(
+      const std::vector<NodeVersionEntry>& entries) override;
 
  private:
   struct Impl;

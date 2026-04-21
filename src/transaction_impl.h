@@ -27,6 +27,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "concurrency_control/concurrency_control_base.h"
 #include "table/table.h"
@@ -140,6 +141,9 @@ class Transaction::Impl {
 
   ReadSetType read_set_;
   WriteSetType write_set_;
+  // Deferred phantom-detection snapshots collected from Masstree-backed
+  // scans during this transaction. Re-checked at Precommit; empty for PL.
+  std::vector<Index::NodeVersionEntry> node_version_set_;
   struct NotNullProgress {
     size_t remainingWrites;
     std::unordered_set<std::string> satisfiedIndexNames;

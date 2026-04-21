@@ -42,23 +42,30 @@ class ConcurrentTable {
   DataItem* GetOrInsert(const std::string_view key);
   bool Put(const std::string_view key, DataItem&& value);
   void ForEach(std::function<bool(std::string_view, DataItem&)>);
-  std::optional<size_t> Scan(const std::string_view begin,
-                             const std::optional<std::string_view> end,
-                             std::function<bool(std::string_view)> operation);
+  std::optional<size_t> Scan(
+      const std::string_view begin, const std::optional<std::string_view> end,
+      std::function<bool(std::string_view)> operation,
+      std::vector<NodeVersionEntry>* out_versions = nullptr);
   std::optional<size_t> Scan(
       const std::string_view begin, const std::string_view end,
-      std::function<bool(std::string_view, DataItem&)> operation);
+      std::function<bool(std::string_view, DataItem&)> operation,
+      std::vector<NodeVersionEntry>* out_versions = nullptr);
   std::optional<size_t> ScanReverse(
       const std::string_view begin, const std::optional<std::string_view> end,
-      std::function<bool(std::string_view)> operation);
+      std::function<bool(std::string_view)> operation,
+      std::vector<NodeVersionEntry>* out_versions = nullptr);
   std::optional<size_t> ScanReverse(
       const std::string_view begin, const std::string_view end,
-      std::function<bool(std::string_view, DataItem&)> operation);
+      std::function<bool(std::string_view, DataItem&)> operation,
+      std::vector<NodeVersionEntry>* out_versions = nullptr);
   bool Insert(const std::string_view key);
 
   bool Delete(const std::string_view key);
 
   void WaitForIndexIsLinearizable();
+
+  // Re-check deferred phantom snapshots (Masstree backend) for this index.
+  bool ValidatePhantoms(const std::vector<NodeVersionEntry>& entries);
 
  private:
   std::unique_ptr<IndexBase> index_;

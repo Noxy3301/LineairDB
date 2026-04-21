@@ -66,26 +66,30 @@ void ConcurrentTable::ForEach(
 
 std::optional<size_t> ConcurrentTable::Scan(
     const std::string_view begin, const std::optional<std::string_view> end,
-    std::function<bool(std::string_view)> operation) {
-  return index_->Scan(begin, end, operation);
+    std::function<bool(std::string_view)> operation,
+    std::vector<NodeVersionEntry>* out_versions) {
+  return index_->Scan(begin, end, operation, out_versions);
 };
 
 std::optional<size_t> ConcurrentTable::Scan(
     const std::string_view begin, const std::string_view end,
-    std::function<bool(std::string_view, DataItem&)> operation) {
-  return index_->Scan(begin, end, operation);
+    std::function<bool(std::string_view, DataItem&)> operation,
+    std::vector<NodeVersionEntry>* out_versions) {
+  return index_->Scan(begin, end, operation, out_versions);
 };
 
 std::optional<size_t> ConcurrentTable::ScanReverse(
     const std::string_view begin, const std::optional<std::string_view> end,
-    std::function<bool(std::string_view)> operation) {
-  return index_->ScanReverse(begin, end, operation);
+    std::function<bool(std::string_view)> operation,
+    std::vector<NodeVersionEntry>* out_versions) {
+  return index_->ScanReverse(begin, end, operation, out_versions);
 };
 
 std::optional<size_t> ConcurrentTable::ScanReverse(
     const std::string_view begin, const std::string_view end,
-    std::function<bool(std::string_view, DataItem&)> operation) {
-  return index_->ScanReverse(begin, end, operation);
+    std::function<bool(std::string_view, DataItem&)> operation,
+    std::vector<NodeVersionEntry>* out_versions) {
+  return index_->ScanReverse(begin, end, operation, out_versions);
 };
 
 bool ConcurrentTable::Delete(const std::string_view key) {
@@ -94,6 +98,11 @@ bool ConcurrentTable::Delete(const std::string_view key) {
 
 void ConcurrentTable::WaitForIndexIsLinearizable() {
   index_->WaitForIndexIsLinearizable();
+}
+
+bool ConcurrentTable::ValidatePhantoms(
+    const std::vector<NodeVersionEntry>& entries) {
+  return index_->ValidatePhantoms(entries);
 }
 }  // namespace Index
 }  // namespace LineairDB

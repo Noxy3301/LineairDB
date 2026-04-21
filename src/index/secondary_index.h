@@ -36,16 +36,22 @@ class SecondaryIndex {
     return item;
   }
 
-  std::optional<size_t> Scan(std::string_view begin,
-                             std::optional<std::string_view> end,
-                             std::function<bool(std::string_view)> operation) {
-    return secondary_index_->Scan(begin, end, operation);
+  std::optional<size_t> Scan(
+      std::string_view begin, std::optional<std::string_view> end,
+      std::function<bool(std::string_view)> operation,
+      std::vector<NodeVersionEntry>* out_versions = nullptr) {
+    return secondary_index_->Scan(begin, end, operation, out_versions);
   }
 
   std::optional<size_t> ScanReverse(
       std::string_view begin, std::optional<std::string_view> end,
-      std::function<bool(std::string_view)> operation) {
-    return secondary_index_->ScanReverse(begin, end, operation);
+      std::function<bool(std::string_view)> operation,
+      std::vector<NodeVersionEntry>* out_versions = nullptr) {
+    return secondary_index_->ScanReverse(begin, end, operation, out_versions);
+  }
+
+  bool ValidatePhantoms(const std::vector<NodeVersionEntry>& entries) {
+    return secondary_index_->ValidatePhantoms(entries);
   }
 
   bool Delete(std::string_view key) {

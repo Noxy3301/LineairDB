@@ -61,18 +61,25 @@ inline void ensure_thread_init() {
 }
 
 // Adapter that drives masstree's forward/reverse scan into the LDB callback
-// shape (operation returning `true` means cancel). `emit_cb` only runs for
-// keys strictly inside [begin, end); end_ is held separately because
-// masstree's visitor sees arbitrary keys beyond the upper bound.
+// shape (operation returning `true` means cancel). When `out_versions` is
+// set, every leaf masstree visits records (leaf_ptr, full_version_value) so
+// that MasstreeIndex::ValidatePhantoms can re-check at commit.
 struct ScanAdapter {
   const char* end_ptr;
   size_t end_len;
   bool has_end;
   std::function<bool(std::string_view)> cb;
+  IndexBase* owner;
+  std::vector<NodeVersionEntry>* out_versions;
   size_t count = 0;
 
   template <typename SS, typename K>
-  void visit_leaf(const SS&, const K&, threadinfo&) {}
+  void visit_leaf(const SS& stack, const K&, threadinfo&) {
+    if (out_versions == nullptr) return;
+    out_versions->push_back(
+        {owner, static_cast<const void*>(stack.node()),
+         static_cast<std::uint64_t>(stack.full_version_value())});
+  }
 
   // Returns true to keep scanning, false to stop (masstree convention).
   bool visit_value(Masstree::Str key, DataItem* /*val*/, threadinfo&) {
@@ -97,10 +104,17 @@ struct ScanValueAdapter {
   size_t end_len;
   bool has_end;
   std::function<bool(std::string_view, DataItem&)> cb;
+  IndexBase* owner;
+  std::vector<NodeVersionEntry>* out_versions;
   size_t count = 0;
 
   template <typename SS, typename K>
-  void visit_leaf(const SS&, const K&, threadinfo&) {}
+  void visit_leaf(const SS& stack, const K&, threadinfo&) {
+    if (out_versions == nullptr) return;
+    out_versions->push_back(
+        {owner, static_cast<const void*>(stack.node()),
+         static_cast<std::uint64_t>(stack.full_version_value())});
+  }
 
   bool visit_value(Masstree::Str key, DataItem* val, threadinfo&) {
     if (has_end) {
@@ -118,6 +132,8 @@ struct ScanValueAdapter {
     return true;
   }
 };
+
+using leaf_type = Masstree::leaf<table_params>;
 
 }  // namespace
 
@@ -214,14 +230,16 @@ struct MasstreeIndex::Impl {
 
   std::optional<size_t> Scan(
       std::string_view begin, std::optional<std::string_view> end,
-      std::function<bool(std::string_view)> op) {
+      std::function<bool(std::string_view)> op, IndexBase* owner,
+      std::vector<NodeVersionEntry>* out_versions) {
     ensure_thread_init();
-    ScanAdapter adapter{
-        end.has_value() ? end->data() : nullptr,
-        end.has_value() ? end->size() : 0,
-        end.has_value(),
-        std::move(op),
-        0};
+    ScanAdapter adapter{end.has_value() ? end->data() : nullptr,
+                        end.has_value() ? end->size() : 0,
+                        end.has_value(),
+                        std::move(op),
+                        owner,
+                        out_versions,
+                        0};
     Masstree::Str firstkey(begin.data(), begin.size());
     table_.scan(firstkey, /*emit_firstkey=*/true, adapter, *tls_ti);
     return adapter.count;
@@ -229,10 +247,17 @@ struct MasstreeIndex::Impl {
 
   std::optional<size_t> Scan(
       std::string_view begin, std::string_view end,
-      std::function<bool(std::string_view, DataItem&)> op) {
+      std::function<bool(std::string_view, DataItem&)> op,
+      IndexBase* owner,
+      std::vector<NodeVersionEntry>* out_versions) {
     ensure_thread_init();
-    ScanValueAdapter adapter{end.data(),   end.size(), true,
-                             std::move(op), 0};
+    ScanValueAdapter adapter{end.data(),
+                             end.size(),
+                             true,
+                             std::move(op),
+                             owner,
+                             out_versions,
+                             0};
     Masstree::Str firstkey(begin.data(), begin.size());
     table_.scan(firstkey, /*emit_firstkey=*/true, adapter, *tls_ti);
     return adapter.count;
@@ -240,7 +265,8 @@ struct MasstreeIndex::Impl {
 
   std::optional<size_t> ScanReverse(
       std::string_view begin, std::optional<std::string_view> end,
-      std::function<bool(std::string_view)> op) {
+      std::function<bool(std::string_view)> op, IndexBase* owner,
+      std::vector<NodeVersionEntry>* out_versions) {
     ensure_thread_init();
     // Reverse scan walks downward from `end - 1`, stopping once key < begin.
     // Range is [begin, end) just like forward Scan.
@@ -255,7 +281,13 @@ struct MasstreeIndex::Impl {
       if (key_below_begin) return true;  // below begin -> stop
       return cb(key);
     };
-    ScanAdapter adapter{nullptr, 0, false, std::move(adapter_op), 0};
+    ScanAdapter adapter{nullptr,
+                        0,
+                        false,
+                        std::move(adapter_op),
+                        owner,
+                        out_versions,
+                        0};
     if (end.has_value()) {
       Masstree::Str firstkey(end->data(), end->size());
       table_.rscan(firstkey, /*emit_firstkey=*/false, adapter, *tls_ti);
@@ -270,7 +302,9 @@ struct MasstreeIndex::Impl {
 
   std::optional<size_t> ScanReverse(
       std::string_view begin, std::string_view end,
-      std::function<bool(std::string_view, DataItem&)> op) {
+      std::function<bool(std::string_view, DataItem&)> op,
+      IndexBase* owner,
+      std::vector<NodeVersionEntry>* out_versions) {
     ensure_thread_init();
     auto adapter_op = [b_ptr = begin.data(), b_len = begin.size(),
                        cb = std::move(op)](std::string_view key,
@@ -284,7 +318,13 @@ struct MasstreeIndex::Impl {
       if (key_below_begin) return true;
       return cb(key, val);
     };
-    ScanValueAdapter adapter{nullptr, 0, false, std::move(adapter_op), 0};
+    ScanValueAdapter adapter{nullptr,
+                             0,
+                             false,
+                             std::move(adapter_op),
+                             owner,
+                             out_versions,
+                             0};
     Masstree::Str firstkey(end.data(), end.size());
     table_.rscan(firstkey, /*emit_firstkey=*/false, adapter, *tls_ti);
     return adapter.count;
@@ -292,8 +332,23 @@ struct MasstreeIndex::Impl {
 
   void ForEach(std::function<bool(std::string_view, DataItem&)> op) {
     ensure_thread_init();
-    ScanValueAdapter adapter{nullptr, 0, false, std::move(op), 0};
+    ScanValueAdapter adapter{nullptr, 0, false, std::move(op),
+                             nullptr, nullptr, 0};
     table_.scan(Masstree::Str(), /*emit_firstkey=*/true, adapter, *tls_ti);
+  }
+
+  bool ValidatePhantoms(const std::vector<NodeVersionEntry>& entries,
+                        IndexBase* self) {
+    for (const auto& e : entries) {
+      if (e.owner != self) continue;  // entry belongs to a different index
+      const auto* leaf =
+          static_cast<const leaf_type*>(e.node_ptr);
+      if (static_cast<std::uint64_t>(leaf->full_version_value()) !=
+          e.version) {
+        return false;
+      }
+    }
+    return true;
   }
 
   void WaitForIndexIsLinearizable() {
@@ -333,26 +388,32 @@ bool MasstreeIndex::EnsureVisibleForSecondaryWrite(std::string_view key) {
 
 std::optional<size_t> MasstreeIndex::Scan(
     std::string_view begin, std::optional<std::string_view> end,
-    std::function<bool(std::string_view)> operation) {
-  return impl_->Scan(begin, end, std::move(operation));
+    std::function<bool(std::string_view)> operation,
+    std::vector<NodeVersionEntry>* out_versions) {
+  return impl_->Scan(begin, end, std::move(operation), this, out_versions);
 }
 
 std::optional<size_t> MasstreeIndex::Scan(
     std::string_view begin, std::string_view end,
-    std::function<bool(std::string_view, DataItem&)> operation) {
-  return impl_->Scan(begin, end, std::move(operation));
+    std::function<bool(std::string_view, DataItem&)> operation,
+    std::vector<NodeVersionEntry>* out_versions) {
+  return impl_->Scan(begin, end, std::move(operation), this, out_versions);
 }
 
 std::optional<size_t> MasstreeIndex::ScanReverse(
     std::string_view begin, std::optional<std::string_view> end,
-    std::function<bool(std::string_view)> operation) {
-  return impl_->ScanReverse(begin, end, std::move(operation));
+    std::function<bool(std::string_view)> operation,
+    std::vector<NodeVersionEntry>* out_versions) {
+  return impl_->ScanReverse(begin, end, std::move(operation), this,
+                            out_versions);
 }
 
 std::optional<size_t> MasstreeIndex::ScanReverse(
     std::string_view begin, std::string_view end,
-    std::function<bool(std::string_view, DataItem&)> operation) {
-  return impl_->ScanReverse(begin, end, std::move(operation));
+    std::function<bool(std::string_view, DataItem&)> operation,
+    std::vector<NodeVersionEntry>* out_versions) {
+  return impl_->ScanReverse(begin, end, std::move(operation), this,
+                            out_versions);
 }
 
 void MasstreeIndex::ForEach(
@@ -362,6 +423,11 @@ void MasstreeIndex::ForEach(
 
 void MasstreeIndex::WaitForIndexIsLinearizable() {
   impl_->WaitForIndexIsLinearizable();
+}
+
+bool MasstreeIndex::ValidatePhantoms(
+    const std::vector<NodeVersionEntry>& entries) {
+  return impl_->ValidatePhantoms(entries, this);
 }
 
 }  // namespace Index

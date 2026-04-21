@@ -95,6 +95,7 @@ void Transaction::Impl::Reset(Database::Impl* db_pimpl) {
   read_set_.clear();
   write_set_.clear();
   remainingNotNullSkWrites_.clear();
+  node_version_set_.clear();
 
   TransactionReferences new_ref{read_set_, write_set_,
                                 db_pimpl_->epoch_framework_, current_status_};
@@ -424,10 +425,12 @@ const std::optional<size_t> Transaction::Impl::Scan(
   std::vector<std::string> index_keys;
   index_keys.reserve(4096);
   auto index_result = current_table_->GetPrimaryIndex().Scan(
-      begin, end, [&](std::string_view key) {
+      begin, end,
+      [&](std::string_view key) {
         index_keys.emplace_back(key);
         return false;  // Continue to collect all keys
-      });
+      },
+      &node_version_set_);
 
   if (!index_result.has_value()) {
     Abort();
@@ -543,10 +546,12 @@ const std::optional<size_t> Transaction::Impl::ScanReverse(
   std::vector<std::string> index_keys;
   index_keys.reserve(4096);
   auto index_result = current_table_->GetPrimaryIndex().ScanReverse(
-      begin, end, [&](std::string_view key) {
+      begin, end,
+      [&](std::string_view key) {
         index_keys.emplace_back(key);
         return false;  // Continue to collect all keys
-      });
+      },
+      &node_version_set_);
 
   if (!index_result.has_value()) {
     Abort();
@@ -658,10 +663,13 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndex(
   // instead of std::set (which allocates per-node).
   std::vector<std::string> index_keys;
   index_keys.reserve(64);
-  auto index_result = index->Scan(begin, end, [&](std::string_view key) {
-    index_keys.emplace_back(key);
-    return false;  // Continue to collect all keys
-  });
+  auto index_result = index->Scan(
+      begin, end,
+      [&](std::string_view key) {
+        index_keys.emplace_back(key);
+        return false;  // Continue to collect all keys
+      },
+      &node_version_set_);
 
   if (!index_result.has_value()) {
     Abort();
@@ -759,10 +767,13 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndexReverse(
   // Step 1: Collect keys from secondary index (sorted order from SI)
   std::vector<std::string> index_keys;
   index_keys.reserve(64);
-  auto index_result = index->ScanReverse(begin, end, [&](std::string_view key) {
-    index_keys.emplace_back(key);
-    return false;  // Continue to collect all keys
-  });
+  auto index_result = index->ScanReverse(
+      begin, end,
+      [&](std::string_view key) {
+        index_keys.emplace_back(key);
+        return false;  // Continue to collect all keys
+      },
+      &node_version_set_);
 
   if (!index_result.has_value()) {
     Abort();
@@ -1113,6 +1124,20 @@ void Transaction::Impl::Abort() {
 }
 bool Transaction::Impl::Precommit() {
   if (IsAborted()) return false;
+
+  // Deferred phantom validation (Masstree scans). Each unique owner index
+  // only needs one ValidatePhantoms call because ValidatePhantoms filters
+  // entries by owner internally. PL owners always return true.
+  if (!node_version_set_.empty()) {
+    std::unordered_set<Index::IndexBase*> owners;
+    for (const auto& e : node_version_set_) owners.insert(e.owner);
+    for (auto* owner : owners) {
+      if (!owner->ValidatePhantoms(node_version_set_)) {
+        Abort();
+        return false;
+      }
+    }
+  }
 
   const bool need_to_checkpoint =
       (db_pimpl_->GetConfig().enable_checkpointing &&
