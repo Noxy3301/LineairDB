@@ -20,6 +20,7 @@
 #include <lineairdb/tx_status.h>
 
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -56,8 +57,18 @@ class ConcurrencyControlBase {
   bool IsReadOnly() { return (0 == tx_ref_.write_set_ref_.size()); }
   bool IsWriteOnly() { return (0 == tx_ref_.read_set_ref_.size()); }
 
+  // Hook for index-layer checks that must run at the CC's serial point
+  // (after read-set validation and under write locks, before buffer
+  // update). Used by Masstree's deferred phantom validation. Returning
+  // false aborts the tx. PL-backed txs leave this unset.
+  using PreCommitValidator = std::function<bool()>;
+  void SetPreCommitValidator(PreCommitValidator v) {
+    pre_commit_validator_ = std::move(v);
+  }
+
  protected:
   TransactionReferences tx_ref_;
+  PreCommitValidator pre_commit_validator_;
 };
 }  // namespace LineairDB
 

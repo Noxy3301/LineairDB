@@ -149,6 +149,13 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
 
     if constexpr (EnableNWR) {
       if (!IsReadOnly() && IsOmittable()) {
+        // NWR's omittable analysis orders versions but says nothing about
+        // phantoms. Run deferred phantom validation here too; otherwise a
+        // Masstree scan followed by an omittable commit can miss a
+        // concurrent structural change in the scanned range.
+        if (pre_commit_validator_ && !pre_commit_validator_()) {
+          return false;
+        }
         // we can safely clear writeset since all versions x_j in writeset_j are
         // omittable.
         tx_ref_.write_set_ref_.clear();
@@ -221,6 +228,19 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
     /** Validation Phase **/
     if (!AntiDependencyValidation()) {
       // if validation failed, unlock all objects
+      for (auto& snapshot : tx_ref_.write_set_ref_) {
+        auto current = snapshot.index_cache->transaction_id.load();
+        current.tid--;
+        snapshot.index_cache->transaction_id.store(current);
+      }
+      return false;
+    }
+
+    // Deferred phantom validation (Masstree). Runs under write locks and
+    // after AntiDepValidation, so concurrent leaf-version drift happening-
+    // before this tx's serial point is observed. PL leaves the validator
+    // unset; Masstree installs one in Transaction::Impl::Precommit.
+    if (pre_commit_validator_ && !pre_commit_validator_()) {
       for (auto& snapshot : tx_ref_.write_set_ref_) {
         auto current = snapshot.index_cache->transaction_id.load();
         current.tid--;

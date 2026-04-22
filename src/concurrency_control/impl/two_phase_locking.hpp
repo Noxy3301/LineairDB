@@ -141,6 +141,18 @@ class TwoPhaseLockingImpl final : public ConcurrencyControlBase {
     }
   };
   bool Precommit(bool need_to_checkpoint) final override {
+    // 2PL relies on per-key locks for conflict detection; it does not take
+    // range locks, so Masstree-backed txs still need deferred phantom
+    // validation to catch concurrent structural changes in scanned ranges.
+    // Writes are applied in-place with undo records, so a phantom failure
+    // must roll them back here. Lock release is left to PostProcessing,
+    // which the caller invokes unconditionally after Precommit returns
+    // false; calling UnlockAll twice would assert on double-unlock.
+    if (pre_commit_validator_ && !pre_commit_validator_()) {
+      Undo();
+      return false;
+    }
+
     if (need_to_checkpoint) {
       for (auto& snapshot : tx_ref_.write_set_ref_) {
         snapshot.index_cache->CopyLiveVersionToStableVersion();

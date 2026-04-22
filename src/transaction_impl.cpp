@@ -1125,19 +1125,21 @@ void Transaction::Impl::Abort() {
 bool Transaction::Impl::Precommit() {
   if (IsAborted()) return false;
 
-  // Deferred phantom validation (Masstree scans). Each unique owner index
-  // only needs one ValidatePhantoms call because ValidatePhantoms filters
-  // entries by owner internally. PL owners always return true.
-  if (!node_version_set_.empty()) {
+  // Install deferred phantom validator. Silo runs this at the serial
+  // point (under write locks, after AntiDepValidation) so concurrent
+  // masstree structural changes happening-before commit are observed.
+  // Running the check earlier admits a race window between validation
+  // and lock acquisition; running it here keeps the protocol strict-
+  // serializable. PL's ValidatePhantoms is a no-op.
+  concurrency_control_->SetPreCommitValidator([this]() {
+    if (node_version_set_.empty()) return true;
     std::unordered_set<Index::IndexBase*> owners;
     for (const auto& e : node_version_set_) owners.insert(e.owner);
     for (auto* owner : owners) {
-      if (!owner->ValidatePhantoms(node_version_set_)) {
-        Abort();
-        return false;
-      }
+      if (!owner->ValidatePhantoms(node_version_set_)) return false;
     }
-  }
+    return true;
+  });
 
   const bool need_to_checkpoint =
       (db_pimpl_->GetConfig().enable_checkpointing &&
