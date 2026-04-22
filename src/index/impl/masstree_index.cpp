@@ -178,16 +178,28 @@ struct MasstreeIndex::Impl {
     return true;
   }
 
-  // Inserts a blank DataItem if absent. Returns false if the key already
-  // exists (matches PL's Insert-fails-on-EXISTS semantics at the point
-  // index level).
+  // Inserts a blank DataItem if absent. Follows PL's EntryState matrix:
+  //   EXISTS   -> fail (key already in tree, data initialized)
+  //   DELETED  -> succeed (key in tree but data !IsInitialized; reuse slot)
+  //   NOT_EXISTS -> succeed (allocate new slot)
+  // Must not replace an existing DataItem* on DELETED reuse: concurrent
+  // readers may still hold a raw pointer from an earlier Get().
   bool Insert(std::string_view key) {
     ensure_thread_init();
     cursor_type lp(table_, key.data(), key.size());
     bool found = lp.find_insert(*tls_ti);
     if (found) {
+      DataItem* existing = lp.value();
+      if (existing != nullptr && existing->IsInitialized()) {
+        lp.finish(0, *tls_ti);
+        return false;
+      }
+      if (existing == nullptr) {
+        lp.value() = new DataItem();
+      }
+      fence();
       lp.finish(0, *tls_ti);
-      return false;
+      return true;
     }
     lp.value() = new DataItem();
     fence();
@@ -195,18 +207,18 @@ struct MasstreeIndex::Impl {
     return true;
   }
 
-  bool Delete(std::string_view key) {
-    ensure_thread_init();
-    cursor_type lp(table_, key.data(), key.size());
-    bool found = lp.find_locked(*tls_ti);
-    if (!found) {
-      lp.finish(-1, *tls_ti);
-      return false;
-    }
-    // Physical removal. The prior DataItem* is leaked; see comment in Put.
-    lp.finish(-1, *tls_ti);
-    return true;
-  }
+  // Logical delete. Contract must match PL: the entry stays reachable via
+  // Get() so that Transaction::Impl::Delete's subsequent Update(nullptr, 0)
+  // finds the DataItem and transitions it to !IsInitialized (PL's DELETED
+  // state: point-present, range-absent, data !init). A physical erase here
+  // would make Get() return nullptr, which Update() interprets as
+  // "key missing" and aborts — breaking every primary-key DELETE.
+  //
+  // Range-visibility for concurrent scanners is caught at Precommit via
+  // deferred ValidatePhantoms (structural check) and Silo's read-set TID
+  // validation (DataItem mutation check). PL detects the same conflicts
+  // synchronously via IsInPredicateSet.
+  bool Delete(std::string_view /*key*/) { return true; }
 
   // Idempotent blank insert: PL's ForcePutBlankEntry never removes, just
   // ensures a slot exists.
