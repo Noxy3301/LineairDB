@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <mutex>
 #include <utility>
 
 // Masstree headers. Must come after the PImpl header guard so other LDB
@@ -51,9 +52,15 @@ using cursor_type = Masstree::tcursor<table_params>;
 
 thread_local threadinfo* tls_ti = nullptr;
 std::atomic<int> next_thread_id{0};
+std::mutex thread_init_mutex;
 
+// threadinfo::make() prepends to masstree's global allthreads list without
+// synchronization (kvthread.cc:57-58). Serialize first-use-per-thread to
+// avoid UB when multiple worker threads register concurrently. Contended
+// only on the first op per thread.
 inline void ensure_thread_init() {
   if (__builtin_expect(tls_ti == nullptr, 0)) {
+    std::lock_guard<std::mutex> lg(thread_init_mutex);
     tls_ti = threadinfo::make(
         threadinfo::TI_PROCESS,
         next_thread_id.fetch_add(1, std::memory_order_relaxed));
