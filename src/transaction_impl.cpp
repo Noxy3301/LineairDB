@@ -437,14 +437,14 @@ const std::optional<size_t> Transaction::Impl::Scan(
     return std::nullopt;
   }
 
-  // Step 2: Collect keys from write_set
+  // Step 2: Pick out write_set entries inside [begin, end) on the current base table.
   std::vector<std::string> write_set_keys;
   const auto& table_name = current_table_->GetTableName();
   for (const auto& snapshot : write_set_) {
-    if (snapshot.table_name != table_name) continue;
-    if (!snapshot.index_name.empty()) continue;  // base-table scan only
-    if (snapshot.key < begin) continue;
-    if (end.has_value() && snapshot.key > end.value()) continue;
+    if (snapshot.table_name != table_name) continue;      // different table
+    if (!snapshot.index_name.empty()) continue;           // secondary index entry
+    if (snapshot.key < begin) continue;                   // before range
+    if (end.has_value() && snapshot.key >= end.value()) continue;  // at/after end
     write_set_keys.emplace_back(snapshot.key);
   }
   std::sort(write_set_keys.begin(), write_set_keys.end());  // std::merge requires sorted inputs
@@ -558,14 +558,14 @@ const std::optional<size_t> Transaction::Impl::ScanReverse(
     return std::nullopt;
   }
 
-  // Step 2: Collect keys from write_set
+  // Step 2: Pick out write_set entries inside [begin, end) on the current base table.
   std::vector<std::string> write_set_keys;
   const auto& table_name = current_table_->GetTableName();
   for (const auto& snapshot : write_set_) {
-    if (snapshot.table_name != table_name) continue;
-    if (!snapshot.index_name.empty()) continue;  // base-table scan only
-    if (snapshot.key < begin) continue;
-    if (end.has_value() && snapshot.key > end.value()) continue;
+    if (snapshot.table_name != table_name) continue;      // different table
+    if (!snapshot.index_name.empty()) continue;           // secondary index entry
+    if (snapshot.key < begin) continue;                   // before range
+    if (end.has_value() && snapshot.key >= end.value()) continue;  // at/after end
     write_set_keys.emplace_back(snapshot.key);
   }
   std::sort(write_set_keys.begin(), write_set_keys.end());  // std::merge requires sorted inputs
@@ -677,13 +677,13 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndex(
   }
   std::sort(index_keys.begin(), index_keys.end());
 
-  // Step 2: Collect keys from write_set (for this secondary index)
+  // Step 2: Pick out write_set entries inside [begin, end) on this secondary index.
   std::vector<std::string> write_set_keys;
   for (const auto& snapshot : write_set_) {
-    if (snapshot.table_name != si_table_name) continue;
-    if (snapshot.index_name != index_name) continue;
-    if (snapshot.key < begin) continue;
-    if (end.has_value() && snapshot.key > end.value()) continue;
+    if (snapshot.table_name != si_table_name) continue;   // different table
+    if (snapshot.index_name != index_name) continue;      // different index
+    if (snapshot.key < begin) continue;                   // before range
+    if (end.has_value() && snapshot.key >= end.value()) continue;  // at/after end
     write_set_keys.emplace_back(snapshot.key);
   }
   std::sort(write_set_keys.begin(), write_set_keys.end());
@@ -782,13 +782,13 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndexReverse(
   // ScanReverse returns keys in reverse order; re-sort ascending for merge
   std::sort(index_keys.begin(), index_keys.end());
 
-  // Step 2: Collect keys from write_set (for this secondary index)
+  // Step 2: Pick out write_set entries inside [begin, end) on this secondary index.
   std::vector<std::string> write_set_keys;
   for (const auto& snapshot : write_set_) {
-    if (snapshot.table_name != si_table_name) continue;
-    if (snapshot.index_name != index_name) continue;
-    if (snapshot.key < begin) continue;
-    if (end.has_value() && snapshot.key > end.value()) continue;
+    if (snapshot.table_name != si_table_name) continue;   // different table
+    if (snapshot.index_name != index_name) continue;      // different index
+    if (snapshot.key < begin) continue;                   // before range
+    if (end.has_value() && snapshot.key >= end.value()) continue;  // at/after end
     write_set_keys.emplace_back(snapshot.key);
   }
   std::sort(write_set_keys.begin(), write_set_keys.end());

@@ -110,7 +110,7 @@ std::optional<size_t> PrecisionLockingIndex::Scan(
     auto it = container_.lower_bound(begin);
     auto it_end = container_.end();
     if (e.has_value()) {
-      it_end = container_.upper_bound(end);
+      it_end = container_.lower_bound(end);
     }
     for (; it != it_end; it++) {
       if (it->second.is_deleted) continue;
@@ -155,7 +155,7 @@ std::optional<size_t> PrecisionLockingIndex::ScanReverse(
     auto it = container_.end();
     auto it_end = container_.lower_bound(begin);
     if (e.has_value()) {
-      it = container_.upper_bound(end);
+      it = container_.lower_bound(end);
     }
     for (; it != it_end;) {
       --it;
@@ -234,7 +234,7 @@ bool PrecisionLockingIndex::IsInPredicateSet(const std::string_view key) {
       }
       const bool is_after_begin = predicate.begin <= key;
       const bool is_before_end =
-          predicate.end.has_value() ? key <= predicate.end.value() : true;
+          predicate.end.has_value() ? key < predicate.end.value() : true;
       if (is_after_begin && is_before_end) return true;
     }
   }
@@ -253,7 +253,7 @@ bool PrecisionLockingIndex::IsOverlapWithInsertOrDelete(
       }
       const bool is_after_begin = begin <= event.key;
       const bool is_before_end =
-          end.has_value() ? event.key <= end.value() : true;
+          end.has_value() ? event.key < end.value() : true;
       if (is_after_begin && is_before_end) {
         return true;
       }
