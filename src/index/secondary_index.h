@@ -30,9 +30,13 @@ class SecondaryIndex {
   }
 
   DataItem* GetOrInsertForWrite(std::string_view key) {
-    if (!secondary_index_->EnsureVisibleForSecondaryWrite(key)) return nullptr;
+    // OCC guards existing entries; only new keys need the lock for phantom detection.
     auto* item = secondary_index_->Get(key);
-    assert(item != nullptr);
+    if (item == nullptr) {
+      if (!secondary_index_->EnsureVisibleForSecondaryWrite(key)) return nullptr;
+      item = secondary_index_->Get(key);
+      assert(item != nullptr);
+    }
     return item;
   }
 
