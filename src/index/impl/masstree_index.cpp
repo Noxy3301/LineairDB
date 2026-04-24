@@ -28,11 +28,13 @@
 // masstree practice — CCBench's masstree_wrapper.hh and Tu Silo's
 // simple_threadinfo stub take the same approach — and has no semantic
 // consequences: masstree's insert/scan/remove correctness relies on
-// nodeversion bits, not these epochs. Tradeoff: retired leaf / internode /
-// ksuffix allocations from internal splits leak for the process lifetime.
-// Bounded by bench-scope insert churn (MBs); not suitable for long-running
-// service deployment without a real reclamation path (deeper masstree-side
-// patch, not a callback piggyback).
+// nodeversion bits, not these epochs. Tradeoff: every masstree allocation
+// that would otherwise be reclaimed via RCU (overwrite-replaced
+// DataItem*, retired leaves/internodes/ksuffix blocks from internal
+// splits), plus the entire live tree at process exit (destroy() is
+// deliberately not called — see ~Impl()), leaks for the process lifetime.
+// Bounded by bench-scope insert churn; not suitable for long-running
+// service deployment without a real reclamation path.
 relaxed_atomic<mrcu_epoch_type> globalepoch{1};
 relaxed_atomic<mrcu_epoch_type> active_epoch{1};
 volatile bool recovering = false;
@@ -167,8 +169,11 @@ struct MasstreeIndex::Impl {
   ~Impl() {
     // Do not call table_.destroy(): it schedules RCU free callbacks via
     // deallocate_rcu, but this wrapper never advances the RCU epoch so the
-    // callbacks would never run. Leaking on database shutdown mirrors PL's
-    // current behavior and is consistent with the epoch-stub policy above.
+    // callbacks would never run. Consequence: at process exit, the entire
+    // live tree (every leaf/internode allocation) and every stored
+    // DataItem* leaks. This differs from PL, whose point-index destructor
+    // frees stored values. Accepted for benchmark-scope runs only; a real
+    // reclamation path is required for long-running service deployment.
   }
 
   DataItem* Get(std::string_view key) {
