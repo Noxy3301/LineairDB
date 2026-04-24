@@ -54,6 +54,16 @@ class Database::Impl {
         callback_manager_(config_),
         epoch_framework_(c.epoch_duration_ms, EventsOnEpochIsUpdated()),
         checkpoint_manager_(config_, table_dictionary_, epoch_framework_) {
+    // 2PL x Masstree unsupported (see 2PL ReadDirect FIXME).
+    if (config_.concurrency_control_protocol ==
+            Config::ConcurrencyControl::TwoPhaseLocking &&
+        config_.index_structure == Config::IndexStructure::Masstree) {
+      SPDLOG_ERROR(
+          "Unsupported LineairDB configuration: TwoPhaseLocking + Masstree. "
+          "See src/concurrency_control/impl/two_phase_locking.hpp for the "
+          "supported CC x Index matrix.");
+      exit(EXIT_FAILURE);
+    }
     if (Database::Impl::CurrentDBInstance == nullptr) {
       Database::Impl::CurrentDBInstance = this;
       SPDLOG_INFO("LineairDB instance has been constructed.");

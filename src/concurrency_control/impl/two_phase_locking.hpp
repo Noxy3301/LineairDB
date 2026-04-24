@@ -79,7 +79,9 @@ class TwoPhaseLockingImpl final : public ConcurrencyControlBase {
     return snapshot_item;
   };
 
-  // STUB: Falls back to full Read().
+  // STUB: returns a pointer into the local `item`'s buffer, which dies on
+  // return. 2PL + Masstree is rejected at Database init (database_impl.h).
+  // FIXME: rework to owned-lifetime before enabling 2PL + Masstree.
   std::pair<const std::byte*, size_t> ReadDirect(
       const std::string_view, DataItem* index_leaf,
       TransactionId& out_tid) final override {
