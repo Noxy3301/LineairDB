@@ -1052,6 +1052,11 @@ void Transaction::Impl::UpdateSecondaryIndex(
     Abort();
     return;
   }
+  // unique constraint check out of the transaction
+  if (new_leaf->IsInitialized() && index->IsUnique()) {
+    Abort();
+    return;
+  }
   bool new_found_in_write_set = false;
 
   bool is_rmf_new_key = false;
@@ -1073,6 +1078,12 @@ void Transaction::Impl::UpdateSecondaryIndex(
         snapshot.table_name != current_table_->GetTableName() ||
         snapshot.index_name != index_name)
       continue;
+
+    // unique constraint check in the transaction
+    if (index->IsUnique()) {
+      Abort();
+      return;
+    }
 
     new_found_in_write_set = true;
     snapshot.index_type = index_type;
