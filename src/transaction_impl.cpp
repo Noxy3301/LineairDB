@@ -147,6 +147,7 @@ std::vector<std::pair<const std::byte* const, const size_t>>
 Transaction::Impl::ReadSecondaryIndex(const std::string_view index_name,
                                       const std::string_view key) {
   if (IsAborted()) return {};
+  EnsureCurrentTable();
   Index::SecondaryIndex* index = current_table_->GetSecondaryIndex(index_name);
 
   if (index == nullptr) {
@@ -154,7 +155,6 @@ Transaction::Impl::ReadSecondaryIndex(const std::string_view index_name,
     return {};
   }
 
-  EnsureCurrentTable();
   const auto& table_name = current_table_->GetTableName();
 
   for (auto& snapshot : write_set_) {
