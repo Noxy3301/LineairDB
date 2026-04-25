@@ -291,8 +291,8 @@ class Transaction {
    *  key, LineairDB returns the data item.
    * @param end
    *  An identifier of the ending point of the range search.
-   *  This key is included in the range: if there exists a data item with this
-   *  key, LineairDB returns the data item.
+   *  This key is excluded from the range: LineairDB scans [begin, end) when
+   *  end is present.
    * @param operation
    *  A bool function to be executed iteratively on data items matching the
    * input range. The arguments of the function are key (std::string_view) and
