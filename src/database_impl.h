@@ -54,6 +54,16 @@ class Database::Impl {
         callback_manager_(config_),
         epoch_framework_(c.epoch_duration_ms, EventsOnEpochIsUpdated()),
         checkpoint_manager_(config_, table_dictionary_, epoch_framework_) {
+    // 2PL x Masstree unsupported (see 2PL ReadDirect FIXME).
+    if (config_.concurrency_control_protocol ==
+            Config::ConcurrencyControl::TwoPhaseLocking &&
+        config_.index_structure == Config::IndexStructure::Masstree) {
+      SPDLOG_ERROR(
+          "Unsupported LineairDB configuration: TwoPhaseLocking + Masstree. "
+          "See src/concurrency_control/impl/two_phase_locking.hpp for the "
+          "supported CC x Index matrix.");
+      exit(EXIT_FAILURE);
+    }
     if (Database::Impl::CurrentDBInstance == nullptr) {
       Database::Impl::CurrentDBInstance = this;
       SPDLOG_INFO("LineairDB instance has been constructed.");
@@ -138,20 +148,30 @@ class Database::Impl {
     }
   }
 
-  // FIXME: TLS workspace assumes one active tx per thread and same CC protocol
-  // across Database instances. Calling BeginTransaction twice without End will
-  // reset the first tx. Switching Database with a different CC protocol will
-  // use the old CC implementation.
+  // FIXME: TLS workspace still assumes the same CC protocol across Database
+  // instances on a single thread. Switching Database with a different CC
+  // protocol will keep the old CC implementation.
   Transaction& BeginTransaction() {
     epoch_framework_.MakeMeOnline();
     thread_local Transaction* tls_workspace = nullptr;
-    if (tls_workspace != nullptr) {
+
+    // Reuse the TLS slot only when its previous transaction has finished.
+    // GetCurrentStatus() returns Running between Begin and End, so a non-Running
+    // status means End has already drained the workspace.
+    if (tls_workspace != nullptr &&
+        tls_workspace->GetCurrentStatus() != TxStatus::Running) {
       tls_workspace->tx_pimpl_->Reset(this);
       return *tls_workspace;
     }
+
     auto* tx = new Transaction(this);
-    tx->reusable_ = true;
-    tls_workspace = tx;
+    if (tls_workspace == nullptr) {
+      // First call on this thread: install as the per-thread workspace.
+      tx->reusable_ = true;
+      tls_workspace = tx;
+    }
+    // Otherwise the workspace is still in use by an outstanding transaction;
+    // hand back a fresh one-shot Transaction that EndTransaction will delete.
     return *tx;
   }
 

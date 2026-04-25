@@ -11,7 +11,8 @@
 
 namespace {
 
-constexpr uint kDictUnique = 2;
+constexpr uint kUnique =
+    static_cast<uint>(LineairDB::SecondaryIndexOption::Constraint::UNIQUE);
 
 LineairDB::TxStatus WriteSecondary(LineairDB::Database& db,
                                    const std::string& table_name,
@@ -56,7 +57,7 @@ TEST_F(UniqueSecondaryIndexTest, DictUniqueFlagRejectsDuplicateSecondaryKey) {
 
   LineairDB::Database db(config_);
   ASSERT_TRUE(db.CreateTable("users"));
-  ASSERT_TRUE(db.CreateSecondaryIndex("users", "email_idx", kDictUnique));
+  ASSERT_TRUE(db.CreateSecondaryIndex("users", "email_idx", kUnique));
 
   const auto status1 = WriteSecondary(db, "users", "user1", "Alice",
                                       "email_idx", "alice@example.com");
@@ -76,7 +77,7 @@ TEST_F(UniqueSecondaryIndexTest,
   {
     LineairDB::Database db(config_);
     ASSERT_TRUE(db.CreateTable("users"));
-    ASSERT_TRUE(db.CreateSecondaryIndex("users", "email_idx", kDictUnique));
+    ASSERT_TRUE(db.CreateSecondaryIndex("users", "email_idx", kUnique));
 
     const auto status1 = WriteSecondary(db, "users", "user1", "Alice",
                                         "email_idx", "alice@example.com");

@@ -18,7 +18,7 @@
 
 #include <functional>
 
-#include "index/precision_locking_index/index.hpp"
+#include "index/index_factory.hpp"
 #include "lineairdb/config.h"
 #include "types/data_item.hpp"
 #include "types/definitions.h"
@@ -28,21 +28,11 @@ namespace Index {
 
 ConcurrentTable::ConcurrentTable(EpochFramework& epoch_framework, Config config,
                                  WriteSetType recovery_set)
-    : epoch_manager_ref_(epoch_framework) {
-  switch (config.index_structure) {
-    case Config::IndexStructure::HashTableWithPrecisionLockingIndex:
-      index_ = std::make_unique<HashTableWithPrecisionLockingIndex<DataItem>>(
-          config, epoch_manager_ref_);
-      break;
-    default:
-      index_ = std::make_unique<HashTableWithPrecisionLockingIndex<DataItem>>(
-          config, epoch_manager_ref_);
-      break;
-  }
-
+    : index_(MakeIndex(config, epoch_framework)),
+      epoch_manager_ref_(epoch_framework) {
   if (recovery_set.empty()) return;
   for (auto& entry : recovery_set) {
-    index_->Put(entry.key, *entry.index_cache);
+    index_->Put(entry.key, DataItem(*entry.index_cache));
   }
 }
 
@@ -76,26 +66,30 @@ void ConcurrentTable::ForEach(
 
 std::optional<size_t> ConcurrentTable::Scan(
     const std::string_view begin, const std::optional<std::string_view> end,
-    std::function<bool(std::string_view)> operation) {
-  return index_->Scan(begin, end, operation);
+    std::function<bool(std::string_view)> operation,
+    std::vector<NodeVersionEntry>* out_versions) {
+  return index_->Scan(begin, end, operation, out_versions);
 };
 
 std::optional<size_t> ConcurrentTable::Scan(
     const std::string_view begin, const std::string_view end,
-    std::function<bool(std::string_view, DataItem&)> operation) {
-  return index_->Scan(begin, end, operation);
+    std::function<bool(std::string_view, DataItem&)> operation,
+    std::vector<NodeVersionEntry>* out_versions) {
+  return index_->Scan(begin, end, operation, out_versions);
 };
 
 std::optional<size_t> ConcurrentTable::ScanReverse(
     const std::string_view begin, const std::optional<std::string_view> end,
-    std::function<bool(std::string_view)> operation) {
-  return index_->ScanReverse(begin, end, operation);
+    std::function<bool(std::string_view)> operation,
+    std::vector<NodeVersionEntry>* out_versions) {
+  return index_->ScanReverse(begin, end, operation, out_versions);
 };
 
 std::optional<size_t> ConcurrentTable::ScanReverse(
     const std::string_view begin, const std::string_view end,
-    std::function<bool(std::string_view, DataItem&)> operation) {
-  return index_->ScanReverse(begin, end, operation);
+    std::function<bool(std::string_view, DataItem&)> operation,
+    std::vector<NodeVersionEntry>* out_versions) {
+  return index_->ScanReverse(begin, end, operation, out_versions);
 };
 
 bool ConcurrentTable::Delete(const std::string_view key) {
@@ -104,6 +98,11 @@ bool ConcurrentTable::Delete(const std::string_view key) {
 
 void ConcurrentTable::WaitForIndexIsLinearizable() {
   index_->WaitForIndexIsLinearizable();
+}
+
+bool ConcurrentTable::ValidatePhantoms(
+    const std::vector<NodeVersionEntry>& entries) {
+  return index_->ValidatePhantoms(entries);
 }
 }  // namespace Index
 }  // namespace LineairDB

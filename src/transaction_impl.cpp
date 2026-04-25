@@ -95,6 +95,7 @@ void Transaction::Impl::Reset(Database::Impl* db_pimpl) {
   read_set_.clear();
   write_set_.clear();
   remainingNotNullSkWrites_.clear();
+  node_version_set_.clear();
 
   TransactionReferences new_ref{read_set_, write_set_,
                                 db_pimpl_->epoch_framework_, current_status_};
@@ -146,6 +147,7 @@ std::vector<std::pair<const std::byte* const, const size_t>>
 Transaction::Impl::ReadSecondaryIndex(const std::string_view index_name,
                                       const std::string_view key) {
   if (IsAborted()) return {};
+  EnsureCurrentTable();
   Index::SecondaryIndex* index = current_table_->GetSecondaryIndex(index_name);
 
   if (index == nullptr) {
@@ -153,11 +155,10 @@ Transaction::Impl::ReadSecondaryIndex(const std::string_view index_name,
     return {};
   }
 
-  EnsureCurrentTable();
+  const auto& table_name = current_table_->GetTableName();
 
   for (auto& snapshot : write_set_) {
-    if (snapshot.key == key &&
-        snapshot.table_name == current_table_->GetTableName() &&
+    if (snapshot.key == key && snapshot.table_name == table_name &&
         snapshot.index_name == index_name) {
       std::vector<std::pair<const std::byte* const, const size_t>> result;
       if (!snapshot.data_item_copy.primary_keys().empty()) {
@@ -172,8 +173,7 @@ Transaction::Impl::ReadSecondaryIndex(const std::string_view index_name,
   }
 
   for (auto& snapshot : read_set_) {
-    if (snapshot.key == key &&
-        snapshot.table_name == current_table_->GetTableName() &&
+    if (snapshot.key == key && snapshot.table_name == table_name &&
         snapshot.index_name == index_name) {
       std::vector<std::pair<const std::byte* const, const size_t>> result;
       if (!snapshot.data_item_copy.primary_keys().empty()) {
@@ -253,6 +253,7 @@ void Transaction::Impl::WriteSecondaryIndex(
   if (IsAborted()) return;
 
   EnsureCurrentTable();
+  const auto& table_name = current_table_->GetTableName();
   const std::string_view primary_key_view(
       reinterpret_cast<const char*>(primary_key_buffer), primary_key_size);
 
@@ -283,8 +284,7 @@ void Transaction::Impl::WriteSecondaryIndex(
   bool is_rmf = false;
   const DataItem* base_data = nullptr;
   for (auto& snapshot : read_set_) {
-    if (snapshot.key == key &&
-        snapshot.table_name == current_table_->GetTableName() &&
+    if (snapshot.key == key && snapshot.table_name == table_name &&
         snapshot.index_name == index_name) {
       is_rmf = true;
       base_data = &snapshot.data_item_copy;
@@ -295,8 +295,7 @@ void Transaction::Impl::WriteSecondaryIndex(
 
   // unique constraint check in the transaction
   for (auto& snapshot : write_set_) {
-    if (snapshot.key != key ||
-        snapshot.table_name != current_table_->GetTableName() ||
+    if (snapshot.key != key || snapshot.table_name != table_name ||
         snapshot.index_name != index_name)
       continue;
     if (index->IsUnique()) {
@@ -362,13 +361,16 @@ void Transaction::Impl::Update(const std::string_view key,
                                const std::byte value[], const size_t size) {
   if (IsAborted()) return;
   EnsureCurrentTable();
+  const auto& table_name = current_table_->GetTableName();
 
-  // If key exists in this transaction's write_set_ (e.g., Insert() then
-  // Update() in the same transaction), Update() should succeed even if the
-  // index entry has not been updated yet.
+  // If the primary-index entry exists in this transaction's write_set_
+  // (e.g., Insert() then Update() in the same transaction), Update() should
+  // succeed even if the index entry has not been updated yet. Snapshots from
+  // WriteSecondaryIndex live in the same write_set_, so filter on the empty
+  // index_name to match base-table writes only.
   for (auto& snapshot : write_set_) {
-    if (snapshot.key == key &&
-        snapshot.table_name == current_table_->GetTableName()) {
+    if (snapshot.key == key && snapshot.table_name == table_name &&
+        snapshot.index_name.empty()) {
       // If the key was deleted within this transaction, Update should fail.
       if (!snapshot.data_item_copy.IsInitialized()) {
         Abort();
@@ -426,23 +428,26 @@ const std::optional<size_t> Transaction::Impl::Scan(
   std::vector<std::string> index_keys;
   index_keys.reserve(4096);
   auto index_result = current_table_->GetPrimaryIndex().Scan(
-      begin, end, [&](std::string_view key) {
+      begin, end,
+      [&](std::string_view key) {
         index_keys.emplace_back(key);
         return false;  // Continue to collect all keys
-      });
+      },
+      &node_version_set_);
 
   if (!index_result.has_value()) {
     Abort();
     return std::nullopt;
   }
 
-  // Step 2: Collect keys from write_set
+  // Step 2: Pick out write_set entries inside [begin, end) on the current base table.
   std::vector<std::string> write_set_keys;
+  const auto& table_name = current_table_->GetTableName();
   for (const auto& snapshot : write_set_) {
-    if (snapshot.table_name != current_table_->GetTableName()) continue;
-    if (!snapshot.index_name.empty()) continue;  // base-table scan only
-    if (snapshot.key < begin) continue;
-    if (end.has_value() && snapshot.key > end.value()) continue;
+    if (snapshot.table_name != table_name) continue;      // different table
+    if (!snapshot.index_name.empty()) continue;           // secondary index entry
+    if (snapshot.key < begin) continue;                   // before range
+    if (end.has_value() && snapshot.key >= end.value()) continue;  // at/after end
     write_set_keys.emplace_back(snapshot.key);
   }
   std::sort(write_set_keys.begin(), write_set_keys.end());  // std::merge requires sorted inputs
@@ -544,23 +549,26 @@ const std::optional<size_t> Transaction::Impl::ScanReverse(
   std::vector<std::string> index_keys;
   index_keys.reserve(4096);
   auto index_result = current_table_->GetPrimaryIndex().ScanReverse(
-      begin, end, [&](std::string_view key) {
+      begin, end,
+      [&](std::string_view key) {
         index_keys.emplace_back(key);
         return false;  // Continue to collect all keys
-      });
+      },
+      &node_version_set_);
 
   if (!index_result.has_value()) {
     Abort();
     return std::nullopt;
   }
 
-  // Step 2: Collect keys from write_set
+  // Step 2: Pick out write_set entries inside [begin, end) on the current base table.
   std::vector<std::string> write_set_keys;
+  const auto& table_name = current_table_->GetTableName();
   for (const auto& snapshot : write_set_) {
-    if (snapshot.table_name != current_table_->GetTableName()) continue;
-    if (!snapshot.index_name.empty()) continue;  // base-table scan only
-    if (snapshot.key < begin) continue;
-    if (end.has_value() && snapshot.key > end.value()) continue;
+    if (snapshot.table_name != table_name) continue;      // different table
+    if (!snapshot.index_name.empty()) continue;           // secondary index entry
+    if (snapshot.key < begin) continue;                   // before range
+    if (end.has_value() && snapshot.key >= end.value()) continue;  // at/after end
     write_set_keys.emplace_back(snapshot.key);
   }
   std::sort(write_set_keys.begin(), write_set_keys.end());  // std::merge requires sorted inputs
@@ -658,10 +666,13 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndex(
   // instead of std::set (which allocates per-node).
   std::vector<std::string> index_keys;
   index_keys.reserve(64);
-  auto index_result = index->Scan(begin, end, [&](std::string_view key) {
-    index_keys.emplace_back(key);
-    return false;  // Continue to collect all keys
-  });
+  auto index_result = index->Scan(
+      begin, end,
+      [&](std::string_view key) {
+        index_keys.emplace_back(key);
+        return false;  // Continue to collect all keys
+      },
+      &node_version_set_);
 
   if (!index_result.has_value()) {
     Abort();
@@ -669,13 +680,13 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndex(
   }
   std::sort(index_keys.begin(), index_keys.end());
 
-  // Step 2: Collect keys from write_set (for this secondary index)
+  // Step 2: Pick out write_set entries inside [begin, end) on this secondary index.
   std::vector<std::string> write_set_keys;
   for (const auto& snapshot : write_set_) {
-    if (snapshot.table_name != si_table_name) continue;
-    if (snapshot.index_name != index_name) continue;
-    if (snapshot.key < begin) continue;
-    if (end.has_value() && snapshot.key > end.value()) continue;
+    if (snapshot.table_name != si_table_name) continue;   // different table
+    if (snapshot.index_name != index_name) continue;      // different index
+    if (snapshot.key < begin) continue;                   // before range
+    if (end.has_value() && snapshot.key >= end.value()) continue;  // at/after end
     write_set_keys.emplace_back(snapshot.key);
   }
   std::sort(write_set_keys.begin(), write_set_keys.end());
@@ -759,10 +770,13 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndexReverse(
   // Step 1: Collect keys from secondary index (sorted order from SI)
   std::vector<std::string> index_keys;
   index_keys.reserve(64);
-  auto index_result = index->ScanReverse(begin, end, [&](std::string_view key) {
-    index_keys.emplace_back(key);
-    return false;  // Continue to collect all keys
-  });
+  auto index_result = index->ScanReverse(
+      begin, end,
+      [&](std::string_view key) {
+        index_keys.emplace_back(key);
+        return false;  // Continue to collect all keys
+      },
+      &node_version_set_);
 
   if (!index_result.has_value()) {
     Abort();
@@ -771,13 +785,13 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndexReverse(
   // ScanReverse returns keys in reverse order; re-sort ascending for merge
   std::sort(index_keys.begin(), index_keys.end());
 
-  // Step 2: Collect keys from write_set (for this secondary index)
+  // Step 2: Pick out write_set entries inside [begin, end) on this secondary index.
   std::vector<std::string> write_set_keys;
   for (const auto& snapshot : write_set_) {
-    if (snapshot.table_name != si_table_name) continue;
-    if (snapshot.index_name != index_name) continue;
-    if (snapshot.key < begin) continue;
-    if (end.has_value() && snapshot.key > end.value()) continue;
+    if (snapshot.table_name != si_table_name) continue;   // different table
+    if (snapshot.index_name != index_name) continue;      // different index
+    if (snapshot.key < begin) continue;                   // before range
+    if (end.has_value() && snapshot.key >= end.value()) continue;  // at/after end
     write_set_keys.emplace_back(snapshot.key);
   }
   std::sort(write_set_keys.begin(), write_set_keys.end());
@@ -1041,6 +1055,11 @@ void Transaction::Impl::UpdateSecondaryIndex(
     Abort();
     return;
   }
+  // unique constraint check out of the transaction
+  if (new_leaf->IsInitialized() && index->IsUnique()) {
+    Abort();
+    return;
+  }
   bool new_found_in_write_set = false;
 
   bool is_rmf_new_key = false;
@@ -1062,6 +1081,12 @@ void Transaction::Impl::UpdateSecondaryIndex(
         snapshot.table_name != current_table_->GetTableName() ||
         snapshot.index_name != index_name)
       continue;
+
+    // unique constraint check in the transaction
+    if (index->IsUnique()) {
+      Abort();
+      return;
+    }
 
     new_found_in_write_set = true;
     snapshot.index_type = index_type;
@@ -1113,6 +1138,22 @@ void Transaction::Impl::Abort() {
 }
 bool Transaction::Impl::Precommit() {
   if (IsAborted()) return false;
+
+  // Install deferred phantom validator. Silo runs this at the serial
+  // point (under write locks, after AntiDepValidation) so concurrent
+  // masstree structural changes happening-before commit are observed.
+  // Running the check earlier admits a race window between validation
+  // and lock acquisition; running it here keeps the protocol strict-
+  // serializable. PL's ValidatePhantoms is a no-op.
+  concurrency_control_->SetPreCommitValidator([this]() {
+    if (node_version_set_.empty()) return true;
+    std::unordered_set<Index::IndexBase*> owners;
+    for (const auto& e : node_version_set_) owners.insert(e.owner);
+    for (auto* owner : owners) {
+      if (!owner->ValidatePhantoms(node_version_set_)) return false;
+    }
+    return true;
+  });
 
   const bool need_to_checkpoint =
       (db_pimpl_->GetConfig().enable_checkpointing &&

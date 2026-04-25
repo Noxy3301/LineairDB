@@ -1,6 +1,8 @@
-#pragma once
+#ifndef LINEAIRDB_SECONDARY_INDEX_H
+#define LINEAIRDB_SECONDARY_INDEX_H
 
-#include "index/concurrent_table.h"
+#include "index/index_base.h"
+#include "index/index_factory.hpp"
 #include "index/secondary_index_type.h"
 #include "util/epoch_framework.hpp"
 
@@ -12,11 +14,8 @@ class SecondaryIndex {
   SecondaryIndex(EpochFramework& epoch_framework, Config config = Config(),
                  SecondaryIndexType index_type = SecondaryIndexType(),
                  [[maybe_unused]] WriteSetType recovery_set = WriteSetType())
-      : index_type_(index_type) {
-    secondary_index_ =
-        std::make_unique<HashTableWithPrecisionLockingIndex<DataItem>>(
-            config, epoch_framework);
-  }
+      : index_type_(index_type),
+        secondary_index_(MakeIndex(config, epoch_framework)) {}
 
   DataItem* Get(std::string_view key) { return secondary_index_->Get(key); }
 
@@ -31,22 +30,35 @@ class SecondaryIndex {
   }
 
   DataItem* GetOrInsertForWrite(std::string_view key) {
-    if (!secondary_index_->EnsureVisibleForSecondaryWrite(key)) return nullptr;
+    // OCC guards existing entries; new keys (and PL's point-present /
+    // range-absent DELETED slots, where IsInitialized() is false) still need
+    // EnsureVisibleForSecondaryWrite so the range index can run its phantom
+    // detection.
     auto* item = secondary_index_->Get(key);
-    assert(item != nullptr);
+    if (item == nullptr || !item->IsInitialized()) {
+      if (!secondary_index_->EnsureVisibleForSecondaryWrite(key)) return nullptr;
+      item = secondary_index_->Get(key);
+      assert(item != nullptr);
+    }
     return item;
   }
 
-  std::optional<size_t> Scan(std::string_view begin,
-                             std::optional<std::string_view> end,
-                             std::function<bool(std::string_view)> operation) {
-    return secondary_index_->Scan(begin, end, operation);
+  std::optional<size_t> Scan(
+      std::string_view begin, std::optional<std::string_view> end,
+      std::function<bool(std::string_view)> operation,
+      std::vector<NodeVersionEntry>* out_versions = nullptr) {
+    return secondary_index_->Scan(begin, end, operation, out_versions);
   }
 
   std::optional<size_t> ScanReverse(
       std::string_view begin, std::optional<std::string_view> end,
-      std::function<bool(std::string_view)> operation) {
-    return secondary_index_->ScanReverse(begin, end, operation);
+      std::function<bool(std::string_view)> operation,
+      std::vector<NodeVersionEntry>* out_versions = nullptr) {
+    return secondary_index_->ScanReverse(begin, end, operation, out_versions);
+  }
+
+  bool ValidatePhantoms(const std::vector<NodeVersionEntry>& entries) {
+    return secondary_index_->ValidatePhantoms(entries);
   }
 
   bool Delete(std::string_view key) {
@@ -75,8 +87,9 @@ class SecondaryIndex {
 
  private:
   SecondaryIndexType index_type_;
-  std::unique_ptr<HashTableWithPrecisionLockingIndex<DataItem>>
-      secondary_index_;
+  std::unique_ptr<IndexBase> secondary_index_;
 };
 }  // namespace Index
 }  // namespace LineairDB
+
+#endif /* LINEAIRDB_SECONDARY_INDEX_H */

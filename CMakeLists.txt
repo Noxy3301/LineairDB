@@ -137,6 +137,30 @@ target_include_directories(
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/spdlog/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/msgpack/include>)
 
+# Masstree B+tree backend (switchable index)
+# Built via masstree's own autoconf -> libjson.a. Linked PRIVATE because
+# masstree symbols are internal to index implementation, not exposed via
+# public headers. To refresh after submodule update: rm the libjson.a.
+set(MASSTREE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/masstree")
+set(MASSTREE_LIB "${MASSTREE_DIR}/libjson.a")
+
+add_custom_command(
+  OUTPUT ${MASSTREE_LIB}
+  COMMAND ${CMAKE_COMMAND} -E env "CXXFLAGS=-fPIC -O3" ./bootstrap.sh
+  COMMAND ${CMAKE_COMMAND} -E env "CXXFLAGS=-fPIC -O3" ./configure --disable-assertions
+  COMMAND make -j libjson.a
+  WORKING_DIRECTORY ${MASSTREE_DIR}
+  COMMENT "Building masstree (libjson.a)"
+  VERBATIM)
+
+add_custom_target(masstree_build DEPENDS ${MASSTREE_LIB})
+add_library(masstree STATIC IMPORTED GLOBAL)
+set_target_properties(masstree PROPERTIES IMPORTED_LOCATION ${MASSTREE_LIB})
+add_dependencies(masstree masstree_build)
+
+target_link_libraries(${PROJECT_NAME} masstree)
+target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE ${MASSTREE_DIR})
+
 # Export as cmake library
 file(GLOB_RECURSE PUBLIC_HEADERS include/${PROJECT_NAME}/*.h)
 message(STATUS "${PUBLIC_HEADERS}")

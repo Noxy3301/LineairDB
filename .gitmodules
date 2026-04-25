@@ -17,3 +17,6 @@
 	path = third_party/msgpack
 	url = https://github.com/msgpack/msgpack-c.git
 	branch = cpp_master
+[submodule "third_party/masstree"]
+	path = third_party/masstree
+	url = https://github.com/Noxy3301/masstree-beta.git
