@@ -148,20 +148,30 @@ class Database::Impl {
     }
   }
 
-  // FIXME: TLS workspace assumes one active tx per thread and same CC protocol
-  // across Database instances. Calling BeginTransaction twice without End will
-  // reset the first tx. Switching Database with a different CC protocol will
-  // use the old CC implementation.
+  // FIXME: TLS workspace still assumes the same CC protocol across Database
+  // instances on a single thread. Switching Database with a different CC
+  // protocol will keep the old CC implementation.
   Transaction& BeginTransaction() {
     epoch_framework_.MakeMeOnline();
     thread_local Transaction* tls_workspace = nullptr;
-    if (tls_workspace != nullptr) {
+
+    // Reuse the TLS slot only when its previous transaction has finished.
+    // GetCurrentStatus() returns Running between Begin and End, so a non-Running
+    // status means End has already drained the workspace.
+    if (tls_workspace != nullptr &&
+        tls_workspace->GetCurrentStatus() != TxStatus::Running) {
       tls_workspace->tx_pimpl_->Reset(this);
       return *tls_workspace;
     }
+
     auto* tx = new Transaction(this);
-    tx->reusable_ = true;
-    tls_workspace = tx;
+    if (tls_workspace == nullptr) {
+      // First call on this thread: install as the per-thread workspace.
+      tx->reusable_ = true;
+      tls_workspace = tx;
+    }
+    // Otherwise the workspace is still in use by an outstanding transaction;
+    // hand back a fresh one-shot Transaction that EndTransaction will delete.
     return *tx;
   }
 
