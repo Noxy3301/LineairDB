@@ -199,7 +199,10 @@ struct MasstreeIndex::Impl {
       lp.value() = fresh;
     }
     fence();
-    lp.finish(1, *tls_ti);
+    // 1 == structural insert (bumps the leaf's vinsert counter), 0 == in-place
+    // overwrite. Claiming an insert on overwrite would falsely trigger phantom
+    // retries on concurrent scanners watching this leaf.
+    lp.finish(found ? 0 : 1, *tls_ti);
     return true;
   }
 
