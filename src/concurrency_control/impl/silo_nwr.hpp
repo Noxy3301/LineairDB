@@ -70,6 +70,7 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
     nwr_validation_result_ = NWRValidationResult::NOT_YET_VALIDATED;
     my_pivot_object_ = NWRPivotObject();
     pivot_object_snapshots_.clear();
+    pre_commit_validator_ = {};
   }
 
   const DataItem Read(const std::string_view,

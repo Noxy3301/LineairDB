@@ -53,6 +53,7 @@ class TwoPhaseLockingImpl final : public ConcurrencyControlBase {
     new (&tx_ref_) TransactionReferences(std::move(new_ref));
     undo_set_.clear();
     read_lock_set_.clear();
+    pre_commit_validator_ = {};
   }
 
   const DataItem Read(const std::string_view,
