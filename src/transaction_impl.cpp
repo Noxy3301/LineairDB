@@ -363,11 +363,14 @@ void Transaction::Impl::Update(const std::string_view key,
   EnsureCurrentTable();
   const auto& table_name = current_table_->GetTableName();
 
-  // If key exists in this transaction's write_set_ (e.g., Insert() then
-  // Update() in the same transaction), Update() should succeed even if the
-  // index entry has not been updated yet.
+  // If the primary-index entry exists in this transaction's write_set_
+  // (e.g., Insert() then Update() in the same transaction), Update() should
+  // succeed even if the index entry has not been updated yet. Snapshots from
+  // WriteSecondaryIndex live in the same write_set_, so filter on the empty
+  // index_name to match base-table writes only.
   for (auto& snapshot : write_set_) {
-    if (snapshot.key == key && snapshot.table_name == table_name) {
+    if (snapshot.key == key && snapshot.table_name == table_name &&
+        snapshot.index_name.empty()) {
       // If the key was deleted within this transaction, Update should fail.
       if (!snapshot.data_item_copy.IsInitialized()) {
         Abort();
