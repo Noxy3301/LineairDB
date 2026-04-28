@@ -130,7 +130,15 @@ const std::pair<const std::byte* const, const size_t> Transaction::Impl::Read(
     }
   }
 
-  auto* index_leaf = current_table_->GetPrimaryIndex().GetOrInsert(key);
+  // Read path: never structurally insert. ForcePutBlankEntry would bump the
+  // leaf's vinsert and invalidate any node_version_set_ entry captured by an
+  // earlier Scan in this same transaction (or by a concurrent scanner),
+  // forcing a spurious phantom abort at commit. Use non-mutating Get; if the
+  // key has no slot yet, just report not-found without registering anything.
+  auto* index_leaf = current_table_->GetPrimaryIndex().Get(key);
+  if (index_leaf == nullptr) {
+    return {nullptr, 0};
+  }
   Snapshot snapshot = {
       key, nullptr, 0, index_leaf, current_table_->GetTableName(), ""};
 
@@ -187,7 +195,11 @@ Transaction::Impl::ReadSecondaryIndex(const std::string_view index_name,
     }
   }
 
-  DataItem* index_leaf = index->GetOrInsert(key);
+  // Read path: avoid structural insert — see Read() above.
+  DataItem* index_leaf = index->Get(key);
+  if (index_leaf == nullptr) {
+    return {};
+  }
   Snapshot snapshot = {
       key, nullptr, 0, index_leaf, current_table_->GetTableName(), index_name};
 
