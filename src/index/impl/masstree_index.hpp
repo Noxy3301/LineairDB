@@ -22,12 +22,16 @@ class MasstreeIndex final : public IndexBase {
   ~MasstreeIndex() override;
 
   DataItem* Get(std::string_view key) override;
-  bool Put(std::string_view key, DataItem&& rhs) override;
-  bool Insert(std::string_view key) override;
+  bool Put(std::string_view key, DataItem&& rhs,
+           NodeVersionUpdate* out_update = nullptr) override;
+  bool Insert(std::string_view key,
+              NodeVersionUpdate* out_update = nullptr) override;
   bool Delete(std::string_view key) override;
 
-  void ForcePutBlankEntry(std::string_view key) override;
-  bool EnsureVisibleForSecondaryWrite(std::string_view key) override;
+  void ForcePutBlankEntry(std::string_view key,
+                          NodeVersionUpdate* out_update = nullptr) override;
+  bool EnsureVisibleForSecondaryWrite(
+      std::string_view key, NodeVersionUpdate* out_update = nullptr) override;
 
   std::optional<size_t> Scan(
       std::string_view begin, std::optional<std::string_view> end,
