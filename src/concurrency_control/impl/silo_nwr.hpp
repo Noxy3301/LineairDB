@@ -126,6 +126,9 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
       }
 
       // Step 3: Read value pointer + size from DataItem buffer (no memcpy).
+      // Also snapshot the initialized flag: a logical delete leaves the
+      // buffer untouched, so Scan must skip non-live leaves like Read does.
+      const bool live = index_leaf->initialized;
       const std::byte* val = index_leaf->buffer.value;
       size_t sz = index_leaf->buffer.size;
 
@@ -134,7 +137,8 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
       if (index_leaf->transaction_id.load() == tx_id) {
         validation_set_.push_back({index_leaf, tx_id});
         out_tid = tx_id;
-        return {val, sz};
+        return live ? std::pair<const std::byte*, size_t>{val, sz}
+                    : std::pair<const std::byte*, size_t>{nullptr, 0};
       }
       // TID changed → a writer intervened. Retry from Step 1.
     }
