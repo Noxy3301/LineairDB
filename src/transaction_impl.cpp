@@ -82,6 +82,33 @@ Transaction::Impl::Impl(Database::Impl* db_pimpl) noexcept
 
 Transaction::Impl::~Impl() noexcept { current_transaction_context = nullptr; }
 
+void Transaction::Impl::ReconcileOwnInsertWithNodeVersionSet(
+    const Index::NodeVersionUpdate& update) {
+  if (!update.valid || update.node_ptr == nullptr) return;
+  // node_version_set_ is a std::vector and may contain duplicate entries for
+  // the same (owner, node_ptr) when a tx scanned the same leaf more than once
+  // (overlapping scans, repeated range probes). Silo's reference uses a
+  // node-keyed map so each leaf appears once; here we have to advance every
+  // matching entry, otherwise a stale entry left at old_version would make
+  // commit-time ValidatePhantoms reject our own bump.
+  for (auto& entry : node_version_set_) {
+    if (entry.owner != update.owner || entry.node_ptr != update.node_ptr)
+      continue;
+    if (entry.version == update.old_version) {
+      // Silo §4.6: own insert advances the node-set entry from v_old to v_new
+      // so commit-time ValidatePhantoms does not reject our own bump.
+      entry.version = update.new_version;
+      continue;
+    }
+    // Same leaf, but a different version than what we recorded at scan time.
+    // A concurrent writer raced between our scan and our insert -> the only
+    // sound choice is to abort.
+    Abort();
+    return;
+  }
+  // Leaf not in node-set: this scan never observed it, no reconciliation needed.
+}
+
 void Transaction::Impl::Reset(Database::Impl* db_pimpl) {
   current_status_ = TxStatus::Running;
   db_pimpl_ = db_pimpl;
@@ -130,7 +157,15 @@ const std::pair<const std::byte* const, const size_t> Transaction::Impl::Read(
     }
   }
 
-  auto* index_leaf = current_table_->GetPrimaryIndex().GetOrInsert(key);
+  // Read path: never structurally insert. ForcePutBlankEntry would bump the
+  // leaf's vinsert and invalidate any node_version_set_ entry captured by an
+  // earlier Scan in this same transaction (or by a concurrent scanner),
+  // forcing a spurious phantom abort at commit. Use non-mutating Get; if the
+  // key has no slot yet, just report not-found without registering anything.
+  auto* index_leaf = current_table_->GetPrimaryIndex().Get(key);
+  if (index_leaf == nullptr) {
+    return {nullptr, 0};
+  }
   Snapshot snapshot = {
       key, nullptr, 0, index_leaf, current_table_->GetTableName(), ""};
 
@@ -187,7 +222,11 @@ Transaction::Impl::ReadSecondaryIndex(const std::string_view index_name,
     }
   }
 
-  DataItem* index_leaf = index->GetOrInsert(key);
+  // Read path: avoid structural insert — see Read() above.
+  DataItem* index_leaf = index->Get(key);
+  if (index_leaf == nullptr) {
+    return {};
+  }
   Snapshot snapshot = {
       key, nullptr, 0, index_leaf, current_table_->GetTableName(), index_name};
 
@@ -238,7 +277,11 @@ void Transaction::Impl::Write(const std::string_view key,
     }
   }
 
-  auto* index_leaf = current_table_->GetPrimaryIndex().GetOrInsert(key);
+  Index::NodeVersionUpdate own_insert;
+  auto* index_leaf =
+      current_table_->GetPrimaryIndex().GetOrInsert(key, &own_insert);
+  ReconcileOwnInsertWithNodeVersionSet(own_insert);
+  if (IsAborted()) return;
 
   concurrency_control_->Write(key, value, size, index_leaf);
   Snapshot sp(key, value, size, index_leaf, current_table_->GetTableName(), "",
@@ -271,11 +314,14 @@ void Transaction::Impl::WriteSecondaryIndex(
 
   // existing key
   // unique constraint check out of the transaction
-  DataItem* index_leaf = index->GetOrInsertForWrite(key);
+  Index::NodeVersionUpdate si_own_insert;
+  DataItem* index_leaf = index->GetOrInsertForWrite(key, &si_own_insert);
   if (index_leaf == nullptr) {
     Abort();
     return;
   }
+  ReconcileOwnInsertWithNodeVersionSet(si_own_insert);
+  if (IsAborted()) return;
   if (index_leaf->IsInitialized() && index->IsUnique()) {
     Abort();
     return;
@@ -347,11 +393,14 @@ void Transaction::Impl::Insert(const std::string_view key,
   if (IsAborted()) return;
   EnsureCurrentTable();
 
-  auto inserted = current_table_->GetPrimaryIndex().Insert(key);
+  Index::NodeVersionUpdate own_insert;
+  auto inserted = current_table_->GetPrimaryIndex().Insert(key, &own_insert);
   if (!inserted) {
     Abort();
     return;
   }
+  ReconcileOwnInsertWithNodeVersionSet(own_insert);
+  if (IsAborted()) return;
 
   // After successful insertion to index, delegate to Write
   Write(key, value, size);
@@ -514,7 +563,15 @@ const std::optional<size_t> Transaction::Impl::Scan(
       // Not in write_set or read_set: use ReadDirect (zero-copy).
       // This avoids creating a full Snapshot (288B) per scan entry.
       // Validation is tracked via CC's validation_set_ inside ReadDirect.
-      auto* index_leaf = current_table_->GetPrimaryIndex().GetOrInsert(key);
+      // GetOrInsert here usually finds the existing key (the scan that fed
+      // us already saw it), so out_update typically stays invalid. We still
+      // pass it through so that a concurrent split between scan and this
+      // materialization is reconciled with our node-set instead of leaking.
+      Index::NodeVersionUpdate scan_own_insert;
+      auto* index_leaf =
+          current_table_->GetPrimaryIndex().GetOrInsert(key, &scan_own_insert);
+      ReconcileOwnInsertWithNodeVersionSet(scan_own_insert);
+      if (IsAborted()) return std::nullopt;
       TransactionId scan_tid;
       auto [ptr, sz] = concurrency_control_->ReadDirect(key, index_leaf, scan_tid);
       if (IsAborted()) return std::nullopt;
@@ -879,7 +936,10 @@ void Transaction::Impl::DeleteSecondaryIndex(
 
   // delete the primary key from the data item associated
   // with the old secondary key ==========
-  auto index_leaf = index->GetOrInsert(secondary_key);
+  Index::NodeVersionUpdate si_own_insert_del;
+  auto index_leaf = index->GetOrInsert(secondary_key, &si_own_insert_del);
+  ReconcileOwnInsertWithNodeVersionSet(si_own_insert_del);
+  if (IsAborted()) return;
   bool found_in_write_set = false;
 
   bool is_rmf = false;
@@ -972,7 +1032,10 @@ void Transaction::Impl::UpdateSecondaryIndex(
   const auto index_type = index->GetIndexType();
 
   // ========== Phase 1: delete the primary key from the data item
-  auto old_leaf = index->GetOrInsert(old_secondary_key);
+  Index::NodeVersionUpdate si_own_insert_old;
+  auto old_leaf = index->GetOrInsert(old_secondary_key, &si_own_insert_old);
+  ReconcileOwnInsertWithNodeVersionSet(si_own_insert_old);
+  if (IsAborted()) return;
   bool old_found_in_write_set = false;
 
   bool is_rmf_old_key = false;
@@ -1050,11 +1113,15 @@ void Transaction::Impl::UpdateSecondaryIndex(
 
   // ========== Phase 2: add the primary key to the data item associated with
   // the new secondary key ==========
-  auto new_leaf = index->GetOrInsertForWrite(new_secondary_key);
+  Index::NodeVersionUpdate si_own_insert_new;
+  auto new_leaf =
+      index->GetOrInsertForWrite(new_secondary_key, &si_own_insert_new);
   if (new_leaf == nullptr) {
     Abort();
     return;
   }
+  ReconcileOwnInsertWithNodeVersionSet(si_own_insert_new);
+  if (IsAborted()) return;
   // unique constraint check out of the transaction
   if (new_leaf->IsInitialized() && index->IsUnique()) {
     Abort();

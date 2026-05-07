@@ -25,25 +25,49 @@ struct NodeVersionEntry {
   std::uint64_t version;
 };
 
+// Reports what an Insert/Put/ForcePutBlankEntry actually did at the leaf
+// version level. Used by OCC backends to apply the Silo §4.6 self-bump rule:
+// if the affected leaf is already in the transaction's node-set with
+// `old_version`, advance that entry to `new_version` (and only abort the tx
+// if some other concurrent writer raced between the scan and our insert).
+// `valid=false` means the call did not bump any leaf version (e.g. an
+// in-place overwrite, or the call was a no-op).
+struct NodeVersionUpdate {
+  IndexBase* owner = nullptr;
+  const void* node_ptr = nullptr;
+  std::uint64_t old_version = 0;
+  std::uint64_t new_version = 0;
+  bool valid = false;
+};
+
 class IndexBase {
  public:
   virtual ~IndexBase() = default;
 
-  // Point operations.
+  // Point operations. The optional `out_update` lets the OCC layer learn
+  // whether the call structurally bumped a leaf version, so it can apply
+  // the Silo §4.6 own-write node-set rule (advance any matching node-set
+  // entry from old_version to new_version, abort only on a real race).
+  // Backends that do not track leaf versions (PL) leave `out_update->valid`
+  // false.
   virtual DataItem* Get(std::string_view key) = 0;
-  virtual bool Put(std::string_view key, DataItem&& rhs) = 0;
-  virtual bool Insert(std::string_view key) = 0;
+  virtual bool Put(std::string_view key, DataItem&& rhs,
+                   NodeVersionUpdate* out_update = nullptr) = 0;
+  virtual bool Insert(std::string_view key,
+                      NodeVersionUpdate* out_update = nullptr) = 0;
   virtual bool Delete(std::string_view key) = 0;
 
   // Force-insert a blank entry into the point index. PL uses this to seed a
   // value slot that later writes fill in; single-tree backends implement it
   // as an idempotent Insert.
-  virtual void ForcePutBlankEntry(std::string_view key) = 0;
+  virtual void ForcePutBlankEntry(std::string_view key,
+                                   NodeVersionUpdate* out_update = nullptr) = 0;
 
   // Make the key visible to future scans even if a prior write left the point
   // index populated but the range index empty (PL's DELETED state).
   // Returns false on phantom anomaly.
-  virtual bool EnsureVisibleForSecondaryWrite(std::string_view key) = 0;
+  virtual bool EnsureVisibleForSecondaryWrite(
+      std::string_view key, NodeVersionUpdate* out_update = nullptr) = 0;
 
   // Range operations. Returning std::nullopt signals a phantom anomaly
   // detected synchronously (PL). Backends that defer phantom checks append

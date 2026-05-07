@@ -19,24 +19,27 @@ class SecondaryIndex {
 
   DataItem* Get(std::string_view key) { return secondary_index_->Get(key); }
 
-  DataItem* GetOrInsert(std::string_view key) {
+  DataItem* GetOrInsert(std::string_view key,
+                         NodeVersionUpdate* out_update = nullptr) {
     auto* item = secondary_index_->Get(key);
     if (item == nullptr) {
-      secondary_index_->ForcePutBlankEntry(key);
+      secondary_index_->ForcePutBlankEntry(key, out_update);
       item = secondary_index_->Get(key);
       assert(item != nullptr);
     }
     return item;
   }
 
-  DataItem* GetOrInsertForWrite(std::string_view key) {
+  DataItem* GetOrInsertForWrite(std::string_view key,
+                                  NodeVersionUpdate* out_update = nullptr) {
     // OCC guards existing entries; new keys (and PL's point-present /
     // range-absent DELETED slots, where IsInitialized() is false) still need
     // EnsureVisibleForSecondaryWrite so the range index can run its phantom
     // detection.
     auto* item = secondary_index_->Get(key);
     if (item == nullptr || !item->IsInitialized()) {
-      if (!secondary_index_->EnsureVisibleForSecondaryWrite(key)) return nullptr;
+      if (!secondary_index_->EnsureVisibleForSecondaryWrite(key, out_update))
+        return nullptr;
       item = secondary_index_->Get(key);
       assert(item != nullptr);
     }
@@ -73,8 +76,9 @@ class SecondaryIndex {
     secondary_index_->ForEach(f);
   }
 
-  bool Put(const std::string_view key, DataItem&& value) {
-    return secondary_index_->Put(key, std::forward<DataItem>(value));
+  bool Put(const std::string_view key, DataItem&& value,
+           NodeVersionUpdate* out_update = nullptr) {
+    return secondary_index_->Put(key, std::forward<DataItem>(value), out_update);
   }
 
   bool IsUnique() { return index_type_.IsUnique(); }

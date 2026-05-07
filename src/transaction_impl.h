@@ -133,6 +133,16 @@ class Transaction::Impl {
   void EnsureCurrentTable();
   bool IsAborted() { return current_status_ == TxStatus::Aborted; };
 
+  // Apply the Silo §4.6 own-write rule to node_version_set_: when this tx
+  // structurally bumped a leaf via Insert/Put/ForcePutBlankEntry, look up any
+  // matching node-set entry. If found with the leaf's pre-insert version,
+  // advance it to the post-insert version (so commit-time ValidatePhantoms
+  // does not abort us on our own bump). If found with a different version,
+  // a concurrent writer raced between our scan and our insert -> Abort().
+  // No-op when `update.valid` is false or the leaf is not in node_version_set_.
+  void ReconcileOwnInsertWithNodeVersionSet(
+      const Index::NodeVersionUpdate& update);
+
  private:
   TxStatus current_status_;
   Database::Impl* db_pimpl_;

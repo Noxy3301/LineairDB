@@ -16,19 +16,26 @@ class PLIndex final : public IndexBase {
 
   DataItem* Get(std::string_view key) override { return impl_.Get(key); }
 
-  bool Put(std::string_view key, DataItem&& rhs) override {
+  bool Put(std::string_view key, DataItem&& rhs,
+           NodeVersionUpdate* /*out_update*/ = nullptr) override {
     return impl_.Put(key, std::forward<DataItem>(rhs));
   }
 
-  bool Insert(std::string_view key) override { return impl_.Insert(key); }
+  bool Insert(std::string_view key,
+              NodeVersionUpdate* /*out_update*/ = nullptr) override {
+    return impl_.Insert(key);
+  }
 
   bool Delete(std::string_view key) override { return impl_.Delete(key); }
 
-  void ForcePutBlankEntry(std::string_view key) override {
+  void ForcePutBlankEntry(std::string_view key,
+                          NodeVersionUpdate* /*out_update*/ = nullptr) override {
     impl_.ForcePutBlankEntry(key);
   }
 
-  bool EnsureVisibleForSecondaryWrite(std::string_view key) override {
+  bool EnsureVisibleForSecondaryWrite(
+      std::string_view key,
+      NodeVersionUpdate* /*out_update*/ = nullptr) override {
     return impl_.EnsureVisibleForSecondaryWrite(key);
   }
 

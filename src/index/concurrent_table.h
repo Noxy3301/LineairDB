@@ -39,8 +39,12 @@ class ConcurrentTable {
                   WriteSetType recovery_set = WriteSetType());
 
   DataItem* Get(const std::string_view key);
-  DataItem* GetOrInsert(const std::string_view key);
-  bool Put(const std::string_view key, DataItem&& value);
+  // GetOrInsert reports a non-null `out_update->valid=true` only when the
+  // missing-key path actually structurally inserted a placeholder leaf.
+  DataItem* GetOrInsert(const std::string_view key,
+                         NodeVersionUpdate* out_update = nullptr);
+  bool Put(const std::string_view key, DataItem&& value,
+           NodeVersionUpdate* out_update = nullptr);
   void ForEach(std::function<bool(std::string_view, DataItem&)>);
   std::optional<size_t> Scan(
       const std::string_view begin, const std::optional<std::string_view> end,
@@ -58,7 +62,8 @@ class ConcurrentTable {
       const std::string_view begin, const std::string_view end,
       std::function<bool(std::string_view, DataItem&)> operation,
       std::vector<NodeVersionEntry>* out_versions = nullptr);
-  bool Insert(const std::string_view key);
+  bool Insert(const std::string_view key,
+              NodeVersionUpdate* out_update = nullptr);
 
   bool Delete(const std::string_view key);
 

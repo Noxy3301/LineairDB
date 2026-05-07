@@ -97,9 +97,13 @@ struct ScanAdapter {
   template <typename SS, typename K>
   void visit_leaf(const SS& stack, const K&, threadinfo&) {
     if (out_versions == nullptr) return;
+    // Use the unlocked projection so the recorded version matches what
+    // ValidatePhantoms (and tcursor's next_full_version_value bumping) read
+    // back later. Otherwise a stack snapshot taken while some writer briefly
+    // held the leaf lock would carry the lock_bit and mismatch.
     out_versions->push_back(
         {owner, static_cast<const void*>(stack.node()),
-         static_cast<std::uint64_t>(stack.full_version_value())});
+         static_cast<std::uint64_t>(stack.node()->full_unlocked_version_value())});
   }
 
   // Returns true to keep scanning, false to stop (masstree convention).
@@ -132,9 +136,13 @@ struct ScanValueAdapter {
   template <typename SS, typename K>
   void visit_leaf(const SS& stack, const K&, threadinfo&) {
     if (out_versions == nullptr) return;
+    // Use the unlocked projection so the recorded version matches what
+    // ValidatePhantoms (and tcursor's next_full_version_value bumping) read
+    // back later. Otherwise a stack snapshot taken while some writer briefly
+    // held the leaf lock would carry the lock_bit and mismatch.
     out_versions->push_back(
         {owner, static_cast<const void*>(stack.node()),
-         static_cast<std::uint64_t>(stack.full_version_value())});
+         static_cast<std::uint64_t>(stack.node()->full_unlocked_version_value())});
   }
 
   bool visit_value(Masstree::Str key, DataItem* val, threadinfo&) {
@@ -184,7 +192,11 @@ struct MasstreeIndex::Impl {
   }
 
   // Upsert with a freshly-allocated DataItem. Returns true on success.
-  bool Put(std::string_view key, DataItem&& rhs) {
+  // When `out_update` is non-null and the call structurally bumps the leaf
+  // (state=1 = key was absent), records (leaf, prev_version, next_version) so
+  // the OCC layer can apply Silo §4.6's own-write node-set rule.
+  bool Put(std::string_view key, DataItem&& rhs,
+           NodeVersionUpdate* out_update = nullptr) {
     ensure_thread_init();
     auto* fresh = new DataItem(std::move(rhs));
     cursor_type lp(table_, key.data(), key.size());
@@ -197,6 +209,14 @@ struct MasstreeIndex::Impl {
       lp.value() = fresh;
     } else {
       lp.value() = fresh;
+    }
+    if (out_update != nullptr && !found) {
+      out_update->node_ptr = static_cast<const void*>(lp.node());
+      out_update->old_version =
+          static_cast<std::uint64_t>(lp.previous_full_version_value());
+      out_update->new_version =
+          static_cast<std::uint64_t>(lp.next_full_version_value(1));
+      out_update->valid = true;
     }
     fence();
     // 1 == structural insert (bumps the leaf's vinsert counter), 0 == in-place
@@ -212,7 +232,10 @@ struct MasstreeIndex::Impl {
   //   NOT_EXISTS -> succeed (allocate new slot)
   // Must not replace an existing DataItem* on DELETED reuse: concurrent
   // readers may still hold a raw pointer from an earlier Get().
-  bool Insert(std::string_view key) {
+  // When `out_update` is non-null and the call structurally bumps the leaf
+  // (NOT_EXISTS branch), records the version delta for Silo §4.6 own-write
+  // node-set reconciliation.
+  bool Insert(std::string_view key, NodeVersionUpdate* out_update = nullptr) {
     ensure_thread_init();
     cursor_type lp(table_, key.data(), key.size());
     bool found = lp.find_insert(*tls_ti);
@@ -228,6 +251,14 @@ struct MasstreeIndex::Impl {
       fence();
       lp.finish(0, *tls_ti);
       return true;
+    }
+    if (out_update != nullptr) {
+      out_update->node_ptr = static_cast<const void*>(lp.node());
+      out_update->old_version =
+          static_cast<std::uint64_t>(lp.previous_full_version_value());
+      out_update->new_version =
+          static_cast<std::uint64_t>(lp.next_full_version_value(1));
+      out_update->valid = true;
     }
     lp.value() = new DataItem();
     fence();
@@ -249,22 +280,34 @@ struct MasstreeIndex::Impl {
   bool Delete(std::string_view /*key*/) { return true; }
 
   // Idempotent blank insert: PL's ForcePutBlankEntry never removes, just
-  // ensures a slot exists.
-  void ForcePutBlankEntry(std::string_view key) {
+  // ensures a slot exists. When `out_update` is non-null and we structurally
+  // bumped the leaf, records the version delta for Silo §4.6 own-write
+  // node-set reconciliation.
+  void ForcePutBlankEntry(std::string_view key,
+                           NodeVersionUpdate* out_update = nullptr) {
     ensure_thread_init();
     cursor_type lp(table_, key.data(), key.size());
     bool found = lp.find_insert(*tls_ti);
     if (!found) {
       lp.value() = new DataItem();
     }
+    if (out_update != nullptr && !found) {
+      out_update->node_ptr = static_cast<const void*>(lp.node());
+      out_update->old_version =
+          static_cast<std::uint64_t>(lp.previous_full_version_value());
+      out_update->new_version =
+          static_cast<std::uint64_t>(lp.next_full_version_value(1));
+      out_update->valid = true;
+    }
     fence();
     lp.finish(found ? 0 : 1, *tls_ti);
   }
 
-  bool EnsureVisibleForSecondaryWrite(std::string_view key) {
+  bool EnsureVisibleForSecondaryWrite(
+      std::string_view key, NodeVersionUpdate* out_update = nullptr) {
     // Single-tree Masstree has no "range-empty point-present" DELETED state,
     // so any successful insert/idempotent-visit keeps the key observable.
-    ForcePutBlankEntry(key);
+    ForcePutBlankEntry(key, out_update);
     return true;
   }
 
@@ -383,7 +426,13 @@ struct MasstreeIndex::Impl {
       if (e.owner != self) continue;  // entry belongs to a different index
       const auto* leaf =
           static_cast<const leaf_type*>(e.node_ptr);
-      if (static_cast<std::uint64_t>(leaf->full_version_value()) !=
+      // full_unlocked_version_value() masks the transient lock_bit (and
+      // handles the split-bit corner case), so an unrelated concurrent
+      // writer holding the leaf lock at validation time does not produce
+      // a false-positive abort. tcursor::previous_full_version_value and
+      // next_full_version_value, which seed the entries we are comparing
+      // against, also return the unlocked projection -> apples to apples.
+      if (static_cast<std::uint64_t>(leaf->full_unlocked_version_value()) !=
           e.version) {
         return false;
       }
@@ -406,24 +455,35 @@ DataItem* MasstreeIndex::Get(std::string_view key) {
   return impl_->Get(key);
 }
 
-bool MasstreeIndex::Put(std::string_view key, DataItem&& rhs) {
-  return impl_->Put(key, std::move(rhs));
+bool MasstreeIndex::Put(std::string_view key, DataItem&& rhs,
+                        NodeVersionUpdate* out_update) {
+  bool ok = impl_->Put(key, std::move(rhs), out_update);
+  if (out_update != nullptr && out_update->valid) out_update->owner = this;
+  return ok;
 }
 
-bool MasstreeIndex::Insert(std::string_view key) {
-  return impl_->Insert(key);
+bool MasstreeIndex::Insert(std::string_view key,
+                            NodeVersionUpdate* out_update) {
+  bool ok = impl_->Insert(key, out_update);
+  if (out_update != nullptr && out_update->valid) out_update->owner = this;
+  return ok;
 }
 
 bool MasstreeIndex::Delete(std::string_view key) {
   return impl_->Delete(key);
 }
 
-void MasstreeIndex::ForcePutBlankEntry(std::string_view key) {
-  impl_->ForcePutBlankEntry(key);
+void MasstreeIndex::ForcePutBlankEntry(std::string_view key,
+                                        NodeVersionUpdate* out_update) {
+  impl_->ForcePutBlankEntry(key, out_update);
+  if (out_update != nullptr && out_update->valid) out_update->owner = this;
 }
 
-bool MasstreeIndex::EnsureVisibleForSecondaryWrite(std::string_view key) {
-  return impl_->EnsureVisibleForSecondaryWrite(key);
+bool MasstreeIndex::EnsureVisibleForSecondaryWrite(
+    std::string_view key, NodeVersionUpdate* out_update) {
+  bool ok = impl_->EnsureVisibleForSecondaryWrite(key, out_update);
+  if (out_update != nullptr && out_update->valid) out_update->owner = this;
+  return ok;
 }
 
 std::optional<size_t> MasstreeIndex::Scan(
