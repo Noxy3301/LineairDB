@@ -142,6 +142,11 @@ class Transaction::Impl {
   // No-op when `update.valid` is false or the leaf is not in node_version_set_.
   void ReconcileOwnInsertWithNodeVersionSet(
       const Index::NodeVersionUpdate& update);
+  // Scan the primary index so the callback can stop the tree walk early.
+  const std::optional<size_t> ScanPrimaryIndexWithEarlyStop(
+      const std::string_view begin, const std::string_view end,
+      std::function<bool(std::string_view,const std::pair<const void*, const size_t>)> operation,
+      bool reverse);
 
  private:
   TxStatus current_status_;

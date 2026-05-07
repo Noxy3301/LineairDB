@@ -38,6 +38,23 @@ thread_local void* current_transaction_context = nullptr;
 thread_local uint64_t tx_context_thread_tag =
     (std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xFFFFFFFF) << 32;
 thread_local uint64_t tx_context_seq = 0;
+
+// True when this transaction wrote a base row inside [begin, end).
+bool HasOwnBaseRowWriteInRange(const WriteSetType& write_set,
+                               std::string_view table_name,
+                               std::string_view begin,
+                               const std::optional<std::string_view>& end) {
+  for (const auto& snapshot : write_set) {
+    if (snapshot.table_name != table_name) continue;
+    if (!snapshot.index_name.empty()) continue;
+
+    const std::string_view key(snapshot.key);
+    if (key < begin) continue;
+    if (end.has_value() && key >= end.value()) continue;
+    return true;
+  }
+  return false;
+}
 }
 
 void* GetCurrentTransactionContext() { return current_transaction_context; }
@@ -460,6 +477,60 @@ void Transaction::Impl::Delete(const std::string_view key) {
   this->Update(key, nullptr, 0);
 }
 
+const std::optional<size_t> Transaction::Impl::ScanPrimaryIndexWithEarlyStop(
+    const std::string_view begin, const std::string_view end,
+    std::function<bool(std::string_view, const std::pair<const void*, const size_t>)> operation,
+    bool reverse) {
+  const auto& table_name = current_table_->GetTableName();
+  size_t total_count = 0;
+
+  // Materialize each index entry as a transaction read.
+  auto emit_index_row = [&](std::string_view key, DataItem& index_leaf) {
+    if (IsAborted()) return true;
+
+    // Reuse read_set_ so repeated reads keep the same value and validation.
+    for (auto& snapshot : read_set_) {
+      if (snapshot.key != key || snapshot.table_name != table_name || !snapshot.index_name.empty()) {
+        continue;
+      }
+      if (snapshot.data_item_copy.IsInitialized()) {
+        std::pair<const void*, const size_t> value_pair = {
+          snapshot.data_item_copy.value(), snapshot.data_item_copy.size()};
+        total_count++;
+        return operation(snapshot.key, value_pair);
+      }
+      return false;
+    }
+
+    // ReadDirect records OCC validation for the row found by the index scan.
+    TransactionId scan_tid;
+    auto [ptr, sz] = concurrency_control_->ReadDirect(key, &index_leaf, scan_tid);
+    if (IsAborted()) return true;
+
+    if (ptr == nullptr || sz == 0) return false;
+    total_count++;
+    return operation(key, {ptr, sz});
+  };
+
+  // Forward and reverse scans share the same row materialization path.
+  std::optional<size_t> index_result;
+  if (reverse) {
+    index_result = current_table_->GetPrimaryIndex().ScanReverse(
+        begin, end, emit_index_row, &node_version_set_);
+  } else {
+    index_result = current_table_->GetPrimaryIndex().Scan(
+        begin, end, emit_index_row, &node_version_set_);
+  }
+
+  // A missing index result means the scan could not take a safe node snapshot.
+  if (!index_result.has_value()) {
+    Abort();
+    return std::nullopt;
+  }
+  if (IsAborted()) return std::nullopt;
+  return total_count;
+}
+
 const std::optional<size_t> Transaction::Impl::Scan(
     const std::string_view begin, const std::optional<std::string_view> end,
     std::function<bool(std::string_view,
@@ -470,6 +541,12 @@ const std::optional<size_t> Transaction::Impl::Scan(
   // Note: In this Scan implementation, nullptr indicates that the key is
   // deleted or does not exist. SQL NULL values should be handled within the
   // byte array value, not by nullptr.
+
+  const auto& table_name = current_table_->GetTableName();
+  // No own writes to merge: scan the index directly and stop on callback.
+  if (end.has_value() && !HasOwnBaseRowWriteInRange(write_set_, table_name, begin, end)) {
+    return ScanPrimaryIndexWithEarlyStop(begin, end.value(), operation, false);
+  }
 
   // Step 1: Collect keys from index.
   // Keys come out sorted from PrecisionLocking's std::map, so we use a vector
@@ -491,7 +568,6 @@ const std::optional<size_t> Transaction::Impl::Scan(
 
   // Step 2: Pick out write_set entries inside [begin, end) on the current base table.
   std::vector<std::string> write_set_keys;
-  const auto& table_name = current_table_->GetTableName();
   for (const auto& snapshot : write_set_) {
     if (snapshot.table_name != table_name) continue;      // different table
     if (!snapshot.index_name.empty()) continue;           // secondary index entry
@@ -602,6 +678,12 @@ const std::optional<size_t> Transaction::Impl::ScanReverse(
   // deleted or does not exist. SQL NULL values should be handled within the
   // byte array value, not by nullptr.
 
+  const auto& table_name = current_table_->GetTableName();
+  // No own writes to merge: scan the index directly and stop on callback.
+  if (end.has_value() && !HasOwnBaseRowWriteInRange(write_set_, table_name, begin, end)) {
+    return ScanPrimaryIndexWithEarlyStop(begin, end.value(), operation, true);
+  }
+
   // Step 1: Collect keys from index (reverse order from PL's map)
   std::vector<std::string> index_keys;
   index_keys.reserve(4096);
@@ -620,7 +702,6 @@ const std::optional<size_t> Transaction::Impl::ScanReverse(
 
   // Step 2: Pick out write_set entries inside [begin, end) on the current base table.
   std::vector<std::string> write_set_keys;
-  const auto& table_name = current_table_->GetTableName();
   for (const auto& snapshot : write_set_) {
     if (snapshot.table_name != table_name) continue;      // different table
     if (!snapshot.index_name.empty()) continue;           // secondary index entry
