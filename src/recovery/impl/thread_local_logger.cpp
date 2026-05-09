@@ -16,12 +16,15 @@
 
 #include "thread_local_logger.h"
 
+#include <fcntl.h>
 #include <glob.h>
 #include <lineairdb/database.h>
 #include <lineairdb/tx_status.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cassert>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <msgpack.hpp>
@@ -37,7 +40,10 @@ std::atomic<size_t> ThreadLocalLogger::ThreadLocalStorageNode::ThreadIdCounter =
     {0};
 
 ThreadLocalLogger::ThreadLocalLogger(const Config& config)
-    : WorkingDir(config.work_dir) {
+    : WorkingDir(config.work_dir),
+      sync_log_writes_(std::getenv("LINEAIRDB_LOG_FSYNC") != nullptr &&
+                       std::getenv("LINEAIRDB_LOG_FSYNC")[0] != '\0' &&
+                       std::getenv("LINEAIRDB_LOG_FSYNC")[0] != '0') {
   LineairDB::Util::SetUpSPDLog();
 }
 
@@ -85,48 +91,29 @@ void ThreadLocalLogger::Enqueue(const WriteSetType& ws_ref, EpochNumber epoch,
       }
     }
   }
+
   auto* my_storage = thread_key_storage_.Get();
-  my_storage->log_records.emplace_back(std::move(record));
-
+  std::lock_guard<std::mutex> guard(my_storage->log_records_mutex);
   if (entrusting) {
-    // The callee thread is not in LineairDB's thread pool and thus
-    // this thread may be terminated after this transaction
-    // The log record is not persisted when 1) this thread buffers its log
-    // records and 2) will be terminated soon after here.
-    // To ensure durability, we immediately flush the log records.
-
-    if (!my_storage->log_file.is_open()) {
-      my_storage->log_file = std::fstream(
-          GetLogFileName(my_storage->thread_id),
-          std::fstream::out | std::fstream::binary | std::fstream::ate);
+    // A newly buffered record is not durable until a later epoch flush writes it.
+    const EpochNumber durable_before_record = (epoch == 0) ? 0 : epoch - 1;
+    const EpochNumber current_durable = my_storage->durable_epoch.load();
+    if (current_durable == EpochFramework::THREAD_OFFLINE ||
+        current_durable >= epoch) {
+      my_storage->durable_epoch.store(durable_before_record);
     }
-    msgpack::pack(my_storage->log_file, my_storage->log_records);
-    my_storage->log_file.flush();
-    my_storage->log_records.clear();
-    my_storage->durable_epoch.store(epoch);
   }
+  my_storage->log_records.emplace_back(std::move(record));
 }
 
 void ThreadLocalLogger::FlushLogs(EpochNumber stable_epoch) {
-  auto* my_storage = thread_key_storage_.Get();
-
-  if (!my_storage->log_records.empty()) {
-    if (!my_storage->log_file.is_open()) {
-      my_storage->log_file = std::fstream(
-          GetLogFileName(my_storage->thread_id),
-          std::fstream::out | std::fstream::binary | std::fstream::ate);
-    }
-    msgpack::pack(my_storage->log_file, my_storage->log_records);
-    my_storage->log_file.flush();
-    my_storage->log_records.clear();
-  }
-
-  my_storage->durable_epoch.store(stable_epoch);
+  FlushAllLogs(stable_epoch);
 }
 
 void ThreadLocalLogger::TruncateLogs(
     const EpochNumber checkpoint_completed_epoch) {
   auto* my_storage = thread_key_storage_.Get();
+  std::lock_guard<std::mutex> guard(my_storage->log_records_mutex);
 
   assert(my_storage->truncated_epoch <= checkpoint_completed_epoch);
   if (checkpoint_completed_epoch == my_storage->truncated_epoch) return;
@@ -210,6 +197,50 @@ std::string ThreadLocalLogger::GetLogFileName(size_t thread_id) const {
 
 std::string ThreadLocalLogger::GetWorkingLogFileName(size_t thread_id) const {
   return WorkingDir + "/thread" + std::to_string(thread_id) + ".working.log";
+}
+
+void ThreadLocalLogger::FlushThreadLogs(ThreadLocalStorageNode* storage,
+                                        EpochNumber stable_epoch) {
+  std::lock_guard<std::mutex> guard(storage->log_records_mutex);
+  if (!storage->log_records.empty()) {
+    if (!storage->log_file.is_open()) {
+      storage->log_file = std::fstream(
+          GetLogFileName(storage->thread_id),
+          std::fstream::out | std::fstream::binary | std::fstream::ate);
+    }
+    msgpack::pack(storage->log_file, storage->log_records);
+    storage->log_file.flush();
+    if (sync_log_writes_) {
+      SyncLogFile(GetLogFileName(storage->thread_id));
+    }
+    storage->log_records.clear();
+  }
+
+  if (storage->durable_epoch.load() != EpochFramework::THREAD_OFFLINE) {
+    storage->durable_epoch.store(stable_epoch);
+  }
+}
+
+void ThreadLocalLogger::FlushAllLogs(EpochNumber stable_epoch) {
+  std::lock_guard<std::mutex> guard(flush_all_mutex_);
+  thread_key_storage_.ForEach([&](ThreadLocalStorageNode* storage) {
+    FlushThreadLogs(storage, stable_epoch);
+  });
+}
+
+void ThreadLocalLogger::SyncLogFile(const std::string& filename) const {
+  const int fd = open(filename.c_str(), O_RDONLY);
+  if (fd < 0) {
+    SPDLOG_ERROR("Durability Error: fail to open logfile for fsync. errno: {0}",
+                 errno);
+    exit(1);
+  }
+  if (fsync(fd) != 0) {
+    SPDLOG_ERROR("Durability Error: fail to fsync logfile. errno: {0}", errno);
+    close(fd);
+    exit(1);
+  }
+  close(fd);
 }
 
 }  // namespace Recovery

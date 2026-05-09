@@ -24,6 +24,7 @@
 #include <fstream>
 #include <functional>
 #include <msgpack.hpp>
+#include <mutex>
 #include <queue>
 #include <sstream>
 
@@ -60,6 +61,7 @@ class ThreadLocalLogger final : public LoggerBase {
     size_t thread_id;
     std::atomic<EpochNumber> durable_epoch;
     EpochNumber truncated_epoch;
+    std::mutex log_records_mutex;
     std::fstream log_file;
     Logger::LogRecords log_records;
     MSGPACK_DEFINE(log_records);
@@ -72,7 +74,15 @@ class ThreadLocalLogger final : public LoggerBase {
   };
 
  private:
+  void FlushThreadLogs(ThreadLocalStorageNode* storage,
+                       EpochNumber stable_epoch);
+  void FlushAllLogs(EpochNumber stable_epoch);
+  void SyncLogFile(const std::string& filename) const;
+
+ private:
   ThreadKeyStorage<ThreadLocalStorageNode> thread_key_storage_;
+  std::mutex flush_all_mutex_;
+  bool sync_log_writes_;
 };
 
 }  // namespace Recovery
