@@ -71,4 +71,41 @@ bool Database::CreateSecondaryIndex(const std::string_view table_name,
   return db_pimpl_->CreateSecondaryIndex(table_name, index_name, index_type);
 }
 
+StatelessReadResult Database::StatelessRead(const std::string_view table_name,
+                                            const std::string_view key) {
+  return db_pimpl_->StatelessRead(table_name, key);
+}
+
+std::vector<StatelessReadResult> Database::StatelessBatchRead(
+    const std::vector<std::pair<std::string, std::string>>& keys) {
+  return db_pimpl_->StatelessBatchRead(keys);
+}
+
+StatelessRangeScanResult Database::StatelessRangeScan(
+    const std::string_view table_name, const std::string_view start_key,
+    const std::string_view end_key, uint64_t row_limit, bool reverse_scan) {
+  return db_pimpl_->StatelessRangeScan(table_name, start_key, end_key,
+                                       row_limit, reverse_scan);
+}
+
+StatelessSecondaryRangeScanResult Database::StatelessSecondaryRangeScan(
+    const std::string_view table_name, const std::string_view index_name,
+    const std::string_view start_key, const std::string_view end_key,
+    uint64_t row_limit, bool reverse_scan) {
+  return db_pimpl_->StatelessSecondaryRangeScan(
+      table_name, index_name, start_key, end_key, row_limit, reverse_scan);
+}
+
+bool Database::ValidateAndCommit(
+    const std::vector<ExternalReadEntry>& reads,
+    const std::vector<ExternalWriteEntry>& writes,
+    const std::vector<ExternalSecondaryIndexEntry>& secondary_index_ops,
+    const std::vector<ExternalRangeValidationEntry>& range_reads,
+    const std::vector<ExternalIndexValidationEntry>& index_reads,
+    std::string* abort_reason) {
+  return db_pimpl_->ValidateAndCommit(reads, writes, secondary_index_ops,
+                                      range_reads, index_reads,
+                                      abort_reason);
+}
+
 }  // namespace LineairDB

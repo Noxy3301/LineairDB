@@ -18,11 +18,15 @@
 #define LINEAIRDB_DATABASE_H
 
 #include <lineairdb/config.h>
+#include <lineairdb/stateless.h>
 #include <lineairdb/transaction.h>
 
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "config.h"
 #include "tx_status.h"
@@ -166,8 +170,128 @@ class Database {
    */
   bool CreateTable(const std::string_view table_name);
 
- private:
+  // ----------------------------------------------------------------------
+  // Stateless read / validate-and-commit API.
+  //
+  // The methods below do not allocate a server-side Transaction. Each call
+  // returns the snapshot the caller needs (value, packed TID, observed
+  // Masstree node versions) so that the caller can keep its own read set
+  // across independent RPCs. The collected snapshot is replayed through
+  // ValidateAndCommit when the logical transaction is ready to commit.
+  // See @ref stateless.h for the supporting types.
+  // ----------------------------------------------------------------------
+
+  /**
+   * @brief Read one row without opening a server-side transaction.
+   *
+   * Looks the key up in the primary index of `table_name` and returns the
+   * current value together with the packed TID observed at read time. The
+   * caller should later pass the same TID back inside an ExternalReadEntry
+   * so that ValidateAndCommit can confirm the row was not modified
+   * concurrently.
+   *
+   * @param table_name Target table.
+   * @param key Primary key to look up.
+   * @return Result with `found` set when the key exists and was non-empty.
+   *         When the table does not exist, `found` is false and `tid` is 0.
+   */
+  StatelessReadResult StatelessRead(const std::string_view table_name,
+                                    const std::string_view key);
+
+  /**
+   * @brief Read several rows in one call.
+   *
+   * Each `keys[i] = {table_name, key}` is resolved with the same protocol as
+   * StatelessRead. Reads do not share state, so this is purely a transport
+   * optimization on top of repeated StatelessRead calls.
+   *
+   * @param keys (table_name, key) pairs to look up.
+   * @return One StatelessReadResult per input, in the same order.
+   */
+  std::vector<StatelessReadResult> StatelessBatchRead(
+      const std::vector<std::pair<std::string, std::string>>& keys);
+
+  /**
+   * @brief Range-scan the primary index and return all rows together with
+   *        the validation tokens needed to revalidate the range at commit.
+   *
+   * Each returned row carries its own TID. The result also includes the
+   * Masstree node versions touched by the scan (range_versions) and any
+   * exact tombstone entries (index_reads), so a concurrent insert that
+   * reuses a tombstone slot or splits a leaf is detected by
+   * ValidateAndCommit.
+   *
+   * @param table_name Target table.
+   * @param start_key Inclusive start of the range.
+   * @param end_key   Exclusive end of the range. Must be non-empty.
+   * @param row_limit Maximum rows to return. 0 means no cap.
+   * @param reverse_scan When true, iterate from `end_key` toward `start_key`.
+   * @return Result with `ok == false` if the scan retried out or the table
+   *         is missing. Callers should treat `!ok` as an abort signal.
+   */
+  StatelessRangeScanResult StatelessRangeScan(
+      const std::string_view table_name, const std::string_view start_key,
+      const std::string_view end_key, uint64_t row_limit, bool reverse_scan);
+
+  /**
+   * @brief Range-scan a secondary index and resolve each hit to its base row.
+   *
+   * For every secondary key in `[start_key, end_key)`, this resolves each of
+   * its primary keys, reads the base row, and reports
+   * `{secondary_key, primary_key, value, tid, found}` per result. Validation
+   * tokens cover both the secondary index range and each base-row read.
+   *
+   * @param table_name Base table.
+   * @param index_name Secondary index name.
+   * @param start_key Inclusive start of the secondary range.
+   * @param end_key Exclusive end of the secondary range. Must be non-empty.
+   * @param row_limit Maximum rows to return. 0 means no cap.
+   * @param reverse_scan When true, iterate in reverse secondary-key order.
+   * @return Result with `ok == false` if the scan retried out or the
+   *         table/index is missing.
+   */
+  StatelessSecondaryRangeScanResult StatelessSecondaryRangeScan(
+      const std::string_view table_name, const std::string_view index_name,
+      const std::string_view start_key, const std::string_view end_key,
+      uint64_t row_limit, bool reverse_scan);
+
+  /**
+   * @brief Validate a caller-collected snapshot and install its writes
+   *        atomically.
+   *
+   * Runs the Silo commit phase against external inputs:
+   *   1. Resolve each read/write/SI op to its DataItem.
+   *   2. Lock every write target.
+   *   3. Re-check `reads` and `index_reads` TIDs against the locked state.
+   *   4. Re-check `range_reads` either by Masstree node version
+   *      (physical form) or by replaying the scan (logical form).
+   *   5. Re-check UNIQUE secondary-index adds against the locked SI slots.
+   *   6. Install writes, append the log set, and unlock with a new TID.
+   *
+   * Aborts return false. The optional `abort_reason` is set to a short
+   * machine-readable label such as `exact_read_tid_moved`,
+   * `range_node_version_changed`, or `unique_si_exists_after_lock`.
+   *
+   * @param reads Point reads to revalidate before commit.
+   * @param writes Row writes (`is_delete == true` to remove the row).
+   * @param secondary_index_ops Secondary-index adds/removes to install.
+   * @param range_reads Range validation tokens collected by earlier scans.
+   * @param index_reads Exact-key tokens collected alongside scans.
+   * @param abort_reason Optional out parameter. Set only when the function
+   *                    returns false.
+   * @return true on commit; false on validation failure or schema mismatch.
+   */
+  bool ValidateAndCommit(
+      const std::vector<ExternalReadEntry>& reads,
+      const std::vector<ExternalWriteEntry>& writes,
+      const std::vector<ExternalSecondaryIndexEntry>& secondary_index_ops,
+      const std::vector<ExternalRangeValidationEntry>& range_reads = {},
+      const std::vector<ExternalIndexValidationEntry>& index_reads = {},
+      std::string* abort_reason = nullptr);
+
   class Impl;
+
+ private:
   const std::unique_ptr<Impl> db_pimpl_;
   friend class Transaction;
 };
