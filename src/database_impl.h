@@ -1180,46 +1180,17 @@ class Database::Impl {
       }
     }
 
-    // Install secondary-index add/remove. The Purge decision uses the
-    // post-tx primary_keys, not the intermediate per-op state — for a
-    // unique SI [Remove(sk,pk1), Add(sk,pk2)] (= UPDATE on a unique
-    // column), a per-op decision would Purge after Remove and then
-    // Add(pk2) into the orphaned slot, losing the mapping. Purge again
-    // runs BEFORE mutating DataItem (same ordering as the primary loop).
-    std::unordered_map<DataItem*, std::vector<std::string>> si_final_state;
-    for (const auto& op : resolved_si_ops) {
-      auto [it, inserted] = si_final_state.emplace(op.item,
-                                                   std::vector<std::string>{});
-      if (inserted) {
-        it->second = op.item->primary_keys();
-      }
-      auto& keys = it->second;
-      if (op.is_delete) {
-        keys.erase(std::remove(keys.begin(), keys.end(), op.primary_key),
-                   keys.end());
-      } else {
-        if (std::find(keys.begin(), keys.end(), op.primary_key) == keys.end()) {
-          keys.push_back(op.primary_key);
-        }
-      }
-    }
-    // Purge each item whose post-tx primary_keys is empty, before any
-    // DataItem mutation. Any op on the same item gives the (sk, index)
-    // pair we need.
-    std::unordered_set<DataItem*> physical_deleted;
-    for (const auto& op : resolved_si_ops) {
-      if (physical_deleted.count(op.item)) continue;
-      auto it = si_final_state.find(op.item);
-      if (it == si_final_state.end() || !it->second.empty()) continue;
-      op.index->Purge(op.secondary_key, op.item);
-      physical_deleted.insert(op.item);
-    }
+    // Install secondary-index add/remove. Purge per-op when the SI slot's
+    // primary_keys becomes empty after the remove.
     for (auto& op : resolved_si_ops) {
       const auto* primary_key =
           reinterpret_cast<const std::byte*>(op.primary_key.data());
       if (op.is_delete) {
         op.item->RemoveSecondaryIndexValue(primary_key,
                                            op.primary_key.size());
+        if (op.item->primary_keys().empty()) {
+          op.index->Purge(op.secondary_key, op.item);
+        }
       } else {
         op.item->AddSecondaryIndexValue(primary_key, op.primary_key.size());
       }
