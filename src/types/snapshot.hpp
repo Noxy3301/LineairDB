@@ -27,6 +27,10 @@
 #include "index/secondary_index_type.h"
 
 namespace LineairDB {
+namespace Index {
+class ConcurrentTable;
+class SecondaryIndex;
+}  // namespace Index
 
 struct Snapshot {
   std::string key;
@@ -36,6 +40,14 @@ struct Snapshot {
   std::string table_name;
   std::string index_name;
   Index::SecondaryIndexType index_type;
+  // Owning table / SI of `key`. Populated at Snapshot construction time so
+  // the OCC backend can structurally erase the entry from the underlying
+  // index after a committed delete without re-resolving by table_name.
+  // For primary-index writes pi_ref is non-null; for SI writes
+  // si_ref is non-null. PL backends ignore both (PL doesn't expose
+  // Purge).
+  Index::ConcurrentTable* pi_ref = nullptr;
+  Index::SecondaryIndex* si_ref = nullptr;
   struct SecondaryIndexDelta {
     std::string primary_key;
     SecondaryIndexOp op;

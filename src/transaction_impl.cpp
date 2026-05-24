@@ -303,6 +303,7 @@ void Transaction::Impl::Write(const std::string_view key,
   concurrency_control_->Write(key, value, size, index_leaf);
   Snapshot sp(key, value, size, index_leaf, current_table_->GetTableName(), "",
               {});
+  sp.pi_ref = &current_table_->GetPrimaryIndex();
   if (is_rmf) sp.is_read_modify_write = true;
   write_set_.emplace_back(std::move(sp));
 }
@@ -367,6 +368,7 @@ void Transaction::Impl::WriteSecondaryIndex(
     }
 
     snapshot.index_type = index_type;
+    snapshot.si_ref = index;
     snapshot.data_item_copy.AddSecondaryIndexValue(primary_key_buffer,
                                                    primary_key_size);
     snapshot.RecordSecondaryIndexDelta(primary_key_view, SecondaryIndexOp::Add);
@@ -395,6 +397,7 @@ void Transaction::Impl::WriteSecondaryIndex(
                               index_leaf);
   Snapshot sp(key, nullptr, 0, index_leaf, current_table_->GetTableName(),
               index_name, 0, index_type);
+  sp.si_ref = index;
 
   if (is_rmf) sp.is_read_modify_write = true;
   sp.data_item_copy = *base_data;
@@ -1045,6 +1048,7 @@ void Transaction::Impl::DeleteSecondaryIndex(
 
     found_in_write_set = true;
     snapshot.index_type = index_type;
+    snapshot.si_ref = index;
     snapshot.data_item_copy.RemoveSecondaryIndexValue(primary_key_buffer,
                                                       primary_key_size);
     snapshot.RecordSecondaryIndexDelta(primary_key_view,
@@ -1078,6 +1082,7 @@ void Transaction::Impl::DeleteSecondaryIndex(
     }
     Snapshot sp(secondary_key, nullptr, 0, index_leaf,
                 current_table_->GetTableName(), index_name, 0, index_type);
+    sp.si_ref = index;
     sp.data_item_copy = *base_data;
     sp.data_item_copy.RemoveSecondaryIndexValue(primary_key_buffer,
                                                 primary_key_size);
@@ -1141,6 +1146,7 @@ void Transaction::Impl::UpdateSecondaryIndex(
 
     old_found_in_write_set = true;
     snapshot.index_type = index_type;
+    snapshot.si_ref = index;
     snapshot.data_item_copy.RemoveSecondaryIndexValue(primary_key_buffer,
                                                       primary_key_size);
     snapshot.RecordSecondaryIndexDelta(primary_key_view,
@@ -1174,6 +1180,7 @@ void Transaction::Impl::UpdateSecondaryIndex(
     }
     Snapshot sp(old_secondary_key, nullptr, 0, old_leaf,
                 current_table_->GetTableName(), index_name, 0, index_type);
+    sp.si_ref = index;
     sp.data_item_copy = *base_data_old_key;
     sp.data_item_copy.RemoveSecondaryIndexValue(primary_key_buffer,
                                                 primary_key_size);
@@ -1238,6 +1245,7 @@ void Transaction::Impl::UpdateSecondaryIndex(
 
     new_found_in_write_set = true;
     snapshot.index_type = index_type;
+    snapshot.si_ref = index;
     snapshot.data_item_copy.AddSecondaryIndexValue(primary_key_buffer,
                                                    primary_key_size);
     snapshot.RecordSecondaryIndexDelta(primary_key_view, SecondaryIndexOp::Add);
@@ -1264,6 +1272,7 @@ void Transaction::Impl::UpdateSecondaryIndex(
     }
     Snapshot sp(new_secondary_key, nullptr, 0, new_leaf,
                 current_table_->GetTableName(), index_name, 0, index_type);
+    sp.si_ref = index;
     sp.data_item_copy = *base_data_new_key;
     sp.data_item_copy.AddSecondaryIndexValue(primary_key_buffer,
                                              primary_key_size);
