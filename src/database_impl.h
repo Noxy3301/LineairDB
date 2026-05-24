@@ -407,7 +407,9 @@ class Database::Impl {
     if (!table.has_value()) return result;
     result.ok = true;
 
-    const bool use_logical_validation = false;
+    // Commit re-walks the range and compares key lists, so we do not
+    // ship masstree node pointers that RCU can free between RPCs.
+    const bool use_logical_validation = true;
     std::vector<Index::NodeVersionEntry> versions;
     uint64_t returned_rows = 0;
 
@@ -438,13 +440,9 @@ class Database::Impl {
               {std::string(key), std::move(value), PackTransactionId(tid),
                true});
           ++returned_rows;
-        } else if (!use_logical_validation) {
-          // Node-version validation also needs exact deleted entries because
-          // a tombstone can be reused without changing the tree shape.
-          result.index_reads.push_back(
-              {std::string(table_name), "", std::string(key),
-               PackTransactionId(tid), false});
         }
+        // Tombstones are skipped: Purge erases them at commit, and key-list
+        // validation catches any reuse without needing a per-entry TID.
         return row_limit > 0 && returned_rows >= row_limit;
       }
     };
@@ -518,7 +516,8 @@ class Database::Impl {
     if (index == nullptr) return result;
     result.ok = true;
 
-    const bool use_logical_validation = false;
+    // Same rationale as StatelessRangeScan above.
+    const bool use_logical_validation = true;
     std::vector<Index::NodeVersionEntry> versions;
     uint64_t returned_rows = 0;
 
