@@ -67,6 +67,10 @@ class ConcurrentTable {
 
   bool Delete(const std::string_view key);
 
+  bool Purge(std::string_view key, DataItem* expected) {
+    return index_->Purge(key, expected);
+  }
+
   void WaitForIndexIsLinearizable();
 
   // Re-check deferred phantom snapshots (Masstree backend) for this index.

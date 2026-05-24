@@ -100,6 +100,17 @@ class IndexBase {
   // caller can validate many indexes in one pass).
   virtual bool ValidatePhantoms(
       const std::vector<NodeVersionEntry>& entries) = 0;
+
+  // Structurally remove a committed delete from the index. Called from the
+  // commit-install phase only, while the per-DataItem lock is still held;
+  // calling it earlier (mid-transaction or without the lock) lets a racing
+  // Insert reuse the slot before the erase lands. `expected` is the
+  // DataItem pointer the caller captured; if the live entry no longer
+  // matches, the call must be a no-op (a racing replacement won). Default
+  // no-op for backends without physical reclamation (PL).
+  virtual bool Purge(std::string_view /*key*/, DataItem* /*expected*/) {
+    return false;
+  }
 };
 
 }  // namespace Index
