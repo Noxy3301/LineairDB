@@ -683,33 +683,25 @@ class Database::Impl {
    *        catch a concurrent insert that became visible while we were
    *        waiting on the write lock. Failure aborts with
    *        `unique_si_exists_after_lock`.
-   *   9. Write-target recheck
-   *        re-`Get` each write target's index entry; abort with
-   *        `write_target_replaced` or `si_target_replaced` if a concurrent
-   *        committed delete purged the slot between Step 2 and the lock.
-   *  10. Op dedup
-   *        collapse same-key writes/SI ops with last-wins so Step 11 does
-   *        not Purge a key and then install into the orphaned slot.
-   *  11. Install
+   *   9. Install
    *        Purge then `DataItem::Reset` for deletes, then apply SI
    *        add/remove via `AddSecondaryIndexValue` /
    *        `RemoveSecondaryIndexValue`. SI entries are Purged when their
    *        post-tx primary_keys list is empty.
-   *  12. Log snapshot
+   *  10. Log snapshot
    *        capture the post-install snapshot before unlock so a later
    *        transaction cannot overwrite the values we just logged. Only
    *        when logging is enabled.
-   *  13. Unlock
+   *  11. Unlock
    *        rewrite each item's TID. Carry the epoch forward when the
    *        captured TID is from an earlier epoch.
-   *  14. Log enqueue
+   *  12. Log enqueue
    *        push the log set into `logger_`, then call `MakeMeOffline`.
    *
    * On any failure path the function unlocks every item it owns, sets
    * `*abort_reason` (when non-null) to a short label such as
-   * `exact_read_tid_moved`, `range_node_version_changed`,
-   * `unique_si_exists_after_lock`, or `write_target_replaced`, and
-   * returns false.
+   * `exact_read_tid_moved`, `range_node_version_changed`, or
+   * `unique_si_exists_after_lock`, and returns false.
    */
   bool ValidateAndCommit(
       const std::vector<ExternalReadEntry>& reads,
@@ -1171,68 +1163,7 @@ class Database::Impl {
       keys.insert(key_it, op.primary_key);
     }
 
-    // Step 9: re-check that each write target's index entry still
-    // points to our locked DataItem. A concurrent committed delete may
-    // have purged the slot between Step 2 resolution and the lock, in
-    // which case installing here would write to an orphaned pointer.
-    // SI ops are checked too: an SI slot is purged once its primary_keys
-    // vector empties.
-    for (const auto& write : resolved_writes) {
-      auto table = GetTable(write.table_name);
-      if (!table.has_value()) continue;
-      if (table.value()->GetPrimaryIndex().Get(write.key) != write.item) {
-        return unlock_and_abort("write_target_replaced");
-      }
-    }
-    for (const auto& op : resolved_si_ops) {
-      if (op.index == nullptr) continue;
-      if (op.index->Get(op.secondary_key) != op.item) {
-        return unlock_and_abort("si_target_replaced");
-      }
-    }
-
-    // Step 10: coalesce duplicate ops by key (last-wins). The proxy
-    // ships ops in arrival order; running [DELETE k, WRITE k] as-is
-    // would Purge k and then Reset() into the orphaned slot, losing the
-    // insert. SI has the analogous race on repeated (sk, pk).
-    {
-      std::unordered_map<std::string, size_t> last_idx;
-      for (size_t i = 0; i < resolved_writes.size(); ++i) {
-        const auto& w = resolved_writes[i];
-        last_idx[w.table_name + '\0' + w.key] = i;
-      }
-      std::vector<ResolvedWrite> deduped;
-      deduped.reserve(last_idx.size());
-      for (size_t i = 0; i < resolved_writes.size(); ++i) {
-        const auto& w = resolved_writes[i];
-        const std::string key = w.table_name + '\0' + w.key;
-        if (last_idx[key] == i) {
-          deduped.push_back(std::move(resolved_writes[i]));
-        }
-      }
-      resolved_writes = std::move(deduped);
-    }
-    {
-      std::unordered_map<std::string, size_t> last_idx;
-      for (size_t i = 0; i < resolved_si_ops.size(); ++i) {
-        const auto& op = resolved_si_ops[i];
-        last_idx[op.table_name + '\0' + op.index_name + '\0' +
-                 op.secondary_key + '\0' + op.primary_key] = i;
-      }
-      std::vector<ResolvedSecondaryIndexOp> deduped;
-      deduped.reserve(last_idx.size());
-      for (size_t i = 0; i < resolved_si_ops.size(); ++i) {
-        const auto& op = resolved_si_ops[i];
-        const std::string key = op.table_name + '\0' + op.index_name + '\0' +
-                                op.secondary_key + '\0' + op.primary_key;
-        if (last_idx[key] == i) {
-          deduped.push_back(std::move(resolved_si_ops[i]));
-        }
-      }
-      resolved_si_ops = std::move(deduped);
-    }
-
-    // Step 11: install row writes/deletes and SI add/remove. Purge
+    // Step 9: install row writes/deletes and SI add/remove. Purge
     // BEFORE Reset on deletes: MasstreeIndex::Insert treats an
     // uninitialized DataItem as a reusable slot, so flipping first would
     // let a racing Insert grab it and our erase would drop the new value.
@@ -1294,7 +1225,7 @@ class Database::Impl {
       }
     }
 
-    // Step 12: build the log snapshot before unlock so a later transaction
+    // Step 10: build the log snapshot before unlock so a later transaction
     // cannot overwrite the values we just logged.
     WriteSetType log_set;
     bool has_log_set = false;
@@ -1319,7 +1250,7 @@ class Database::Impl {
       }
     }
 
-    // Step 13: unlock by writing the new TID. Carry the epoch forward when
+    // Step 11: unlock by writing the new TID. Carry the epoch forward when
     // the captured TID is from an earlier epoch.
     const EpochNumber current_epoch = epoch_framework_.GetMyThreadLocalEpoch();
     for (auto* item : lock_items) {
@@ -1333,7 +1264,7 @@ class Database::Impl {
       item->transaction_id.store(unlocked);
     }
 
-    // Step 14: enqueue the log set, then leave the epoch.
+    // Step 12: enqueue the log set, then leave the epoch.
     if (has_log_set) {
       logger_.Enqueue(log_set, current_epoch, true);
     }
