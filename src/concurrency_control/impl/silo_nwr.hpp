@@ -254,8 +254,62 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
       return false;
     }
 
-    /** Buffer Update **/
+    /** Index-pointer revalidation **/
+    //
+    // GetOrInsert captured index_cache long before we took the per-item
+    // lock; a concurrent committed delete may have purged that slot in
+    // between, leaving our pointer orphaned (still dereferenceable thanks
+    // to RCU-deferred free, but no longer reachable via Get()). Abort if
+    // any write target no longer matches the live index entry, otherwise
+    // the install below would write to memory unreachable to readers.
+    auto unlock_writeset_and_abort = [&]() {
+      for (auto& s : tx_ref_.write_set_ref_) {
+        auto current = s.index_cache->transaction_id.load();
+        current.tid--;
+        s.index_cache->transaction_id.store(current);
+      }
+      return false;
+    };
     for (auto& snapshot : tx_ref_.write_set_ref_) {
+      if (snapshot.pi_ref != nullptr && snapshot.index_name.empty()) {
+        if (snapshot.pi_ref->Get(snapshot.key) != snapshot.index_cache) {
+          return unlock_writeset_and_abort();
+        }
+      } else if (snapshot.si_ref != nullptr && !snapshot.index_name.empty()) {
+        if (snapshot.si_ref->Get(snapshot.key) != snapshot.index_cache) {
+          return unlock_writeset_and_abort();
+        }
+      }
+    }
+
+    /** Buffer Update **/
+    //
+    // Silo defers physical removal of deleted masstree leaves to a
+    // reaper thread on epoch advance; we erase inline under the
+    // per-DataItem lock we already hold, trading one cursor lock per
+    // delete for no reaper subsystem and bounded tombstone lifetime.
+    //
+    // Ordering: erase BEFORE the *index_cache flip. MasstreeIndex::Insert
+    // treats an !IsInitialized DataItem as a reusable slot, so flipping
+    // first would let a racing Insert grab the slot and silently lose its
+    // value. SI uses primary_keys().empty() as the delete predicate: the
+    // SI entry is removable only when no primary key still maps to it
+    // after this tx's mutations.
+    for (auto& snapshot : tx_ref_.write_set_ref_) {
+      const bool is_primary_delete =
+          snapshot.index_name.empty() &&
+          snapshot.pi_ref != nullptr &&
+          !snapshot.data_item_copy.IsInitialized();
+      if (is_primary_delete) {
+        snapshot.pi_ref->Purge(snapshot.key, snapshot.index_cache);
+      }
+      const bool is_si_delete =
+          !snapshot.index_name.empty() &&
+          snapshot.si_ref != nullptr &&
+          snapshot.data_item_copy.primary_keys().empty();
+      if (is_si_delete) {
+        snapshot.si_ref->Purge(snapshot.key, snapshot.index_cache);
+      }
       *snapshot.index_cache = snapshot.data_item_copy;
     }
 
