@@ -155,6 +155,31 @@ class Database {
    */
   void RequestCallbacks();
 
+  /**
+   * @brief End the calling thread's masstree RCU critical section, drain
+   * the now-eligible entries from its limbo list, and drop it from the
+   * `min_active_epoch()` participant set.
+   *
+   * The caller MUST guarantee that no raw DataItem* (or masstree leaf
+   * pointer) obtained inside the section is still in use past this call —
+   * a section-end is a release operation in the RCU sense, after which
+   * other threads' physical deletes can free those objects.
+   *
+   * The first masstree op on the thread (after construction or after a
+   * release) implicitly re-opens a section at the then-current
+   * globalepoch; there is no separate "begin" call.
+   */
+  void ReleaseMasstreeThreadEpoch();
+
+  /**
+   * @brief Like ReleaseMasstreeThreadEpoch but pessimistically advances
+   * the global masstree epoch so the calling thread's RCU limbo is fully
+   * drained before it returns. Intended for the connection-close path
+   * only; substantially heavier than a regular release at high
+   * concurrency.
+   */
+  void FullyDrainMasstreeThread();
+
   bool CreateSecondaryIndex(const std::string_view table_name,
                             const std::string_view index_name,
                             const uint index_type);

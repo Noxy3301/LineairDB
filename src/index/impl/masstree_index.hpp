@@ -58,10 +58,31 @@ class MasstreeIndex final : public IndexBase {
   bool ValidatePhantoms(
       const std::vector<NodeVersionEntry>& entries) override;
 
+  bool Purge(std::string_view key,
+                               DataItem* expected) override;
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+// Hooks into masstree-beta's RCU machinery. masstree's globalepoch needs
+// to be driven by the host's epoch ticker (MasstreeAdvanceEpoch). Threads
+// that touch the tree enrol implicitly via masstree ops; they close their
+// critical section by calling MasstreeReleaseThreadEpoch at a safe
+// boundary (no raw DataItem* / leaf pointer from this section can be used
+// past the release). There is intentionally no "advance without release"
+// API — re-stamping gc_epoch_ mid-section would let RCU reclaim pointers
+// the caller is still using.
+// Both per-thread functions are no-ops when no masstree threadinfo has
+// been initialised on the current thread.
+void MasstreeAdvanceEpoch();
+void MasstreeReleaseThreadEpoch();
+// Like MasstreeReleaseThreadEpoch but pessimistically advances the global
+// epoch in a loop so the calling thread's limbo gets fully drained before
+// it exits. Heavier than a regular release; intended for connection-close
+// paths only.
+void MasstreeFullyDrainThread();
 
 }  // namespace Index
 }  // namespace LineairDB

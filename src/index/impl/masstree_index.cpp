@@ -65,20 +65,72 @@ using unlocked_cursor_type = Masstree::unlocked_tcursor<table_params>;
 using cursor_type = Masstree::tcursor<table_params>;
 
 thread_local threadinfo* tls_ti = nullptr;
+// True iff this thread has called rcu_start since its last rcu_stop. Used to
+// make ensure_thread_active idempotent within a critical section: re-stamping
+// gc_epoch_ on every masstree op would advance the thread past the epoch
+// protecting raw DataItem* pointers the caller is still holding (e.g.
+// Silo's validation_set_ holds item_p_cache across reads, and a concurrent
+// committed delete schedules those DataItems for RCU free). With the gate,
+// a thread's gc_epoch_ stays at the epoch of its FIRST masstree access until
+// an explicit release at a safe boundary.
+thread_local bool tls_enrolled = false;
 std::atomic<int> next_thread_id{0};
 std::mutex thread_init_mutex;
 
 // threadinfo::make() prepends to masstree's global allthreads list without
 // synchronization (kvthread.cc:57-58). Serialize first-use-per-thread to
 // avoid UB when multiple worker threads register concurrently. Contended
-// only on the first op per thread.
+// only on the first op per thread. Does NOT enrol the thread in the
+// current RCU epoch — that is ensure_thread_active's job. Splitting
+// registration from enrolment lets short-lived callers (the Database
+// construction thread, server-side threads between operations) leave
+// gc_epoch_ at 0 so they do not pin min_active_epoch().
 inline void ensure_thread_init() {
   if (__builtin_expect(tls_ti == nullptr, 0)) {
     std::lock_guard<std::mutex> lg(thread_init_mutex);
-    tls_ti = threadinfo::make(
-        threadinfo::TI_PROCESS,
-        next_thread_id.fetch_add(1, std::memory_order_relaxed));
+    if (tls_ti == nullptr) {
+      tls_ti = threadinfo::make(
+          threadinfo::TI_PROCESS,
+          next_thread_id.fetch_add(1, std::memory_order_relaxed));
+    }
   }
+}
+
+// Ensure threadinfo exists AND this thread is enrolled at the current
+// masstree epoch — but only if the thread is not already enrolled. This
+// idempotency is correctness-critical: every public op uses this, and
+// re-stamping gc_epoch_ in the middle of a transaction would let RCU
+// reclaim DataItem* pointers the caller is still holding (e.g. Silo
+// validation_set_ entries captured from an earlier read). The thread stays
+// enrolled at its first-op epoch until an explicit release at a safe
+// boundary (MasstreeReleaseThreadEpoch).
+inline void ensure_thread_active() {
+  ensure_thread_init();
+  if (!tls_enrolled) {
+    tls_ti->rcu_start();
+    tls_enrolled = true;
+  }
+}
+
+// RCU callback for deferred DataItem deletion. Allocated through
+// threadinfo::allocate so it lives in masstree's accounting pool, and
+// frees itself in operator() after deleting the wrapped DataItem (the
+// same shape as masstree's own gc_layer_rcu_callback, see
+// masstree_remove.hh:135-146).
+struct DataItemRcuCallback : public threadinfo::mrcu_callback {
+  DataItem* item;
+  explicit DataItemRcuCallback(DataItem* it) : item(it) {}
+  void operator()(threadinfo& ti) override {
+    delete item;
+    ti.deallocate(this, sizeof(DataItemRcuCallback), memtag_masstree_gc);
+  }
+};
+
+inline void schedule_data_item_rcu_free(DataItem* item) {
+  if (item == nullptr) return;
+  void* mem = tls_ti->allocate(sizeof(DataItemRcuCallback), memtag_masstree_gc);
+  auto* cb = new (mem) DataItemRcuCallback(item);
+  tls_ti->rcu_register(cb);
 }
 
 // Adapter that drives masstree's forward/reverse scan into the LDB callback
@@ -170,8 +222,28 @@ struct MasstreeIndex::Impl {
   table_type table_;
 
   Impl() {
+    // Enrol briefly so table_.initialize can allocate the root node through
+    // the threadinfo's RCU-aware allocator, then leave the epoch so the
+    // construction thread does not pin min_active_epoch at the initial
+    // value forever. If the same thread later does masstree ops, each op
+    // path goes through ensure_thread_active and re-enrols.
+    //
+    // If the caller is ALREADY in an RCU critical section (e.g., a Path B
+    // tx on this thread invoked CreateTable / CreateSecondaryIndex
+    // mid-transaction), we must not touch its enrolment: rcu_stop()
+    // would clear gc_epoch_ while raw DataItem* pointers in tx state are
+    // still in use, opening a use-after-free window once another thread's
+    // physical-delete schedules them for RCU free. Preserve the section
+    // in that case (the existing rcu_start covers the initialize).
     ensure_thread_init();
+    const bool was_enrolled = tls_enrolled;
+    if (!was_enrolled) {
+      tls_ti->rcu_start();
+    }
     table_.initialize(*tls_ti);
+    if (!was_enrolled) {
+      tls_ti->rcu_stop();
+    }
   }
 
   ~Impl() {
@@ -185,7 +257,7 @@ struct MasstreeIndex::Impl {
   }
 
   DataItem* Get(std::string_view key) {
-    ensure_thread_init();
+    ensure_thread_active();
     unlocked_cursor_type lp(table_, key.data(), key.size());
     if (lp.find_unlocked(*tls_ti)) return lp.value();
     return nullptr;
@@ -197,7 +269,7 @@ struct MasstreeIndex::Impl {
   // the OCC layer can apply Silo §4.6's own-write node-set rule.
   bool Put(std::string_view key, DataItem&& rhs,
            NodeVersionUpdate* out_update = nullptr) {
-    ensure_thread_init();
+    ensure_thread_active();
     auto* fresh = new DataItem(std::move(rhs));
     cursor_type lp(table_, key.data(), key.size());
     bool found = lp.find_insert(*tls_ti);
@@ -236,7 +308,7 @@ struct MasstreeIndex::Impl {
   // (NOT_EXISTS branch), records the version delta for Silo §4.6 own-write
   // node-set reconciliation.
   bool Insert(std::string_view key, NodeVersionUpdate* out_update = nullptr) {
-    ensure_thread_init();
+    ensure_thread_active();
     cursor_type lp(table_, key.data(), key.size());
     bool found = lp.find_insert(*tls_ti);
     if (found) {
@@ -273,11 +345,40 @@ struct MasstreeIndex::Impl {
   // would make Get() return nullptr, which Update() interprets as
   // "key missing" and aborts — breaking every primary-key DELETE.
   //
-  // Range-visibility for concurrent scanners is caught at Precommit via
-  // deferred ValidatePhantoms (structural check) and Silo's read-set TID
-  // validation (DataItem mutation check). PL detects the same conflicts
-  // synchronously via IsInPredicateSet.
+  // The actual structural removal happens later in Purge,
+  // called from the OCC layer after the write-set has been installed (i.e.
+  // after the DataItem already reads back as !IsInitialized to everyone).
   bool Delete(std::string_view /*key*/) { return true; }
+
+  // Structural removal of a committed delete. Invoked from the OCC backend's
+  // install phase while the per-DataItem lock is still held: this is what
+  // prevents Insert from observing the freshly-uninitialized slot, racing in
+  // a new value, and having the structural erase below silently drop it.
+  // Returns true if the key was physically removed; false if the slot is
+  // already gone or a racing replacement won the position (defensive — the
+  // committed-only contract means we should always find our own DataItem).
+  bool Purge(std::string_view key, DataItem* expected) {
+    ensure_thread_active();
+    cursor_type lp(table_, key.data(), key.size());
+    const bool found = lp.find_locked(*tls_ti);
+    if (!found) {
+      lp.finish(0, *tls_ti);
+      return false;
+    }
+    DataItem* current = lp.value();
+    if (expected != nullptr && current != expected) {
+      // Some other writer replaced the slot between our commit-time decision
+      // and this erase. Leave the new occupant alone.
+      lp.finish(0, *tls_ti);
+      return false;
+    }
+    // finish(-1) calls finish_remove which removes the permutation slot and
+    // RCU-frees the leaf if it becomes empty. The DataItem* itself rides on
+    // a separate RCU callback below.
+    lp.finish(-1, *tls_ti);
+    schedule_data_item_rcu_free(current);
+    return true;
+  }
 
   // Idempotent blank insert: PL's ForcePutBlankEntry never removes, just
   // ensures a slot exists. When `out_update` is non-null and we structurally
@@ -285,7 +386,7 @@ struct MasstreeIndex::Impl {
   // node-set reconciliation.
   void ForcePutBlankEntry(std::string_view key,
                            NodeVersionUpdate* out_update = nullptr) {
-    ensure_thread_init();
+    ensure_thread_active();
     cursor_type lp(table_, key.data(), key.size());
     bool found = lp.find_insert(*tls_ti);
     if (!found) {
@@ -315,7 +416,7 @@ struct MasstreeIndex::Impl {
       std::string_view begin, std::optional<std::string_view> end,
       std::function<bool(std::string_view)> op, IndexBase* owner,
       std::vector<NodeVersionEntry>* out_versions) {
-    ensure_thread_init();
+    ensure_thread_active();
     ScanAdapter adapter{end.has_value() ? end->data() : nullptr,
                         end.has_value() ? end->size() : 0,
                         end.has_value(),
@@ -333,7 +434,7 @@ struct MasstreeIndex::Impl {
       std::function<bool(std::string_view, DataItem&)> op,
       IndexBase* owner,
       std::vector<NodeVersionEntry>* out_versions) {
-    ensure_thread_init();
+    ensure_thread_active();
     ScanValueAdapter adapter{end.data(),
                              end.size(),
                              true,
@@ -350,7 +451,7 @@ struct MasstreeIndex::Impl {
       std::string_view begin, std::optional<std::string_view> end,
       std::function<bool(std::string_view)> op, IndexBase* owner,
       std::vector<NodeVersionEntry>* out_versions) {
-    ensure_thread_init();
+    ensure_thread_active();
     // Reverse scan walks downward from `end - 1`, stopping once key < begin.
     // Range is [begin, end) just like forward Scan.
     auto adapter_op = [b_ptr = begin.data(), b_len = begin.size(),
@@ -388,7 +489,7 @@ struct MasstreeIndex::Impl {
       std::function<bool(std::string_view, DataItem&)> op,
       IndexBase* owner,
       std::vector<NodeVersionEntry>* out_versions) {
-    ensure_thread_init();
+    ensure_thread_active();
     auto adapter_op = [b_ptr = begin.data(), b_len = begin.size(),
                        cb = std::move(op)](std::string_view key,
                                            DataItem& val) mutable {
@@ -414,7 +515,7 @@ struct MasstreeIndex::Impl {
   }
 
   void ForEach(std::function<bool(std::string_view, DataItem&)> op) {
-    ensure_thread_init();
+    ensure_thread_active();
     ScanValueAdapter adapter{nullptr, 0, false, std::move(op),
                              nullptr, nullptr, 0};
     table_.scan(Masstree::Str(), /*emit_firstkey=*/true, adapter, *tls_ti);
@@ -422,6 +523,12 @@ struct MasstreeIndex::Impl {
 
   bool ValidatePhantoms(const std::vector<NodeVersionEntry>& entries,
                         IndexBase* self) {
+    // Re-stamp gc_epoch_ before dereferencing leaf pointers from `entries`.
+    // Those pointers were captured during an earlier scan on this or
+    // another thread and are RCU-protected; without an active enrolment
+    // this thread could be invisible to min_active_epoch() and let RCU
+    // free a leaf out from under us mid-check.
+    ensure_thread_active();
     for (const auto& e : entries) {
       if (e.owner != self) continue;  // entry belongs to a different index
       const auto* leaf =
@@ -528,6 +635,89 @@ void MasstreeIndex::WaitForIndexIsLinearizable() {
 bool MasstreeIndex::ValidatePhantoms(
     const std::vector<NodeVersionEntry>& entries) {
   return impl_->ValidatePhantoms(entries, this);
+}
+
+bool MasstreeIndex::Purge(std::string_view key,
+                                            DataItem* expected) {
+  return impl_->Purge(key, expected);
+}
+
+void MasstreeAdvanceEpoch() {
+  // Bump masstree's global epoch and recompute the reclamation watermark.
+  // Mirrors mttest.cc's main-thread tick (mttest.cc:124-131). The mutex
+  // serialises with ensure_thread_init's threadinfo::make, which prepends
+  // to the unsynchronised threadinfo::allthreads list that min_active_epoch
+  // walks (kvthread.cc:53-58, kvthread.hh:368-377).
+  std::lock_guard<std::mutex> lg(thread_init_mutex);
+  globalepoch.store(globalepoch.load() + 1);
+  active_epoch.store(threadinfo::min_active_epoch());
+}
+
+void MasstreeReleaseThreadEpoch() {
+  // End this thread's RCU critical section: drain whatever is eligible
+  // under the current active_epoch and clear gc_epoch_. Callers MUST
+  // guarantee no raw DataItem* or masstree leaf pointer from inside this
+  // section survives past the release — that's the whole point of marking
+  // the section closed.
+  //
+  // This is the hot-path release (called at every RPC safe boundary). It
+  // does ONE rcu_stop pass: cheap when limbo is small, and items that
+  // remain on the local limbo are drained on the thread's next release
+  // when active_epoch has moved further. For a thread that is about to
+  // exit and will never call release again, use MasstreeFullyDrainThread
+  // instead.
+  if (tls_ti == nullptr) return;
+  tls_ti->rcu_stop();
+  tls_enrolled = false;
+}
+
+void MasstreeFullyDrainThread() {
+  // Best-effort drain of the calling thread's local limbo before it
+  // exits. Strategy: leave the min_active_epoch participant set first
+  // (rcu_stop sets gc_epoch_=0 and frees the first eligible batch), then
+  // bump the global epoch and re-call rcu_stop to peel further 128-entry
+  // batches.
+  //
+  // KNOWN LIMITATION (cross-thread limbo leak): this is best-effort, not
+  // a guarantee. Two conditions can permanently strand entries on this
+  // thread's local limbo after it exits:
+  //
+  //   (a) Some OTHER thread holds an old gc_epoch_ that pins active_epoch
+  //       below the epoch our items were retired at. Our items remain
+  //       ineligible; the loop bumps globalepoch but min_active_epoch
+  //       stays low.
+  //   (b) We retired more entries than 4096 * 128 = 512K within this
+  //       section. The loop cap exits before they are all drained.
+  //
+  // After the detached connection thread exits, its threadinfo lingers
+  // on masstree's allthreads list but no future call runs on it. The
+  // limbo is per-threadinfo and only the owning thread can safely drain
+  // it via masstree's API, so the stranded items leak for the process
+  // lifetime.
+  //
+  // Closing this properly requires either (i) a server architecture
+  // change to keep RPC threads alive (thread pool instead of detached
+  // per-connection threads) so the same thread eventually drains its
+  // own limbo on a later op, or (ii) patching masstree-beta to expose a
+  // cross-thread drain primitive so the LineairDB epoch ticker can
+  // process exited threadinfos. Both are out of scope for this patch.
+  //
+  // In the meantime: the leak is bounded by per-connection-close
+  // workload. Benchmarks that keep connections alive (BenchBase / sysbench
+  // style pools) do not trigger it. Long-running services with high
+  // connection churn under contended workloads will accumulate it.
+  //
+  // Not for the hot path: each MasstreeAdvanceEpoch acquires
+  // thread_init_mutex and re-walks the allthreads list, so calling this
+  // on every RPC boundary causes contention collapse at high
+  // concurrency.
+  if (tls_ti == nullptr) return;
+  tls_ti->rcu_stop();
+  tls_enrolled = false;
+  for (int i = 0; i < 4096; ++i) {
+    MasstreeAdvanceEpoch();
+    tls_ti->rcu_stop();
+  }
 }
 
 }  // namespace Index

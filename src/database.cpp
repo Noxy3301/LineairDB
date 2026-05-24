@@ -61,6 +61,12 @@ void Database::WaitForCheckpoint() const noexcept {
   db_pimpl_->WaitForCheckpoint();
 }
 void Database::RequestCallbacks() { db_pimpl_->RequestCallbacks(); }
+void Database::ReleaseMasstreeThreadEpoch() {
+  Index::MasstreeReleaseThreadEpoch();
+}
+void Database::FullyDrainMasstreeThread() {
+  Index::MasstreeFullyDrainThread();
+}
 bool Database::CreateTable(const std::string_view table_name) {
   return db_pimpl_->CreateTable(table_name);
 }
