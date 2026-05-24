@@ -254,34 +254,6 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
       return false;
     }
 
-    /** Index-pointer revalidation **/
-    //
-    // GetOrInsert captured index_cache long before we took the per-item
-    // lock; a concurrent committed delete may have purged that slot in
-    // between, leaving our pointer orphaned (still dereferenceable thanks
-    // to RCU-deferred free, but no longer reachable via Get()). Abort if
-    // any write target no longer matches the live index entry, otherwise
-    // the install below would write to memory unreachable to readers.
-    auto unlock_writeset_and_abort = [&]() {
-      for (auto& s : tx_ref_.write_set_ref_) {
-        auto current = s.index_cache->transaction_id.load();
-        current.tid--;
-        s.index_cache->transaction_id.store(current);
-      }
-      return false;
-    };
-    for (auto& snapshot : tx_ref_.write_set_ref_) {
-      if (snapshot.pi_ref != nullptr && snapshot.index_name.empty()) {
-        if (snapshot.pi_ref->Get(snapshot.key) != snapshot.index_cache) {
-          return unlock_writeset_and_abort();
-        }
-      } else if (snapshot.si_ref != nullptr && !snapshot.index_name.empty()) {
-        if (snapshot.si_ref->Get(snapshot.key) != snapshot.index_cache) {
-          return unlock_writeset_and_abort();
-        }
-      }
-    }
-
     /** Buffer Update **/
     //
     // Silo defers physical removal of deleted masstree leaves to a
