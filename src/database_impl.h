@@ -37,6 +37,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <xmmintrin.h>
 
 #include "callback/callback_manager.h"
 #include "recovery/checkpoint_manager.hpp"
@@ -354,7 +355,7 @@ class Database::Impl {
     for (;;) {
       TransactionId tid = item->transaction_id.load();
       if (tid.tid & 1u) {
-        std::this_thread::yield();
+        _mm_pause();
         continue;
       }
 
@@ -430,7 +431,7 @@ class Database::Impl {
       for (;;) {
         TransactionId tid = item->transaction_id.load();
         if (tid.tid & 1u) {
-          std::this_thread::yield();
+          _mm_pause();
           continue;
         }
 
@@ -539,7 +540,7 @@ class Database::Impl {
       for (;;) {
         TransactionId tid = item->transaction_id.load();
         if (tid.tid & 1u) {
-          std::this_thread::yield();
+          _mm_pause();
           continue;
         }
 
@@ -577,7 +578,7 @@ class Database::Impl {
       for (;;) {
         TransactionId tid = item->transaction_id.load();
         if (tid.tid & 1u) {
-          std::this_thread::yield();
+          _mm_pause();
           continue;
         }
 
@@ -930,7 +931,7 @@ class Database::Impl {
       for (;;) {
         TransactionId current = item->transaction_id.load();
         if (current.tid & 1u) {
-          std::this_thread::yield();
+          _mm_pause();
           continue;
         }
         TransactionId locked = current;
