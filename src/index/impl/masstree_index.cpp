@@ -1,8 +1,12 @@
 #include "masstree_index.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 
 // Masstree headers. Must come after the PImpl header guard so other LDB
@@ -74,8 +78,64 @@ thread_local threadinfo* tls_ti = nullptr;
 // a thread's gc_epoch_ stays at the epoch of its FIRST masstree access until
 // an explicit release at a safe boundary.
 thread_local bool tls_enrolled = false;
+// helios 2-RPC OCC: the epoch captured at the START of the current rcu
+// critical section. rcu_start's `gc_epoch_` is private inside threadinfo,
+// so we capture globalepoch immediately BEFORE calling rcu_start; the
+// captured value is <= what rcu_start stamps (globalepoch is monotonic), so
+// using it as the per-tx pin is conservatively safe — it never under-
+// protects leaves that the thread's own gc_epoch_ protected. Cleared in
+// MasstreeReleaseThreadEpoch.
+thread_local mrcu_epoch_type tls_section_epoch = 0;
 std::atomic<int> next_thread_id{0};
 std::mutex thread_init_mutex;
+
+// ---- per-tx epoch pin storage (helios 2-RPC OCC extension) -----------
+// `tx_pins_` records an entry per live transaction whose prefetch RPC
+// captured raw masstree leaf pointers. While an entry exists, masstree's
+// active_epoch is held back to that entry's epoch so a tick-driven
+// reclaim cannot free the captured leaves before the commit RPC re-reads
+// them.
+//
+// Lock ordering: tx_pin_mutex is ALWAYS acquired AFTER thread_init_mutex
+// (which MasstreeAdvanceEpoch already holds). Helpers that touch only
+// tx_pin_mutex (Register/Release/GetTxPinFloor/SweepExpiredTxPins) never
+// acquire thread_init_mutex. This avoids any deadlock with
+// ensure_thread_init.
+struct TxPin {
+  mrcu_epoch_type epoch;
+  std::uint64_t expires_at_ns;  // monotonic; 0 = no TTL
+  // Codex P1 fix: bump while commit-side validation is reading node_ptrs the
+  // pin covers. TTL sweep skips pins with in_use > 0 so a stale pin cannot be
+  // erased mid-validate, which would otherwise let RCU reclaim leaves under
+  // our feet (UAF). The commit handler increments before ValidateAndCommit
+  // and decrements after.
+  std::uint32_t in_use = 0;
+};
+std::mutex tx_pin_mutex;
+std::unordered_map<LineairDB::Index::TxPinKey, TxPin> tx_pins_;
+std::atomic<std::uint64_t> tx_pin_ttl_ms_{0};      // 0 = uninitialised; init at first call
+std::atomic<bool> tx_pin_ttl_loaded_{false};
+inline std::uint64_t mono_now_ns() {
+  using clk = std::chrono::steady_clock;
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          clk::now().time_since_epoch())
+          .count());
+}
+inline std::uint64_t load_ttl_ms_once() {
+  if (tx_pin_ttl_loaded_.load(std::memory_order_acquire)) {
+    return tx_pin_ttl_ms_.load(std::memory_order_relaxed);
+  }
+  std::uint64_t ms = 60000;  // default 60 s
+  if (const char* env = std::getenv("HELIOS_PIN_TTL_MS")) {
+    char* endp = nullptr;
+    const unsigned long long parsed = std::strtoull(env, &endp, 10);
+    if (endp != env) ms = static_cast<std::uint64_t>(parsed);
+  }
+  tx_pin_ttl_ms_.store(ms, std::memory_order_relaxed);
+  tx_pin_ttl_loaded_.store(true, std::memory_order_release);
+  return ms;
+}
 
 // threadinfo::make() prepends to masstree's global allthreads list without
 // synchronization (kvthread.cc:57-58). Serialize first-use-per-thread to
@@ -107,6 +167,11 @@ inline void ensure_thread_init() {
 inline void ensure_thread_active() {
   ensure_thread_init();
   if (!tls_enrolled) {
+    // helios 2-RPC OCC: snapshot globalepoch BEFORE rcu_start. rcu_start
+    // stamps gc_epoch_ from its own globalepoch.load() microseconds later;
+    // our captured value is <= that, so using it as a per-tx pin is
+    // conservatively safe (over-protects, never under-protects).
+    tls_section_epoch = globalepoch.load();
     tls_ti->rcu_start();
     tls_enrolled = true;
   }
@@ -650,8 +715,121 @@ void MasstreeAdvanceEpoch() {
   // walks (kvthread.cc:53-58, kvthread.hh:368-377).
   std::lock_guard<std::mutex> lg(thread_init_mutex);
   globalepoch.store(globalepoch.load() + 1);
-  active_epoch.store(threadinfo::min_active_epoch());
+  // helios 2-RPC OCC extension: in addition to the thread-floor, fold any
+  // live per-tx epoch pin into the reclamation watermark. With no pins
+  // registered this is byte-equivalent to the old single-line behaviour.
+  const auto thr_floor = threadinfo::min_active_epoch();
+  const auto pin_floor = GetTxPinFloor();
+  active_epoch.store(thr_floor < pin_floor ? thr_floor : pin_floor);
+  // Tick-driven TTL sweep. Cheap when tx_pins_ is empty.
+  SweepExpiredTxPins(mono_now_ns());
 }
+
+// ---- per-tx epoch pin API ----------------------------------------------
+bool RegisterTxEpochPinFromCurrentThread(TxPinKey key) {
+  // CONTRACT (Codex Q2): must be called while the calling thread is inside
+  // its rcu_start/rcu_stop critical section. The pin epoch is the value
+  // rcu_start STAMPED at entry, not a fresh globalepoch.load(): a long
+  // scan can run for many epochs and a fresh load would publish a later
+  // epoch than the leaves were retired at, leaving them eligible for free
+  // after release.
+  if (tls_ti == nullptr || !tls_enrolled) return false;
+  // Use the epoch we snapshotted just BEFORE rcu_start (tls_section_epoch).
+  // It is <= the value rcu_start stamped into the private gc_epoch_, which
+  // we cannot read from here. Using the smaller value is safe: pin = E_cap
+  // <= E_stamped means active_epoch is held at <= E_cap, which protects all
+  // leaves the thread's enrolment did and possibly a few extra (over-
+  // conservative). Critically it never under-protects.
+  const mrcu_epoch_type ge = tls_section_epoch;
+  const std::uint64_t ttl_ms = load_ttl_ms_once();
+  const std::uint64_t expires =
+      (ttl_ms == 0) ? 0 : (mono_now_ns() + ttl_ms * 1000000ull);
+  {
+    std::lock_guard<std::mutex> lg(tx_pin_mutex);
+    auto it = tx_pins_.find(key);
+    if (it == tx_pins_.end()) {
+      tx_pins_.emplace(key, TxPin{ge, expires});
+    } else {
+      // If the same key registers again (e.g. multiple range captures in
+      // one tx), keep the EARLIER epoch — overwriting with a later epoch
+      // would under-protect leaves captured in the earlier section
+      // (Codex Step 1 reviewer fix). TTL is refreshed to the later expiry.
+      if (ge < it->second.epoch) it->second.epoch = ge;
+      it->second.expires_at_ns = expires;
+    }
+  }
+  return true;
+}
+
+// Step 5/6 helper: is this tx_key still pinned? (false if it was never
+// registered or was already swept by TTL or explicitly released.)
+bool HasTxPin(TxPinKey key) {
+  std::lock_guard<std::mutex> lg(tx_pin_mutex);
+  return tx_pins_.find(key) != tx_pins_.end();
+}
+
+void ReleaseTxEpochPin(TxPinKey key) {
+  std::lock_guard<std::mutex> lg(tx_pin_mutex);
+  tx_pins_.erase(key);
+}
+
+std::uint64_t GetTxPinFloor() {
+  std::lock_guard<std::mutex> lg(tx_pin_mutex);
+  if (tx_pins_.empty()) {
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+  mrcu_epoch_type m = std::numeric_limits<mrcu_epoch_type>::max();
+  for (const auto& kv : tx_pins_) {
+    if (kv.second.epoch < m) m = kv.second.epoch;
+  }
+  return static_cast<std::uint64_t>(m);
+}
+
+std::size_t SweepExpiredTxPins(std::uint64_t now_ns) {
+  std::lock_guard<std::mutex> lg(tx_pin_mutex);
+  std::size_t n = 0;
+  for (auto it = tx_pins_.begin(); it != tx_pins_.end();) {
+    // expires_at_ns == 0 means "no TTL"; skip. in_use > 0 means commit is
+    // currently dereferencing entries this pin covers — Codex P1 fix.
+    if (it->second.expires_at_ns != 0 &&
+        it->second.expires_at_ns <= now_ns &&
+        it->second.in_use == 0) {
+      it = tx_pins_.erase(it);
+      ++n;
+    } else {
+      ++it;
+    }
+  }
+  return n;
+}
+
+// Atomically (under the pin mutex) reserve a pin for validation: if the pin
+// exists AND has not been swept, increment its in_use refcount and return
+// true. The TTL sweep will skip any pin with in_use > 0, so the caller can
+// dereference node_ptrs the pin covers without racing reclamation.
+bool LeaseTxPinForValidation(TxPinKey key) {
+  std::lock_guard<std::mutex> lg(tx_pin_mutex);
+  auto it = tx_pins_.find(key);
+  if (it == tx_pins_.end()) return false;
+  it->second.in_use += 1;
+  return true;
+}
+
+// Counterpart: drop the validation lease. If we are the last in_use AND the
+// pin is also explicitly released (caller's responsibility to call
+// ReleaseTxEpochPin), the next sweep can reclaim.
+void DropTxPinValidationLease(TxPinKey key) {
+  std::lock_guard<std::mutex> lg(tx_pin_mutex);
+  auto it = tx_pins_.find(key);
+  if (it == tx_pins_.end()) return;
+  if (it->second.in_use > 0) it->second.in_use -= 1;
+}
+
+void SetTxPinTtlMs(std::uint64_t ms) {
+  tx_pin_ttl_ms_.store(ms, std::memory_order_relaxed);
+  tx_pin_ttl_loaded_.store(true, std::memory_order_release);
+}
+std::uint64_t GetTxPinTtlMs() { return load_ttl_ms_once(); }
 
 void MasstreeReleaseThreadEpoch() {
   // End this thread's RCU critical section: drain whatever is eligible
@@ -669,6 +847,7 @@ void MasstreeReleaseThreadEpoch() {
   if (tls_ti == nullptr) return;
   tls_ti->rcu_stop();
   tls_enrolled = false;
+  tls_section_epoch = 0;  // section closed; pin can no longer be captured
 }
 
 void MasstreeFullyDrainThread() {
@@ -714,6 +893,7 @@ void MasstreeFullyDrainThread() {
   if (tls_ti == nullptr) return;
   tls_ti->rcu_stop();
   tls_enrolled = false;
+  tls_section_epoch = 0;  // (Codex Step 1 fix) keep in sync with ReleaseThreadEpoch
   for (int i = 0; i < 4096; ++i) {
     MasstreeAdvanceEpoch();
     tls_ti->rcu_stop();

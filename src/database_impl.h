@@ -23,6 +23,13 @@
 #include <table/table.h>
 
 #include "index/impl/masstree_index.hpp"
+#include "util/sha256.hh"  // helios Phase-6 range-hash OCC
+
+// Forward decl: defined in database.cpp. Reads the per-thread physical-OCC
+// flag toggled by Database::SetPhysicalValidationMode (helios 2-RPC OCC).
+namespace LineairDB {
+bool helios_physical_validation_mode_active();
+}
 
 #include <algorithm>
 #include <chrono>
@@ -290,6 +297,12 @@ class Database::Impl {
       // DataItem* limbo once min_active_epoch() catches up. Workers
       // release their epoch at tx/RPC boundaries via
       // ReleaseMasstreeThreadEpoch; we only move the watermark here.
+      // Tick also sweeps expired tx_pins (Codex Step 1) and now expired
+      // server-side TxOccState entries (Codex Step 5/6 P2): MasstreeAdvanceEpoch
+      // already runs SweepExpiredTxPins. The TxOccStore sweeper is invoked
+      // from a separate hook to avoid pulling helios types into LineairDB
+      // — see server/rpc/lineairdb_rpc.cc handler hot path which sweeps on
+      // every TX_VALIDATE_AND_COMMIT entry.
       Index::MasstreeAdvanceEpoch();
 
       if (config_.enable_checkpointing) {
@@ -417,15 +430,19 @@ class Database::Impl {
 
     // Commit re-walks the range and compares key lists, so we do not
     // ship masstree node pointers that RCU can free between RPCs.
-    const bool use_logical_validation = true;
+    // helios 2-RPC OCC: logical=key-list (default) vs physical=node-version.
+    // Toggle is per-thread (LineairDB::Database::SetPhysicalValidationMode).
+    const bool use_logical_validation = !LineairDB::helios_physical_validation_mode_active();
     std::vector<Index::NodeVersionEntry> versions;
     uint64_t returned_rows = 0;
 
-    auto append_scan_entry = [&](std::string_view key, DataItem&) {
-      DataItem* item = table.value()->GetPrimaryIndex().Get(key);
-      if (item == nullptr) {
-        return false;
-      }
+    auto append_scan_entry = [&](std::string_view key, DataItem& di_ref) {
+      // Step B (Codex 2026-05-28): scan callback ALREADY receives the DataItem
+      // via di_ref. Previous code did a second `GetPrimaryIndex().Get(key)` —
+      // a full masstree lookup per row. For Q21 SF=1 lineitem 6M rows that
+      // was 6M wasted lookups (~50% of server scan cost). Use the
+      // passed-in reference directly.
+      DataItem* item = &di_ref;
 
       for (;;) {
         TransactionId tid = item->transaction_id.load();
@@ -448,9 +465,19 @@ class Database::Impl {
               {std::string(key), std::move(value), PackTransactionId(tid),
                true});
           ++returned_rows;
+        } else if (!use_logical_validation) {
+          // Physical-mode tombstone retention (Codex Step 3 blocker fix).
+          // Reusing an uninitialised DataItem (Purge + reinsert at the same
+          // key) does NOT bump the masstree leaf nodeversion, so per-leaf
+          // phantom validation alone misses such a phantom. Capture each
+          // tombstone we touched as (table, "", key, tid, found=false) so
+          // commit re-reads its TID and aborts if it has changed since
+          // prefetch. Logical mode still skips: its key-list compare
+          // catches reuse without needing a per-entry TID.
+          result.index_reads.push_back(
+              {std::string(table_name), std::string(),
+               std::string(key), PackTransactionId(tid), false});
         }
-        // Tombstones are skipped: Purge erases them at commit, and key-list
-        // validation catches any reuse without needing a per-entry TID.
         return row_limit > 0 && returned_rows >= row_limit;
       }
     };
@@ -496,6 +523,78 @@ class Database::Impl {
     return result;
   }
 
+  // helios Phase-6 range-hash OCC. Computes a 32-byte digest over the read
+  // footprint of a primary range [start,end): every entry the Masstree scan
+  // visits, in key order, fed as (key, packed_tid, found). This includes
+  // visible rows, filter-rejected rows (still found=1 — they exist), and
+  // tombstones/empty slots (found=0). Two calls over the same range produce
+  // the same digest iff nothing in the footprint changed. Used at prefetch
+  // (capture expected) and at commit (re-derive + compare) to replace the
+  // O(rows) per-row read-set with an O(1) digest. Read-only scope: the caller
+  // (RPC layer) only uses this for read-only txns, so no own-write
+  // reconciliation is needed and the commit re-scan need not be inside the
+  // locked ValidateAndCommit phase (a read-only txn serializes at its
+  // validation point; see docs/phase6_rangehash_occ_design.md).
+  //
+  // `out_hash` receives 32 bytes. Returns false if the table is missing or the
+  // scan failed (caller should fall back to per-row validation / abort).
+  bool ComputePrimaryRangeFootprintHash(const std::string_view table_name,
+                                        const std::string_view start_key,
+                                        const std::string_view end_key,
+                                        uint64_t row_limit, bool reverse_scan,
+                                        uint8_t out_hash[32]) {
+    if (end_key.empty()) return false;
+    // NOTE: no epoch_framework_.MakeMeOnline()/MakeMeOffline() here. This
+    // helper runs WITHIN the caller's already-established epoch + masstree RCU
+    // context (prefetch: the TX_EXECUTE_READ_PLAN handler; commit: inside
+    // ValidateAndCommit after its MakeMeOnline). A nested MakeMeOffline would
+    // prematurely take the thread offline mid-prefetch and corrupt the
+    // physical-OCC epoch pin → subsequent steps see stale/missing data.
+    // (StatelessRangeScan likewise relies on the caller's epoch.)
+    std::shared_lock<std::shared_mutex> lk(schema_mutex_);
+    auto table = GetTable(table_name);
+    if (!table.has_value()) return false;
+
+    helios_sha::Sha256 sha;
+    // Domain-separate: table name + bounds + direction + limit, so a digest
+    // can't be confused across ranges/tables.
+    sha.update_field(table_name.data(), table_name.size());
+    sha.update_field(start_key.data(), start_key.size());
+    sha.update_field(end_key.data(), end_key.size());
+    sha.update_u64(row_limit);
+    sha.update_u8(reverse_scan ? 1 : 0);
+
+    uint64_t visited = 0;
+    auto feed = [&](std::string_view key, DataItem& item) {
+      // Mirror StatelessRangeScan's read of a stable committed value: spin
+      // past a locked TID, then snapshot found + tid atomically.
+      for (;;) {
+        TransactionId tid = item.transaction_id.load();
+        if (tid.tid & 1u) { std::this_thread::yield(); continue; }
+        const bool found = item.IsInitialized() && item.size() != 0;
+        if (item.transaction_id.load() != tid) continue;
+        sha.update_field(key.data(), key.size());
+        sha.update_u64(PackTransactionId(tid));
+        sha.update_u8(found ? 1 : 0);
+        ++visited;
+        // row_limit counts FOUND rows to match the data scan's footprint.
+        return false;  // never early-stop here: footprint must cover the full
+                       // range (limit handling for footprint is by key set,
+                       // not a hard stop, to stay identical prefetch vs commit)
+      }
+    };
+    auto scan_result =
+        reverse_scan
+            ? table.value()->GetPrimaryIndex().ScanReverse(
+                  start_key, end_key, feed, nullptr)
+            : table.value()->GetPrimaryIndex().Scan(start_key, end_key, feed,
+                                                    nullptr);
+    if (!scan_result.has_value()) return false;
+    sha.update_u64(visited);  // bind the count too
+    sha.final(out_hash);
+    return true;
+  }
+
   /**
    * @brief Range-scan a secondary index and resolve each hit to its base
    *        row.
@@ -525,7 +624,9 @@ class Database::Impl {
     result.ok = true;
 
     // Same rationale as StatelessRangeScan above.
-    const bool use_logical_validation = true;
+    // helios 2-RPC OCC: logical=key-list (default) vs physical=node-version.
+    // Toggle is per-thread (LineairDB::Database::SetPhysicalValidationMode).
+    const bool use_logical_validation = !LineairDB::helios_physical_validation_mode_active();
     std::vector<Index::NodeVersionEntry> versions;
     uint64_t returned_rows = 0;
 
@@ -556,6 +657,17 @@ class Database::Impl {
           result.rows.push_back({secondary_key, primary_key, std::move(value),
                                  PackTransactionId(tid), true});
           ++returned_rows;
+        } else if (!use_logical_validation) {
+          // Physical-mode tombstone retention for the BASE row reached via
+          // the secondary index. Same rationale as the primary scan path
+          // above: an uninitialised DataItem's reuse won't bump masstree
+          // leaf version, so per-row TID re-check at commit is required.
+          // We tag with index_name="" to mark this as a primary-table
+          // tombstone (the secondary slot is already covered by
+          // append_secondary_entry's own index_reads entry).
+          result.index_reads.push_back(
+              {std::string(table_name), std::string(),
+               primary_key, PackTransactionId(tid), false});
         }
         return row_limit > 0 && returned_rows >= row_limit;
       }
@@ -645,6 +757,93 @@ class Database::Impl {
       }
     }
     return result;
+  }
+
+  // helios Phase-2 optimizer stats: exact number-of-distinct-values per key-part
+  // PREFIX for an index, used by the proxy to set rec_per_key. One ordered,
+  // live-filtered pass (no row materialization). out_ndv[d] = distinct values of
+  // the prefix (parts 0..d). num_parts = the index's SECONDARY user key-parts
+  // (PK is NOT appended to helios secondary keys today). INT key-parts only:
+  // returns false ("unavailable") if any live key has a non-int / malformed part
+  // within [0,num_parts) so the proxy keeps its heuristic instead of bad stats.
+  // helios int key-part encoding: [0x00 marker][0x10 type][2B big-endian len]
+  // [len bytes value]. (docs/phase7_optimizer_stats.md)
+  bool ComputeIndexNdvInt(const std::string_view table_name,
+                          const std::string_view index_name, uint32_t num_parts,
+                          std::vector<uint64_t>& out_ndv) {
+    out_ndv.assign(num_parts, 0);
+    if (num_parts == 0) return false;
+    std::shared_lock<std::shared_mutex> lk(schema_mutex_);
+    auto table = GetTable(table_name);
+    if (!table.has_value()) return false;
+
+    bool ok = true;
+    bool first = true;
+    std::string prev;
+    std::vector<size_t> prev_ends(num_parts, 0);
+
+    // Returns true to STOP the scan (only on an unparseable key -> unavailable).
+    auto count_key = [&](std::string_view key) -> bool {
+      std::vector<size_t> ends(num_parts);
+      size_t off = 0;
+      for (uint32_t p = 0; p < num_parts; ++p) {
+        if (off + 4 > key.size()) { ok = false; return true; }
+        const unsigned char marker = static_cast<unsigned char>(key[off]);
+        const unsigned char type = static_cast<unsigned char>(key[off + 1]);
+        if (marker != 0x00 || type != 0x10) { ok = false; return true; }
+        const size_t len =
+            (static_cast<size_t>(static_cast<unsigned char>(key[off + 2])) << 8) |
+            static_cast<unsigned char>(key[off + 3]);
+        off += 4 + len;
+        if (off > key.size()) { ok = false; return true; }
+        ends[p] = off;
+      }
+      if (first) {
+        for (uint32_t d = 0; d < num_parts; ++d) out_ndv[d] = 1;
+        first = false;
+      } else {
+        const std::string_view pv(prev);
+        for (uint32_t d = 0; d < num_parts; ++d) {
+          if (ends[d] != prev_ends[d] ||
+              key.substr(0, ends[d]) != pv.substr(0, prev_ends[d]))
+            out_ndv[d]++;
+        }
+      }
+      prev.assign(key.data(), key.size());
+      prev_ends = ends;
+      return false;
+    };
+
+    static const std::string kMaxEnd(16, '\xff');
+    if (index_name.empty()) {
+      table.value()->GetPrimaryIndex().Scan(
+          std::string_view(), std::string_view(kMaxEnd),
+          [&](std::string_view key, DataItem& di) -> bool {
+            if (di.IsInitialized() && di.size() != 0) return count_key(key);
+            return false;  // skip tombstone/blank slot
+          },
+          nullptr);
+    } else {
+      Index::SecondaryIndex* index =
+          table.value()->GetSecondaryIndex(index_name);
+      if (index == nullptr) return false;
+      index->Scan(
+          std::string_view(), std::string_view(kMaxEnd),
+          [&](std::string_view key) -> bool {
+            // live = the secondary entry still maps to >=1 base row.
+            DataItem* item = index->Get(key);
+            if (item == nullptr || !item->IsInitialized() ||
+                item->primary_keys().empty())
+              return false;
+            return count_key(key);
+          },
+          nullptr);
+    }
+    if (!ok) {
+      out_ndv.assign(num_parts, 0);
+      return false;
+    }
+    return true;
   }
 
   /**

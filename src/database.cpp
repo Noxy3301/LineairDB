@@ -67,6 +67,45 @@ void Database::ReleaseMasstreeThreadEpoch() {
 void Database::FullyDrainMasstreeThread() {
   Index::MasstreeFullyDrainThread();
 }
+
+// helios 2-RPC OCC: per-tx epoch pin wrappers (see
+// `include/lineairdb/database.h` for the contract and the masstree adapter
+// comments for the lifecycle).
+bool Database::RegisterTxEpochPinFromCurrentThread(std::uint64_t key) {
+  return Index::RegisterTxEpochPinFromCurrentThread(key);
+}
+void Database::ReleaseTxEpochPin(std::uint64_t key) {
+  Index::ReleaseTxEpochPin(key);
+}
+bool Database::HasTxPin(std::uint64_t key) { return Index::HasTxPin(key); }
+bool Database::LeaseTxPinForValidation(std::uint64_t key) {
+  return Index::LeaseTxPinForValidation(key);
+}
+void Database::DropTxPinValidationLease(std::uint64_t key) {
+  Index::DropTxPinValidationLease(key);
+}
+
+// Per-thread physical-OCC mode TLS. Lives in this TU; read by
+// StatelessRangeScan inside database_impl.h.
+namespace {
+thread_local bool tls_physical_validation_mode_ = false;
+}
+bool helios_physical_validation_mode_active() {
+  return tls_physical_validation_mode_;
+}
+void Database::SetPhysicalValidationMode(bool on) {
+  tls_physical_validation_mode_ = on;
+}
+bool Database::GetPhysicalValidationMode() const {
+  return tls_physical_validation_mode_;
+}
+std::uint64_t Database::GetTxPinFloor() { return Index::GetTxPinFloor(); }
+std::size_t Database::SweepExpiredTxPins(std::uint64_t now_ns) {
+  return Index::SweepExpiredTxPins(now_ns);
+}
+void Database::SetTxPinTtlMs(std::uint64_t ms) { Index::SetTxPinTtlMs(ms); }
+std::uint64_t Database::GetTxPinTtlMs() { return Index::GetTxPinTtlMs(); }
+
 bool Database::CreateTable(const std::string_view table_name) {
   return db_pimpl_->CreateTable(table_name);
 }
@@ -94,12 +133,28 @@ StatelessRangeScanResult Database::StatelessRangeScan(
                                        row_limit, reverse_scan);
 }
 
+bool Database::ComputePrimaryRangeFootprintHash(
+    const std::string_view table_name, const std::string_view start_key,
+    const std::string_view end_key, uint64_t row_limit, bool reverse_scan,
+    uint8_t out_hash[32]) {
+  return db_pimpl_->ComputePrimaryRangeFootprintHash(
+      table_name, start_key, end_key, row_limit, reverse_scan, out_hash);
+}
+
 StatelessSecondaryRangeScanResult Database::StatelessSecondaryRangeScan(
     const std::string_view table_name, const std::string_view index_name,
     const std::string_view start_key, const std::string_view end_key,
     uint64_t row_limit, bool reverse_scan) {
   return db_pimpl_->StatelessSecondaryRangeScan(
       table_name, index_name, start_key, end_key, row_limit, reverse_scan);
+}
+
+bool Database::ComputeIndexNdvInt(const std::string_view table_name,
+                                  const std::string_view index_name,
+                                  uint32_t num_parts,
+                                  std::vector<uint64_t>& out_ndv) {
+  return db_pimpl_->ComputeIndexNdvInt(table_name, index_name, num_parts,
+                                       out_ndv);
 }
 
 bool Database::ValidateAndCommit(

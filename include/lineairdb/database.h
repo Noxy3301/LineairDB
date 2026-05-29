@@ -21,6 +21,8 @@
 #include <lineairdb/stateless.h>
 #include <lineairdb/transaction.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -180,6 +182,50 @@ class Database {
    */
   void FullyDrainMasstreeThread();
 
+  /**
+   * @brief Per-transaction epoch pin (helios 2-RPC OCC extension). See
+   * `.note/reference/rcu_epoch_background.md` for the design.
+   *
+   * Register: must be called while the CURRENT THREAD is inside its
+   * masstree RCU critical section (i.e. between a masstree op and the
+   * matching ReleaseMasstreeThreadEpoch). The pin epoch is taken from the
+   * value rcu_start stamped, so it survives the thread releasing its own
+   * epoch — letting later RPCs in the same logical transaction safely
+   * dereference node pointers captured during this section. Returns false
+   * if the current thread is NOT in a critical section.
+   *
+   * Release: removes the pin so reclamation can advance.
+   * GetTxPinFloor: smallest live pin epoch (UINT64_MAX when empty).
+   * SweepExpiredTxPins: erase pins whose TTL has elapsed. Returns count.
+   * SetTxPinTtlMs / GetTxPinTtlMs: TTL configuration; default read from
+   *   HELIOS_PIN_TTL_MS env at first use (60000 ms). 0 disables TTL.
+   */
+  bool RegisterTxEpochPinFromCurrentThread(std::uint64_t key);
+  void ReleaseTxEpochPin(std::uint64_t key);
+  bool HasTxPin(std::uint64_t key);
+  // Atomically reserve the pin against TTL sweep for the duration of commit
+  // validation. While the lease is held the pin cannot be reclaimed (the
+  // Sweep skips pins with in_use > 0). Returns false if the pin no longer
+  // exists, in which case the caller MUST abort the tx as expired and not
+  // dereference any node_ptr it captured.
+  bool LeaseTxPinForValidation(std::uint64_t key);
+  void DropTxPinValidationLease(std::uint64_t key);
+  std::uint64_t GetTxPinFloor();
+
+  // Per-thread physical-OCC mode toggle. When set true on the current thread,
+  // StatelessRangeScan / StatelessSecondaryRangeScan emit per-leaf
+  // NodeVersionEntries (physical phantom validation) and capture tombstones
+  // into index_reads instead of skipping them. When false (default), they use
+  // the legacy logical key-list validation. Set TRUE only while the calling
+  // thread is inside the masstree RCU section AND a tx pin is held; otherwise
+  // node_ptrs in the captured entries may dangle across RPCs. The server
+  // resets to false at the end of the prefetch handler.
+  void SetPhysicalValidationMode(bool on);
+  bool GetPhysicalValidationMode() const;
+  std::size_t SweepExpiredTxPins(std::uint64_t now_ns);
+  void SetTxPinTtlMs(std::uint64_t ms);
+  std::uint64_t GetTxPinTtlMs();
+
   bool CreateSecondaryIndex(const std::string_view table_name,
                             const std::string_view index_name,
                             const uint index_type);
@@ -258,6 +304,16 @@ class Database {
       const std::string_view table_name, const std::string_view start_key,
       const std::string_view end_key, uint64_t row_limit, bool reverse_scan);
 
+  // helios Phase-6 range-hash OCC: 32-byte digest over a primary range's read
+  // footprint (every visited entry as key,packed_tid,found in key order).
+  // Captured at prefetch, re-derived + compared at commit to replace the
+  // O(rows) per-row read set with an O(1) digest. Read-only scope only.
+  // Returns false on missing table / scan failure (caller falls back).
+  bool ComputePrimaryRangeFootprintHash(
+      const std::string_view table_name, const std::string_view start_key,
+      const std::string_view end_key, uint64_t row_limit, bool reverse_scan,
+      uint8_t out_hash[32]);
+
   /**
    * @brief Range-scan a secondary index and resolve each hit to its base row.
    *
@@ -279,6 +335,14 @@ class Database {
       const std::string_view table_name, const std::string_view index_name,
       const std::string_view start_key, const std::string_view end_key,
       uint64_t row_limit, bool reverse_scan);
+
+  // helios Phase-2 optimizer stats: exact per-key-part-prefix NDV for an index
+  // (one ordered live-filtered pass). out_ndv[d] = distinct values of prefix
+  // (parts 0..d). INT key-parts only; returns false ("unavailable") on a
+  // non-int/malformed part. index_name "" = primary. See database_impl.h.
+  bool ComputeIndexNdvInt(const std::string_view table_name,
+                          const std::string_view index_name,
+                          uint32_t num_parts, std::vector<uint64_t>& out_ndv);
 
   /**
    * @brief Validate a caller-collected snapshot and install its writes

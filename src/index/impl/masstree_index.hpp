@@ -3,6 +3,8 @@
 
 #include <lineairdb/config.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 
 #include "index/index_base.h"
@@ -83,6 +85,58 @@ void MasstreeReleaseThreadEpoch();
 // it exits. Heavier than a regular release; intended for connection-close
 // paths only.
 void MasstreeFullyDrainThread();
+
+// ---- Per-transaction epoch pin (helios 2-RPC OCC extension) -------------
+// Background: helios's prefetch RPC scans masstree and captures NodeVersion
+// entries that the matching commit RPC must re-read. Between those RPCs the
+// prefetch handler thread calls MasstreeReleaseThreadEpoch (rcu_stop), which
+// removes it from min_active_epoch(); the global ticker then advances
+// active_epoch and reclaims leaves retired at >= the prefetch epoch. The
+// captured node_ptrs become UAF on commit.
+//
+// To fix this WITHOUT changing the per-thread RCU model, helios installs a
+// per-tx "epoch pin": MasstreeAdvanceEpoch computes
+//   active_epoch = min(threadinfo::min_active_epoch(), GetTxPinFloor())
+// so any registered pin holds reclamation back the same way a long-lived
+// thread enrolment would. The pin is released at commit/abort/connection-
+// close/timeout. See `.note/reference/rcu_epoch_background.md`.
+//
+// Pin lifecycle (Codex Q2 critical):
+//   - RegisterTxEpochPinFromCurrentThread MUST be called while the calling
+//     thread is still inside its rcu_start/rcu_stop critical section. It
+//     reads tls_ti->gc_epoch_ (the value rcu_start STAMPED at entry), not
+//     a fresh globalepoch.load(): scans can run for many epochs and a fresh
+//     load would publish a later epoch than the leaves were retired at.
+//   - The pin epoch is then independent of the thread's gc_epoch_, so it
+//     survives MasstreeReleaseThreadEpoch.
+//   - ReleaseTxEpochPin must be called at commit/abort/connection-close.
+//   - SweepExpiredTxPins is invoked from MasstreeAdvanceEpoch on every tick
+//     and erases pins whose TTL has elapsed; the higher-layer TxOccStore
+//     observes the absent pin and aborts the tx as expired on commit.
+using TxPinKey = std::uint64_t;
+// Returns true on success, false if the thread is not currently in a
+// masstree RCU critical section (no tls_ti / not enrolled). Caller should
+// abort the OCC tx on false.
+bool RegisterTxEpochPinFromCurrentThread(TxPinKey key);
+void ReleaseTxEpochPin(TxPinKey key);
+// True if `key` is currently pinned (Step 5/6 helper: lets the commit RPC
+// distinguish "tx was active and survived" from "expired by TTL / proxy
+// crash" without racing the map).
+bool HasTxPin(TxPinKey key);
+// Smallest registered pin epoch (UINT64_MAX when no pins).
+std::uint64_t GetTxPinFloor();
+// Lease/release a pin for the commit-side validation window. While in_use is
+// non-zero the TTL sweep skips the pin, so the commit can safely dereference
+// node_ptrs without a sweep race (Codex Step 5/6 P1 fix). Returns false if
+// the key is no longer present (caller treats as expired-abort).
+bool LeaseTxPinForValidation(TxPinKey key);
+void DropTxPinValidationLease(TxPinKey key);
+// `now_ns` is the caller's monotonic clock (std::chrono::steady_clock); pins
+// with expires_at_ns <= now_ns are removed. Returns the number swept.
+std::size_t SweepExpiredTxPins(std::uint64_t now_ns);
+// TTL config. Default from HELIOS_PIN_TTL_MS (default 60000). 0 disables TTL.
+void SetTxPinTtlMs(std::uint64_t ms);
+std::uint64_t GetTxPinTtlMs();
 
 }  // namespace Index
 }  // namespace LineairDB
