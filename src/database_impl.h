@@ -1024,12 +1024,15 @@ class Database::Impl {
       return false;
     };
 
-    auto wait_until_readable = [&](DataItem* item) {
-      for (;;) {
-        TransactionId tid = item->transaction_id.load();
-        if (!(tid.tid & 1u) || is_own_locked(item)) return;
-        std::this_thread::yield();
-      }
+    // Silo Phase 2 read validation is wait-free: a record locked by another
+    // transaction is treated as "dirty" and forces abort. Spinning here breaks
+    // the paper's deadlock-freedom invariant — sorted write-lock acquisition
+    // protects only write-to-write edges, not read-to-write edges introduced
+    // by validators.
+    auto try_snapshot_readable = [&](DataItem* item) -> bool {
+      TransactionId tid = item->transaction_id.load();
+      if (!(tid.tid & 1u)) return true;
+      return is_own_locked(item);
     };
 
     auto validate_primary_key_list =
@@ -1038,8 +1041,12 @@ class Database::Impl {
           if (!table.has_value()) return false;
 
           std::vector<std::string> keys;
+          bool aborted = false;
           auto collect_key = [&](std::string_view key, DataItem& item) {
-            wait_until_readable(&item);
+            if (!try_snapshot_readable(&item)) {
+              aborted = true;
+              return true;
+            }
             if (item.IsInitialized() && item.size() != 0) {
               keys.emplace_back(key);
             }
@@ -1052,6 +1059,7 @@ class Database::Impl {
                         range.start_key, range.end_key, collect_key, nullptr)
                   : table.value()->GetPrimaryIndex().Scan(
                         range.start_key, range.end_key, collect_key, nullptr);
+          if (aborted) return false;
           return scan_result.has_value() && keys == range.result_keys;
         };
 
@@ -1064,11 +1072,15 @@ class Database::Impl {
 
           std::vector<std::string> secondary_keys;
           std::vector<std::string> primary_keys;
+          bool aborted = false;
           auto snapshot_base_row = [&](const std::string& secondary_key,
                                        const std::string& primary_key) {
             DataItem* item = table.value()->GetPrimaryIndex().Get(primary_key);
             if (item == nullptr) return false;
-            wait_until_readable(item);
+            if (!try_snapshot_readable(item)) {
+              aborted = true;
+              return true;
+            }
             if (item->IsInitialized() && item->size() != 0) {
               secondary_keys.push_back(secondary_key);
               primary_keys.push_back(primary_key);
@@ -1081,7 +1093,10 @@ class Database::Impl {
             const std::string secondary_key(key);
             DataItem* item = index->Get(key);
             if (item == nullptr) return false;
-            wait_until_readable(item);
+            if (!try_snapshot_readable(item)) {
+              aborted = true;
+              return true;
+            }
             if (!item->IsInitialized() || item->primary_keys().empty()) {
               return false;
             }
@@ -1097,6 +1112,7 @@ class Database::Impl {
                                        collect_secondary_key, nullptr)
                   : index->Scan(range.start_key, range.end_key,
                                 collect_secondary_key, nullptr);
+          if (aborted) return false;
           return scan_result.has_value() &&
                  secondary_keys == range.result_keys &&
                  primary_keys == range.result_primary_keys;
