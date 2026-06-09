@@ -1104,14 +1104,26 @@ class Database::Impl {
             const std::string secondary_key(key);
             DataItem* item = index->Get(key);
             if (item == nullptr) return false;
-            if (!try_snapshot_readable(item)) {
+            // Copy the primary-key list under a double-TID read, as in the
+            // staging scan: a committer mutates the live vector in place
+            // under its lock. The TID stays constant while locked, so the
+            // lock bit is checked before the copy and the TID after it.
+            const TransactionId observed = item->transaction_id.load();
+            if ((observed.tid & 1u) && !is_own_locked(item)) {
               aborted = true;
               return true;
             }
-            if (!item->IsInitialized() || item->primary_keys().empty()) {
+            const bool initialized = item->IsInitialized();
+            std::vector<std::string> item_primary_keys;
+            if (initialized) item_primary_keys = item->primary_keys();
+            if (item->transaction_id.load() != observed) {
+              aborted = true;
+              return true;
+            }
+            if (!initialized || item_primary_keys.empty()) {
               return false;
             }
-            for (const auto& primary_key : item->primary_keys()) {
+            for (const auto& primary_key : item_primary_keys) {
               if (snapshot_base_row(secondary_key, primary_key)) return true;
             }
             return false;
