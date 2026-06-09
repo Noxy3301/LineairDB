@@ -979,7 +979,18 @@ class Database::Impl {
         item = read.index == nullptr
                    ? read.table->GetPrimaryIndex().Get(read.key)
                    : read.index->Get(read.key);
-        if (item == nullptr) continue;
+        if (item == nullptr) {
+          // A read observed as present must still resolve at validation
+          // time. An unresolvable key here means a committed delete purged
+          // the slot after the read, which is a serializability conflict.
+          if (read.found) {
+            return unlock_and_abort(exact_read_reason(
+                read.index_name.empty() ? "exact_read_disappeared"
+                                        : "index_read_disappeared",
+                read));
+          }
+          continue;
+        }
         if (!item->IsInitialized() && !read.found) continue;
         return unlock_and_abort(exact_read_reason(
             read.index_name.empty() ? "exact_read_appeared"
