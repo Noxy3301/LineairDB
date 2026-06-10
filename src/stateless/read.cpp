@@ -78,6 +78,7 @@ StatelessRangeScanResult RangeScan(TableDictionary& tables,
           : table.value()->GetPrimaryIndex().Scan(
                 start_key, end_key, append_scan_entry);
   if (!scan_result.has_value()) {
+    result.ok = false;
     result.rows.clear();
   }
   return result;
@@ -136,6 +137,7 @@ StatelessSecondaryRangeScanResult SecondaryRangeScan(
           ? index->ScanReverse(start_key, end_key, append_secondary_entry)
           : index->Scan(start_key, end_key, append_secondary_entry);
   if (!scan_result.has_value()) {
+    result.ok = false;
     result.rows.clear();
   }
   return result;
