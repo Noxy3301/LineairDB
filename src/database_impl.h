@@ -42,7 +42,9 @@
 
 #include "callback/callback_manager.h"
 #include "recovery/checkpoint_manager.hpp"
+#include "concurrency_control/stable_read.hpp"
 #include "recovery/logger.h"
+#include "stateless/packed_transaction_id.hpp"
 #include "table/table.h"
 #include "table/table_dictionary.hpp"
 #include "thread_pool/thread_pool.h"
@@ -366,24 +368,9 @@ class Database::Impl {
     DataItem* item = table.value()->GetPrimaryIndex().Get(key);
     if (item == nullptr) return {};
 
-    for (;;) {
-      TransactionId tid = item->transaction_id.load();
-      if (tid.tid & 1u) {
-        _mm_pause();
-        continue;
-      }
-
-      const bool found = item->IsInitialized() && item->size() != 0;
-      std::string value;
-      if (found) {
-        value.assign(reinterpret_cast<const char*>(item->value()),
-                     item->size());
-      }
-
-      if (item->transaction_id.load() == tid) {
-        return {found, std::move(value), PackTransactionId(tid)};
-      }
-    }
+    auto row = ConcurrencyControl::StableReadValue(*item);
+    return {row.found, std::move(row.value),
+            Stateless::PackTransactionId(row.tid)};
   }
 
   /**
@@ -442,32 +429,15 @@ class Database::Impl {
         return false;
       }
 
-      for (;;) {
-        TransactionId tid = item->transaction_id.load();
-        if (tid.tid & 1u) {
-          _mm_pause();
-          continue;
-        }
-
-        const bool found = item->IsInitialized() && item->size() != 0;
-        std::string value;
-        if (found) {
-          value.assign(reinterpret_cast<const char*>(item->value()),
-                       item->size());
-        }
-
-        if (item->transaction_id.load() != tid) continue;
-
-        if (found) {
-          result.rows.push_back(
-              {std::string(key), std::move(value), PackTransactionId(tid),
-               true});
-          ++returned_rows;
-        }
-        // Tombstones are skipped: Purge erases them at commit, and key-list
-        // validation catches any reuse without needing a per-entry TID.
-        return row_limit > 0 && returned_rows >= row_limit;
+      auto row = ConcurrencyControl::StableReadValue(*item);
+      if (row.found) {
+        result.rows.push_back({std::string(key), std::move(row.value),
+                               Stateless::PackTransactionId(row.tid), true});
+        ++returned_rows;
       }
+      // Tombstones are skipped: Purge erases them at commit, and key-list
+      // validation catches any reuse without needing a per-entry TID.
+      return row_limit > 0 && returned_rows >= row_limit;
     };
 
     auto scan_result =
@@ -551,29 +521,14 @@ class Database::Impl {
         return false;
       }
 
-      for (;;) {
-        TransactionId tid = item->transaction_id.load();
-        if (tid.tid & 1u) {
-          _mm_pause();
-          continue;
-        }
-
-        const bool found = item->IsInitialized() && item->size() != 0;
-        std::string value;
-        if (found) {
-          value.assign(reinterpret_cast<const char*>(item->value()),
-                       item->size());
-        }
-
-        if (item->transaction_id.load() != tid) continue;
-
-        if (found) {
-          result.rows.push_back({secondary_key, primary_key, std::move(value),
-                                 PackTransactionId(tid), true});
-          ++returned_rows;
-        }
-        return row_limit > 0 && returned_rows >= row_limit;
+      auto row = ConcurrencyControl::StableReadValue(*item);
+      if (row.found) {
+        result.rows.push_back({secondary_key, primary_key,
+                               std::move(row.value),
+                               Stateless::PackTransactionId(row.tid), true});
+        ++returned_rows;
       }
+      return row_limit > 0 && returned_rows >= row_limit;
     };
 
     auto append_secondary_entry = [&](std::string_view key) {
@@ -588,29 +543,14 @@ class Database::Impl {
         return false;
       }
 
-      std::vector<std::string> primary_keys;
-      for (;;) {
-        TransactionId tid = item->transaction_id.load();
-        if (tid.tid & 1u) {
-          _mm_pause();
-          continue;
-        }
-
-        const bool found = item->IsInitialized() &&
-                           !item->primary_keys().empty();
-        if (found) primary_keys = item->primary_keys();
-
-        if (item->transaction_id.load() != tid) continue;
-
-        if (!use_logical_validation) {
-          result.index_reads.push_back(
-              {std::string(table_name), std::string(index_name),
-               secondary_key, PackTransactionId(tid), found});
-        }
-        break;
+      auto slot = ConcurrencyControl::StableReadPrimaryKeys(*item);
+      if (!use_logical_validation) {
+        result.index_reads.push_back(
+            {std::string(table_name), std::string(index_name), secondary_key,
+             Stateless::PackTransactionId(slot.tid), slot.found});
       }
 
-      for (const auto& primary_key : primary_keys) {
+      for (const auto& primary_key : slot.primary_keys) {
         if (snapshot_base_row(secondary_key, primary_key)) return true;
       }
       return false;
@@ -813,7 +753,7 @@ class Database::Impl {
         DataItem* item = table.value()->GetPrimaryIndex().Get(read.key);
         validation_entries.push_back({table.value(), nullptr,
                                       read.table_name, "", read.key, item,
-                                      UnpackTransactionId(read.tid),
+                                      Stateless::UnpackTransactionId(read.tid),
                                       read.found});
       }
 
@@ -832,7 +772,7 @@ class Database::Impl {
           DataItem* item = table.value()->GetPrimaryIndex().Get(read.key);
           validation_entries.push_back({table.value(), nullptr,
                                         read.table_name, "", read.key, item,
-                                        UnpackTransactionId(read.tid),
+                                        Stateless::UnpackTransactionId(read.tid),
                                         read.found});
         } else {
           Index::SecondaryIndex* index =
@@ -847,7 +787,7 @@ class Database::Impl {
           DataItem* item = index->Get(read.key);
           validation_entries.push_back({table.value(), index, read.table_name,
                                         read.index_name, read.key, item,
-                                        UnpackTransactionId(read.tid),
+                                        Stateless::UnpackTransactionId(read.tid),
                                         read.found});
         }
       }
@@ -1558,21 +1498,6 @@ class Database::Impl {
         total_reaped, total_requeued, total_dropped);
 
     Index::MasstreeReleaseThreadEpoch();
-  }
-
-  /// Pack a {epoch, tid} pair into one uint64_t so it can travel over the
-  /// stateless RPC as an opaque version token.
-  static uint64_t PackTransactionId(const TransactionId& tid) {
-    return (static_cast<uint64_t>(tid.epoch) << 32) |
-           static_cast<uint64_t>(tid.tid);
-  }
-
-  /// Inverse of PackTransactionId. The stateless API hands the packed value
-  /// back through ValidateAndCommit, which unpacks it to compare with the
-  /// live TransactionId on the DataItem.
-  static TransactionId UnpackTransactionId(uint64_t packed) {
-    return {static_cast<EpochNumber>(packed >> 32),
-            static_cast<uint32_t>(packed & 0xffffffffu)};
   }
 
   void Recovery() {
