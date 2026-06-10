@@ -9,7 +9,6 @@
 #include <vector>
 
 #include "index/concurrent_table.h"
-#include "index/index_base.h"
 #include "index/reaper.h"
 #include "index/secondary_index.h"
 #include "recovery/logger.h"
@@ -30,11 +29,7 @@ namespace Stateless {
  *        call `MakeMeOnline` so the thread participates in this epoch.
  *   2. Resolve
  *        under `schema_mutex` shared, map each read, write, and
- *        secondary-index op to its DataItem. Writes use `GetOrInsert`;
- *        when that splits a Masstree leaf for our own insert,
- *        `reconcile_own_insert` advances the matching `range_reads` entry
- *        from `old_version` to `new_version` so the transaction does not
- *        self-abort.
+ *        secondary-index op to its DataItem. Writes use `GetOrInsert`.
  *   3. Pre-lock UNIQUE dedup
  *        the same UNIQUE SI key appearing twice in `secondary_index_ops`
  *        is rejected with `unique_si_duplicate_in_request`.
@@ -44,15 +39,12 @@ namespace Stateless {
  *   5. Epoch fence
  *        bounce off and back on so a fresh epoch starts.
  *   6. Exact-read validation
- *        every ExternalReadEntry and ExternalIndexValidationEntry has its
- *        DataItem's TID compared with the supplied `tid`. For items we
- *        just locked, the comparison uses `before_lock`. Mismatches abort
- *        with `exact_read_tid_moved` (or `index_read_tid_moved`).
+ *        every ExternalReadEntry has its DataItem's TID compared with the
+ *        supplied `tid`. For items we just locked, the comparison uses
+ *        `before_lock`. Mismatches abort with `exact_read_tid_moved`.
  *   7. Range validation
- *        for each `range_reads` entry, either replay the scan and compare
- *        key lists (logical form), or call `ValidatePhantoms` on the
- *        recorded Masstree node version (physical form). Failure aborts
- *        with `range_node_version_changed` or `*_range_result_changed`.
+ *        for each `range_reads` entry, replay the scan and compare key
+ *        lists. Failure aborts with `*_range_result_changed`.
  *   8. Post-lock UNIQUE recheck
  *        simulate the SI slot state across all ops on the same item to
  *        catch a concurrent insert that became visible while we were
@@ -73,9 +65,16 @@ namespace Stateless {
  *  12. Log enqueue
  *        push the log set into `logger`, then call `MakeMeOffline`.
  *
+ * Range validation is logical-only: a stateless caller cannot hold a
+ * Masstree node pointer across the RPC boundary, so a physical
+ * node-version token (a `range_reads` entry with an empty `end_key`) or a
+ * non-empty `index_reads` set is rejected up front with
+ * `physical_range_token_unsupported` / `index_reads_unsupported` instead
+ * of being silently skipped.
+ *
  * On any failure path the function unlocks every item it owns, sets
  * `*abort_reason` (when non-null) to a short label such as
- * `exact_read_tid_moved`, `range_node_version_changed`, or
+ * `exact_read_tid_moved`, `primary_range_result_changed`, or
  * `unique_si_exists_after_lock`, and returns false.
  */
 bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
@@ -132,24 +131,6 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
   std::vector<DataItem*> lock_items;
   std::vector<LockTarget> lock_targets;
   std::unordered_set<std::string> unique_si_adds;
-  auto reconciled_range_reads = range_reads;
-
-  auto reconcile_own_insert = [&](const Index::NodeVersionUpdate& update) {
-    if (!update.valid || update.node_ptr == nullptr) return true;
-    for (auto& entry : reconciled_range_reads) {
-      if (!entry.end_key.empty()) continue;
-      if (entry.owner_ptr != reinterpret_cast<uint64_t>(update.owner) ||
-          entry.node_ptr != reinterpret_cast<uint64_t>(update.node_ptr)) {
-        continue;
-      }
-      if (entry.version == update.old_version) {
-        entry.version = update.new_version;
-        continue;
-      }
-      return false;
-    }
-    return true;
-  };
 
   auto abort_before_lock = [&](const std::string& reason) {
     if (abort_reason != nullptr) *abort_reason = reason;
@@ -157,12 +138,24 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     return false;
   };
 
+  // Validation is logical-only. A range entry with an empty end_key is a
+  // physical Masstree node-version token and exact index entries have no
+  // producer; reject both instead of silently skipping them.
+  if (!index_reads.empty()) {
+    return abort_before_lock("index_reads_unsupported");
+  }
+  for (const auto& range : range_reads) {
+    if (range.end_key.empty()) {
+      return abort_before_lock("physical_range_token_unsupported");
+    }
+  }
+
   // Step 2: resolve reads, writes, and SI ops to their DataItems.
   {
     std::shared_lock<std::shared_mutex> lk(schema_mutex);
 
     // Resolve point reads to the DataItem and version observed by proxy
-    validation_entries.reserve(reads.size() + index_reads.size());
+    validation_entries.reserve(reads.size());
     for (const auto& read : reads) {
       auto table = tables.GetTable(read.table_name);
       if (!table.has_value()) {
@@ -179,41 +172,6 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
                                     read.found});
     }
 
-    // Resolve exact index entries read by stateless scans.
-    // Empty index_name means a primary-index entry such as a tombstone.
-    for (const auto& read : index_reads) {
-      auto table = tables.GetTable(read.table_name);
-      if (!table.has_value()) {
-        if (read.found || read.tid != 0) {
-          return abort_before_lock("index_read_table_missing");
-        }
-        continue;
-      }
-
-      if (read.index_name.empty()) {
-        DataItem* item = table.value()->GetPrimaryIndex().Get(read.key);
-        validation_entries.push_back({table.value(), nullptr,
-                                      read.table_name, "", read.key, item,
-                                      UnpackTransactionId(read.tid),
-                                      read.found});
-      } else {
-        Index::SecondaryIndex* index =
-            table.value()->GetSecondaryIndex(read.index_name);
-        if (index == nullptr) {
-          if (read.found || read.tid != 0) {
-            return abort_before_lock("index_read_index_missing");
-          }
-          continue;
-        }
-
-        DataItem* item = index->Get(read.key);
-        validation_entries.push_back({table.value(), index, read.table_name,
-                                      read.index_name, read.key, item,
-                                      UnpackTransactionId(read.tid),
-                                      read.found});
-      }
-    }
-
     // Resolve row writes and deletes to the primary-index entries to lock
     resolved_writes.reserve(writes.size());
     for (const auto& write : writes) {
@@ -222,15 +180,10 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
         return abort_before_lock("write_table_missing");
       }
 
-      Index::NodeVersionUpdate own_insert;
       DataItem* item =
-          table.value()->GetPrimaryIndex().GetOrInsert(write.key,
-                                                       &own_insert);
+          table.value()->GetPrimaryIndex().GetOrInsert(write.key);
       if (item == nullptr) {
         return abort_before_lock("write_get_or_insert_failed");
-      }
-      if (!reconcile_own_insert(own_insert)) {
-        return abort_before_lock("range_node_version_changed");
       }
 
       auto* primary_index = &table.value()->GetPrimaryIndex();
@@ -263,18 +216,14 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
         }
       }
 
-      Index::NodeVersionUpdate own_insert;
       DataItem* item = nullptr;
       if (op.is_delete) {
-        item = index->GetOrInsert(op.secondary_key, &own_insert);
+        item = index->GetOrInsert(op.secondary_key);
       } else {
-        item = index->GetOrInsertForWrite(op.secondary_key, &own_insert);
+        item = index->GetOrInsertForWrite(op.secondary_key);
       }
       if (item == nullptr) {
         return abort_before_lock("si_get_or_insert_failed");
-      }
-      if (!reconcile_own_insert(own_insert)) {
-        return abort_before_lock("range_node_version_changed");
       }
 
       resolved_si_ops.push_back({op.table_name, op.index_name,
@@ -435,7 +384,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     }
   }
 
-  // Step 7: range validation (logical key list and physical node version).
+  // Step 7: replay each range scan and compare the key lists.
   auto is_own_locked = [&](DataItem* item) {
     for (const auto& locked : locked_tids) {
       if (locked.item == item) return true;
@@ -549,8 +498,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
                primary_keys == range.result_primary_keys;
       };
 
-  for (const auto& range : reconciled_range_reads) {
-    if (range.end_key.empty()) continue;
+  for (const auto& range : range_reads) {
     const bool ok = range.index_name.empty()
                         ? validate_primary_key_list(range)
                         : validate_secondary_key_list(range);
@@ -558,28 +506,6 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
       return unlock_and_abort(range.index_name.empty()
                                   ? "primary_range_result_changed"
                                   : "secondary_range_result_changed");
-    }
-  }
-
-  // Step 7 (physical form): re-check Masstree node versions captured by
-  // earlier stateless scans.
-  std::vector<Index::NodeVersionEntry> range_versions;
-  std::unordered_set<Index::IndexBase*> range_owners;
-  range_versions.reserve(reconciled_range_reads.size());
-  for (const auto& range : reconciled_range_reads) {
-    if (!range.end_key.empty()) continue;
-    if (range.owner_ptr == 0 || range.node_ptr == 0) {
-      return unlock_and_abort("range_node_token_missing");
-    }
-    auto* owner = reinterpret_cast<Index::IndexBase*>(range.owner_ptr);
-    range_owners.insert(owner);
-    range_versions.push_back(
-        {owner, reinterpret_cast<const void*>(range.node_ptr),
-         range.version});
-  }
-  for (auto* owner : range_owners) {
-    if (!owner->ValidatePhantoms(range_versions)) {
-      return unlock_and_abort("range_node_version_changed");
     }
   }
 
