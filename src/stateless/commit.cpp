@@ -27,7 +27,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
             const std::vector<ExternalReadEntry>& reads,
             const std::vector<ExternalWriteEntry>& writes,
             const std::vector<ExternalSecondaryIndexEntry>& secondary_index_ops,
-            const std::vector<ExternalRangeValidationEntry>& range_reads,
+            const std::vector<ExternalRangeReadEntry>& range_reads,
             std::string* abort_reason) {
   // Epoch join.
   epoch_framework.MakeMeOnline();
@@ -341,7 +341,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
   };
 
   auto validate_primary_key_list =
-      [&](const ExternalRangeValidationEntry& range) {
+      [&](const ExternalRangeReadEntry& range) {
         auto table = tables.GetTable(range.table_name);
         if (!table.has_value()) return false;
 
@@ -369,7 +369,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
       };
 
   auto validate_secondary_key_list =
-      [&](const ExternalRangeValidationEntry& range) {
+      [&](const ExternalRangeReadEntry& range) {
         auto table = tables.GetTable(range.table_name);
         if (!table.has_value()) return false;
         auto* index = table.value()->GetSecondaryIndex(range.index_name);

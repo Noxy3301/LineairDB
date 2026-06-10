@@ -371,7 +371,7 @@ class Database::Impl {
       const std::vector<ExternalReadEntry>& reads,
       const std::vector<ExternalWriteEntry>& writes,
       const std::vector<ExternalSecondaryIndexEntry>& secondary_index_ops,
-      const std::vector<ExternalRangeValidationEntry>& range_reads,
+      const std::vector<ExternalRangeReadEntry>& range_reads,
       std::string* abort_reason = nullptr) {
     return Stateless::Commit(table_dictionary_, schema_mutex_,
                              epoch_framework_, reaper_, logger_, config_,

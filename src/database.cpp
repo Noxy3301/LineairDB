@@ -106,7 +106,7 @@ bool Database::ValidateAndCommit(
     const std::vector<ExternalReadEntry>& reads,
     const std::vector<ExternalWriteEntry>& writes,
     const std::vector<ExternalSecondaryIndexEntry>& secondary_index_ops,
-    const std::vector<ExternalRangeValidationEntry>& range_reads,
+    const std::vector<ExternalRangeReadEntry>& range_reads,
     std::string* abort_reason) {
   return db_pimpl_->ValidateAndCommit(reads, writes, secondary_index_ops,
                                       range_reads, abort_reason);

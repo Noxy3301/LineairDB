@@ -237,13 +237,13 @@ class Database {
       const std::vector<std::pair<std::string, std::string>>& keys);
 
   /**
-   * @brief Range-scan the primary index and return all rows together with
-   *        the validation tokens needed to revalidate the range at commit.
+   * @brief Range-scan the primary index and return the rows observed in
+   *        the range.
    *
-   * Each returned row carries its own TID. The result also includes a
-   * range token (range_versions) recording the scan bounds and the
-   * returned key list; ValidateAndCommit replays the scan and aborts the
-   * transaction when the key set changed.
+   * Each returned row carries its own TID. To revalidate the range at
+   * commit, assemble an ExternalRangeReadEntry from this call's arguments
+   * and the returned keys, and register every consumed row as an
+   * ExternalReadEntry.
    *
    * @param table_name Target table.
    * @param start_key Inclusive start of the range.
@@ -262,9 +262,10 @@ class Database {
    *
    * For every secondary key in `[start_key, end_key)`, this resolves each of
    * its primary keys, reads the base row, and reports
-   * `{secondary_key, primary_key, value, tid, found}` per result. The range
-   * token records both key lists; each base row carries its TID for
-   * revalidation as a point read.
+   * `{secondary_key, primary_key, value, tid, found}` per result. To
+   * revalidate the range at commit, assemble an ExternalRangeReadEntry from
+   * this call's arguments and both returned key lists; each base row carries
+   * its TID for revalidation as a point read.
    *
    * @param table_name Base table.
    * @param index_name Secondary index name.
@@ -297,7 +298,8 @@ class Database {
    * @param reads Point reads to revalidate before commit.
    * @param writes Row writes (`is_delete == true` to remove the row).
    * @param secondary_index_ops Secondary-index adds/removes to install.
-   * @param range_reads Range validation tokens collected by earlier scans.
+   * @param range_reads Range reads assembled by the caller from earlier
+   *                    scans.
    * @param abort_reason Optional out parameter. Set only when the function
    *                    returns false.
    * @return true on commit; false on validation failure or schema mismatch.
@@ -306,7 +308,7 @@ class Database {
       const std::vector<ExternalReadEntry>& reads,
       const std::vector<ExternalWriteEntry>& writes,
       const std::vector<ExternalSecondaryIndexEntry>& secondary_index_ops,
-      const std::vector<ExternalRangeValidationEntry>& range_reads = {},
+      const std::vector<ExternalRangeReadEntry>& range_reads = {},
       std::string* abort_reason = nullptr);
 
   class Impl;

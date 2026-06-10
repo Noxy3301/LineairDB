@@ -50,14 +50,13 @@ std::vector<StatelessReadResult> BatchRead(
     const std::vector<std::pair<std::string, std::string>>& keys);
 
 /**
- * @brief Range-scan the primary index and return rows plus the range
- *        token for commit-time revalidation.
+ * @brief Range-scan the primary index and return the rows observed in
+ *        the range.
  *
  * Drives Index::Scan / Index::ScanReverse with a callback that, for each
- * hit, performs the same double-TID read used by Read. The scan bounds
- * and the returned key list are recorded as one
- * ExternalRangeValidationEntry; ValidateAndCommit replays the scan and
- * aborts when the key set changed. Tombstones are skipped: key-list
+ * hit, performs the same double-TID read used by Read. The caller
+ * assembles the commit-time ExternalRangeReadEntry from its own scan
+ * arguments and the returned keys. Tombstones are skipped: key-list
  * validation catches any reuse of their slots without a per-entry TID.
  *
  * `ok` distinguishes a genuine empty result from a Masstree retry that
@@ -76,10 +75,9 @@ StatelessRangeScanResult RangeScan(TableDictionary& tables,
  *
  * For every secondary key in `[start_key, end_key)`, looks up its
  * `primary_keys()` and, for each one, performs the same double-TID base
- * read as Read. The range token records both the secondary keys and
- * their paired primary keys; ValidateAndCommit replays the scan and
- * aborts when either list changed. `ok == false` is the abort signal,
- * as in RangeScan.
+ * read as Read. The caller assembles the commit-time
+ * ExternalRangeReadEntry from its own scan arguments and both returned
+ * key lists. `ok == false` is the abort signal, as in RangeScan.
  */
 StatelessSecondaryRangeScanResult SecondaryRangeScan(
     TableDictionary& tables, std::shared_mutex& schema_mutex,

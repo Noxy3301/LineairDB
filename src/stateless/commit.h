@@ -76,7 +76,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
             const std::vector<ExternalReadEntry>& reads,
             const std::vector<ExternalWriteEntry>& writes,
             const std::vector<ExternalSecondaryIndexEntry>& secondary_index_ops,
-            const std::vector<ExternalRangeValidationEntry>& range_reads,
+            const std::vector<ExternalRangeReadEntry>& range_reads,
             std::string* abort_reason);
 
 }  // namespace Stateless

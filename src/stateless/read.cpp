@@ -79,21 +79,7 @@ StatelessRangeScanResult RangeScan(TableDictionary& tables,
                 start_key, end_key, append_scan_entry);
   if (!scan_result.has_value()) {
     result.rows.clear();
-    result.range_versions.clear();
-    return result;
   }
-
-  ExternalRangeValidationEntry logical_range;
-  logical_range.table_name = std::string(table_name);
-  logical_range.start_key = std::string(start_key);
-  logical_range.end_key = std::string(end_key);
-  logical_range.row_limit = row_limit;
-  logical_range.reverse_scan = reverse_scan;
-  logical_range.result_keys.reserve(result.rows.size());
-  for (const auto& row : result.rows) {
-    logical_range.result_keys.push_back(row.key);
-  }
-  result.range_versions.push_back(std::move(logical_range));
   return result;
 }
 
@@ -151,24 +137,7 @@ StatelessSecondaryRangeScanResult SecondaryRangeScan(
           : index->Scan(start_key, end_key, append_secondary_entry);
   if (!scan_result.has_value()) {
     result.rows.clear();
-    result.range_versions.clear();
-    return result;
   }
-
-  ExternalRangeValidationEntry logical_range;
-  logical_range.table_name = std::string(table_name);
-  logical_range.index_name = std::string(index_name);
-  logical_range.start_key = std::string(start_key);
-  logical_range.end_key = std::string(end_key);
-  logical_range.row_limit = row_limit;
-  logical_range.reverse_scan = reverse_scan;
-  logical_range.result_keys.reserve(result.rows.size());
-  logical_range.result_primary_keys.reserve(result.rows.size());
-  for (const auto& row : result.rows) {
-    logical_range.result_keys.push_back(row.secondary_key);
-    logical_range.result_primary_keys.push_back(row.primary_key);
-  }
-  result.range_versions.push_back(std::move(logical_range));
   return result;
 }
 
