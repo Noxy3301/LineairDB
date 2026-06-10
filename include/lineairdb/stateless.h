@@ -12,11 +12,12 @@ namespace LineairDB {
 ///
 /// The conventional Transaction path stores its read set, write set, and
 /// node-version set on a per-thread workspace inside LineairDB. The stateless
-/// API does not: each call returns the snapshot (value, packed TID, observed
-/// Masstree node versions) to the caller. The caller keeps those snapshots
-/// across independent RPCs and resubmits them through Database::ValidateAndCommit
-/// when the logical transaction is ready to commit. Because no state is
-/// retained on the database side, calls can be spread across any thread.
+/// API does not: each call returns its observations by value (row value,
+/// packed TID, scanned key list) to the caller. The caller carries them
+/// across independent RPCs and resubmits them through
+/// Database::ValidateAndCommit when the logical transaction is ready to
+/// commit. Because no state is retained on the database side, calls can be
+/// spread across any thread.
 
 /// Outcome of a single Database::StatelessRead.
 ///
@@ -51,44 +52,20 @@ struct StatelessSecondaryScanRow {
 
 /// Token used to revalidate a range observed by a stateless scan.
 ///
-/// One struct carries either of two forms:
-///   - **Physical** (Masstree node version): `owner_ptr`, `node_ptr`, and
-///     `version` are set, and `end_key` is empty. ValidateAndCommit replays
-///     this through `ValidatePhantoms` to detect concurrent structural change
-///     of the leaf.
-///   - **Logical** (key list): `start_key`, `end_key`, `row_limit`,
-///     `reverse_scan`, and `result_keys` (plus `result_primary_keys` on a
-///     secondary index) are set. ValidateAndCommit re-runs the scan and
-///     asserts the result set is unchanged.
-///
-/// The current implementation always emits the physical form. The logical
-/// fields are reserved for a future switch.
+/// ValidateAndCommit re-runs the scan described by `start_key`, `end_key`,
+/// `row_limit`, and `reverse_scan`, and asserts that the observed key set
+/// (`result_keys`, plus `result_primary_keys` on a secondary index) is
+/// unchanged. Row TIDs are not part of this token; rows read from the range
+/// are revalidated through their ExternalReadEntry records.
 struct ExternalRangeValidationEntry {
   std::string table_name;
   std::string index_name;   ///< Empty marks a primary-index range.
-  uint64_t owner_ptr = 0;   ///< Physical: pointer to the IndexBase that owns the node.
-  uint64_t node_ptr = 0;    ///< Physical: pointer to the Masstree node observed.
-  uint64_t version = 0;     ///< Physical: node version captured at scan time.
-  std::string start_key;    ///< Logical: scan start (inclusive).
-  std::string end_key;      ///< Logical: scan end. Empty distinguishes the physical form.
-  uint64_t row_limit = 0;   ///< Logical: row cap applied during scan.
-  bool reverse_scan = false;///< Logical: scan direction.
-  std::vector<std::string> result_keys;          ///< Logical: observed key set.
-  std::vector<std::string> result_primary_keys;  ///< Logical (secondary): paired primary keys.
-};
-
-/// Token for a single exact index entry observed during a stateless scan.
-///
-/// Tombstones in the primary index and slots in a secondary index both fit
-/// here. ValidateAndCommit rechecks the entry's TID after locking writes,
-/// so a concurrent install over a tombstone or a rewrite of an SI slot is
-/// turned into an abort at commit time.
-struct ExternalIndexValidationEntry {
-  std::string table_name;
-  std::string index_name;   ///< Empty marks a primary-index entry such as a tombstone.
-  std::string key;
-  uint64_t tid = 0;         ///< Packed version observed at scan time.
-  bool found = false;
+  std::string start_key;    ///< Scan start (inclusive).
+  std::string end_key;      ///< Scan end (exclusive). Must be non-empty.
+  uint64_t row_limit = 0;   ///< Row cap applied during scan.
+  bool reverse_scan = false;///< Scan direction.
+  std::vector<std::string> result_keys;          ///< Observed key set.
+  std::vector<std::string> result_primary_keys;  ///< Secondary index: paired primary keys.
 };
 
 /// Outcome of Database::StatelessRangeScan.
@@ -100,7 +77,6 @@ struct StatelessRangeScanResult {
   bool ok = false;
   std::vector<StatelessScanRow> rows;
   std::vector<ExternalRangeValidationEntry> range_versions;
-  std::vector<ExternalIndexValidationEntry> index_reads;
 };
 
 /// Outcome of Database::StatelessSecondaryRangeScan.
@@ -108,7 +84,6 @@ struct StatelessSecondaryRangeScanResult {
   bool ok = false;
   std::vector<StatelessSecondaryScanRow> rows;
   std::vector<ExternalRangeValidationEntry> range_versions;
-  std::vector<ExternalIndexValidationEntry> index_reads;
 };
 
 /// Caller-supplied record of a point read that ValidateAndCommit will

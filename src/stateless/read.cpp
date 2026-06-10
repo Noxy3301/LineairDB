@@ -52,10 +52,6 @@ StatelessRangeScanResult RangeScan(TableDictionary& tables,
   if (!table.has_value()) return result;
   result.ok = true;
 
-  // Commit re-walks the range and compares key lists, so we do not
-  // ship masstree node pointers that RCU can free between RPCs.
-  const bool use_logical_validation = true;
-  std::vector<Index::NodeVersionEntry> versions;
   uint64_t returned_rows = 0;
 
   auto append_scan_entry = [&](std::string_view key, DataItem&) {
@@ -78,41 +74,26 @@ StatelessRangeScanResult RangeScan(TableDictionary& tables,
   auto scan_result =
       reverse_scan
           ? table.value()->GetPrimaryIndex().ScanReverse(
-                start_key, end_key, append_scan_entry,
-                use_logical_validation ? nullptr : &versions)
+                start_key, end_key, append_scan_entry)
           : table.value()->GetPrimaryIndex().Scan(
-                start_key, end_key, append_scan_entry,
-                use_logical_validation ? nullptr : &versions);
+                start_key, end_key, append_scan_entry);
   if (!scan_result.has_value()) {
     result.rows.clear();
     result.range_versions.clear();
-    result.index_reads.clear();
     return result;
   }
 
-  if (use_logical_validation) {
-    ExternalRangeValidationEntry logical_range;
-    logical_range.table_name = std::string(table_name);
-    logical_range.start_key = std::string(start_key);
-    logical_range.end_key = std::string(end_key);
-    logical_range.row_limit = row_limit;
-    logical_range.reverse_scan = reverse_scan;
-    logical_range.result_keys.reserve(result.rows.size());
-    for (const auto& row : result.rows) {
-      logical_range.result_keys.push_back(row.key);
-    }
-    result.range_versions.push_back(std::move(logical_range));
-  } else {
-    result.range_versions.reserve(versions.size());
-    for (const auto& version : versions) {
-      ExternalRangeValidationEntry entry;
-      entry.table_name = std::string(table_name);
-      entry.owner_ptr = reinterpret_cast<uint64_t>(version.owner);
-      entry.node_ptr = reinterpret_cast<uint64_t>(version.node_ptr);
-      entry.version = version.version;
-      result.range_versions.push_back(std::move(entry));
-    }
+  ExternalRangeValidationEntry logical_range;
+  logical_range.table_name = std::string(table_name);
+  logical_range.start_key = std::string(start_key);
+  logical_range.end_key = std::string(end_key);
+  logical_range.row_limit = row_limit;
+  logical_range.reverse_scan = reverse_scan;
+  logical_range.result_keys.reserve(result.rows.size());
+  for (const auto& row : result.rows) {
+    logical_range.result_keys.push_back(row.key);
   }
+  result.range_versions.push_back(std::move(logical_range));
   return result;
 }
 
@@ -132,9 +113,6 @@ StatelessSecondaryRangeScanResult SecondaryRangeScan(
   if (index == nullptr) return result;
   result.ok = true;
 
-  // Same rationale as RangeScan above.
-  const bool use_logical_validation = true;
-  std::vector<Index::NodeVersionEntry> versions;
   uint64_t returned_rows = 0;
 
   auto snapshot_base_row = [&](const std::string& secondary_key,
@@ -157,21 +135,10 @@ StatelessSecondaryRangeScanResult SecondaryRangeScan(
     const std::string secondary_key(key);
     DataItem* item = index->Get(key);
     if (item == nullptr) {
-      if (!use_logical_validation) {
-        result.index_reads.push_back({std::string(table_name),
-                                      std::string(index_name), secondary_key,
-                                      0, false});
-      }
       return false;
     }
 
     auto slot = ConcurrencyControl::StableReadPrimaryKeys(*item);
-    if (!use_logical_validation) {
-      result.index_reads.push_back(
-          {std::string(table_name), std::string(index_name), secondary_key,
-           PackTransactionId(slot.tid), slot.found});
-    }
-
     for (const auto& primary_key : slot.primary_keys) {
       if (snapshot_base_row(secondary_key, primary_key)) return true;
     }
@@ -180,44 +147,28 @@ StatelessSecondaryRangeScanResult SecondaryRangeScan(
 
   auto scan_result =
       reverse_scan
-          ? index->ScanReverse(start_key, end_key, append_secondary_entry,
-                               use_logical_validation ? nullptr : &versions)
-          : index->Scan(start_key, end_key, append_secondary_entry,
-                        use_logical_validation ? nullptr : &versions);
+          ? index->ScanReverse(start_key, end_key, append_secondary_entry)
+          : index->Scan(start_key, end_key, append_secondary_entry);
   if (!scan_result.has_value()) {
     result.rows.clear();
     result.range_versions.clear();
-    result.index_reads.clear();
     return result;
   }
 
-  if (use_logical_validation) {
-    ExternalRangeValidationEntry logical_range;
-    logical_range.table_name = std::string(table_name);
-    logical_range.index_name = std::string(index_name);
-    logical_range.start_key = std::string(start_key);
-    logical_range.end_key = std::string(end_key);
-    logical_range.row_limit = row_limit;
-    logical_range.reverse_scan = reverse_scan;
-    logical_range.result_keys.reserve(result.rows.size());
-    logical_range.result_primary_keys.reserve(result.rows.size());
-    for (const auto& row : result.rows) {
-      logical_range.result_keys.push_back(row.secondary_key);
-      logical_range.result_primary_keys.push_back(row.primary_key);
-    }
-    result.range_versions.push_back(std::move(logical_range));
-  } else {
-    result.range_versions.reserve(versions.size());
-    for (const auto& version : versions) {
-      ExternalRangeValidationEntry entry;
-      entry.table_name = std::string(table_name);
-      entry.index_name = std::string(index_name);
-      entry.owner_ptr = reinterpret_cast<uint64_t>(version.owner);
-      entry.node_ptr = reinterpret_cast<uint64_t>(version.node_ptr);
-      entry.version = version.version;
-      result.range_versions.push_back(std::move(entry));
-    }
+  ExternalRangeValidationEntry logical_range;
+  logical_range.table_name = std::string(table_name);
+  logical_range.index_name = std::string(index_name);
+  logical_range.start_key = std::string(start_key);
+  logical_range.end_key = std::string(end_key);
+  logical_range.row_limit = row_limit;
+  logical_range.reverse_scan = reverse_scan;
+  logical_range.result_keys.reserve(result.rows.size());
+  logical_range.result_primary_keys.reserve(result.rows.size());
+  for (const auto& row : result.rows) {
+    logical_range.result_keys.push_back(row.secondary_key);
+    logical_range.result_primary_keys.push_back(row.primary_key);
   }
+  result.range_versions.push_back(std::move(logical_range));
   return result;
 }
 

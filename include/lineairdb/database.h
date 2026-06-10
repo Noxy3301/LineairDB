@@ -240,11 +240,10 @@ class Database {
    * @brief Range-scan the primary index and return all rows together with
    *        the validation tokens needed to revalidate the range at commit.
    *
-   * Each returned row carries its own TID. The result also includes the
-   * Masstree node versions touched by the scan (range_versions) and any
-   * exact tombstone entries (index_reads), so a concurrent insert that
-   * reuses a tombstone slot or splits a leaf is detected by
-   * ValidateAndCommit.
+   * Each returned row carries its own TID. The result also includes a
+   * range token (range_versions) recording the scan bounds and the
+   * returned key list; ValidateAndCommit replays the scan and aborts the
+   * transaction when the key set changed.
    *
    * @param table_name Target table.
    * @param start_key Inclusive start of the range.
@@ -263,8 +262,9 @@ class Database {
    *
    * For every secondary key in `[start_key, end_key)`, this resolves each of
    * its primary keys, reads the base row, and reports
-   * `{secondary_key, primary_key, value, tid, found}` per result. Validation
-   * tokens cover both the secondary index range and each base-row read.
+   * `{secondary_key, primary_key, value, tid, found}` per result. The range
+   * token records both key lists; each base row carries its TID for
+   * revalidation as a point read.
    *
    * @param table_name Base table.
    * @param index_name Secondary index name.
@@ -281,27 +281,23 @@ class Database {
       uint64_t row_limit, bool reverse_scan);
 
   /**
-   * @brief Validate a caller-collected snapshot and install its writes
-   *        atomically.
+   * @brief Validate caller-supplied read and write sets and install the
+   *        writes atomically.
    *
-   * Runs the Silo commit phase against external inputs:
-   *   1. Resolve each read/write/SI op to its DataItem.
-   *   2. Lock every write target.
-   *   3. Re-check `reads` and `index_reads` TIDs against the locked state.
-   *   4. Re-check `range_reads` either by Masstree node version
-   *      (physical form) or by replaying the scan (logical form).
-   *   5. Re-check UNIQUE secondary-index adds against the locked SI slots.
-   *   6. Install writes, append the log set, and unlock with a new TID.
+   * Runs the Silo commit protocol against external inputs: resolve each
+   * key to its record, lock the write set, validate the reads (point
+   * TIDs, range replays, UNIQUE rechecks), then install the writes,
+   * append the log set, and unlock with a new TID. The full contract
+   * lives with Stateless::Commit.
    *
    * Aborts return false. The optional `abort_reason` is set to a short
    * machine-readable label such as `exact_read_tid_moved`,
-   * `range_node_version_changed`, or `unique_si_exists_after_lock`.
+   * `primary_range_result_changed`, or `unique_si_exists_after_lock`.
    *
    * @param reads Point reads to revalidate before commit.
    * @param writes Row writes (`is_delete == true` to remove the row).
    * @param secondary_index_ops Secondary-index adds/removes to install.
    * @param range_reads Range validation tokens collected by earlier scans.
-   * @param index_reads Exact-key tokens collected alongside scans.
    * @param abort_reason Optional out parameter. Set only when the function
    *                    returns false.
    * @return true on commit; false on validation failure or schema mismatch.
@@ -311,7 +307,6 @@ class Database {
       const std::vector<ExternalWriteEntry>& writes,
       const std::vector<ExternalSecondaryIndexEntry>& secondary_index_ops,
       const std::vector<ExternalRangeValidationEntry>& range_reads = {},
-      const std::vector<ExternalIndexValidationEntry>& index_reads = {},
       std::string* abort_reason = nullptr);
 
   class Impl;

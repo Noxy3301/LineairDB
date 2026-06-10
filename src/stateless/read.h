@@ -50,17 +50,15 @@ std::vector<StatelessReadResult> BatchRead(
     const std::vector<std::pair<std::string, std::string>>& keys);
 
 /**
- * @brief Range-scan the primary index and return rows plus validation
- *        tokens.
+ * @brief Range-scan the primary index and return rows plus the range
+ *        token for commit-time revalidation.
  *
  * Drives Index::Scan / Index::ScanReverse with a callback that, for each
- * hit, performs the same double-TID read used by Read. The Masstree scan
- * also fills a `NodeVersionEntry` vector covering every touched leaf;
- * those are returned as `range_versions` so ValidateAndCommit can run
- * `ValidatePhantoms` later. Tombstones encountered during the scan are
- * recorded as exact-key entries in `index_reads`, because a node-version
- * check alone misses a tombstone slot being reused without a tree-shape
- * change.
+ * hit, performs the same double-TID read used by Read. The scan bounds
+ * and the returned key list are recorded as one
+ * ExternalRangeValidationEntry; ValidateAndCommit replays the scan and
+ * aborts when the key set changed. Tombstones are skipped: key-list
+ * validation catches any reuse of their slots without a per-entry TID.
  *
  * `ok` distinguishes a genuine empty result from a Masstree retry that
  * gave up. Callers should treat `!ok` as an abort signal.
@@ -78,10 +76,10 @@ StatelessRangeScanResult RangeScan(TableDictionary& tables,
  *
  * For every secondary key in `[start_key, end_key)`, looks up its
  * `primary_keys()` and, for each one, performs the same double-TID base
- * read as Read. Each secondary slot's TID is also captured as an
- * `ExternalIndexValidationEntry` so SI rewrites at commit time are caught.
- * Like RangeScan, the Masstree-side node versions feed `range_versions`
- * for phantom validation, and `ok == false` is the abort signal.
+ * read as Read. The range token records both the secondary keys and
+ * their paired primary keys; ValidateAndCommit replays the scan and
+ * aborts when either list changed. `ok == false` is the abort signal,
+ * as in RangeScan.
  */
 StatelessSecondaryRangeScanResult SecondaryRangeScan(
     TableDictionary& tables, std::shared_mutex& schema_mutex,

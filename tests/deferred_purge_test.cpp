@@ -32,7 +32,7 @@ LineairDB::Config MakeConfig(size_t epoch_duration_ms) {
 bool CommitWrite(LineairDB::Database& db, const std::string& key,
                  const std::string& value, std::string* reason = nullptr) {
   const bool committed = db.ValidateAndCommit(
-      {}, {{kTable, key, value, false}}, {}, {}, {}, reason);
+      {}, {{kTable, key, value, false}}, {}, {}, reason);
   db.ReleaseMasstreeThreadEpoch();
   return committed;
 }
@@ -40,7 +40,7 @@ bool CommitWrite(LineairDB::Database& db, const std::string& key,
 bool CommitDelete(LineairDB::Database& db, const std::string& key,
                   std::string* reason = nullptr) {
   const bool committed = db.ValidateAndCommit(
-      {}, {{kTable, key, "", true}}, {}, {}, {}, reason);
+      {}, {{kTable, key, "", true}}, {}, {}, reason);
   db.ReleaseMasstreeThreadEpoch();
   return committed;
 }
@@ -56,7 +56,7 @@ bool ValidateRead(LineairDB::Database& db,
                   const LineairDB::StatelessReadResult& read,
                   const std::string& key, std::string* reason) {
   const bool committed = db.ValidateAndCommit(
-      {{kTable, key, read.tid, read.found}}, {}, {}, {}, {}, reason);
+      {{kTable, key, read.tid, read.found}}, {}, {}, {}, reason);
   db.ReleaseMasstreeThreadEpoch();
   return committed;
 }

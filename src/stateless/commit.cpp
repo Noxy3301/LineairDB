@@ -28,7 +28,6 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
             const std::vector<ExternalWriteEntry>& writes,
             const std::vector<ExternalSecondaryIndexEntry>& secondary_index_ops,
             const std::vector<ExternalRangeValidationEntry>& range_reads,
-            const std::vector<ExternalIndexValidationEntry>& index_reads,
             std::string* abort_reason) {
   // Epoch join.
   epoch_framework.MakeMeOnline();
@@ -80,15 +79,11 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     return false;
   };
 
-  // Validation is logical-only: a range entry with an empty end_key is a
-  // physical node-version token and index_reads carry physical exact-key
-  // entries; both are unsupported and abort instead of being skipped.
-  if (!index_reads.empty()) {
-    return abort_before_lock("index_reads_unsupported");
-  }
+  // A range entry without its exclusive end bound cannot be replayed;
+  // abort instead of skipping the validation.
   for (const auto& range : range_reads) {
     if (range.end_key.empty()) {
-      return abort_before_lock("physical_range_token_unsupported");
+      return abort_before_lock("range_end_key_missing");
     }
   }
 

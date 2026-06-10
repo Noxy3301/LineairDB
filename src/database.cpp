@@ -107,11 +107,9 @@ bool Database::ValidateAndCommit(
     const std::vector<ExternalWriteEntry>& writes,
     const std::vector<ExternalSecondaryIndexEntry>& secondary_index_ops,
     const std::vector<ExternalRangeValidationEntry>& range_reads,
-    const std::vector<ExternalIndexValidationEntry>& index_reads,
     std::string* abort_reason) {
   return db_pimpl_->ValidateAndCommit(reads, writes, secondary_index_ops,
-                                      range_reads, index_reads,
-                                      abort_reason);
+                                      range_reads, abort_reason);
 }
 
 }  // namespace LineairDB

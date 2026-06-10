@@ -372,12 +372,11 @@ class Database::Impl {
       const std::vector<ExternalWriteEntry>& writes,
       const std::vector<ExternalSecondaryIndexEntry>& secondary_index_ops,
       const std::vector<ExternalRangeValidationEntry>& range_reads,
-      const std::vector<ExternalIndexValidationEntry>& index_reads,
       std::string* abort_reason = nullptr) {
     return Stateless::Commit(table_dictionary_, schema_mutex_,
                              epoch_framework_, reaper_, logger_, config_,
                              reads, writes, secondary_index_ops, range_reads,
-                             index_reads, abort_reason);
+                             abort_reason);
   }
 
   std::optional<Table*> GetTable(const std::string_view table_name) {
