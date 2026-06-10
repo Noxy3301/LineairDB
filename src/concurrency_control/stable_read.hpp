@@ -67,7 +67,6 @@ inline StableValue StableReadValue(const DataItem& item) {
  * `found` is false when the slot is uninitialized or the list is empty.
  */
 inline StablePrimaryKeys StableReadPrimaryKeys(const DataItem& item) {
-  std::vector<std::string> primary_keys;
   for (;;) {
     TransactionId tid = item.transaction_id.load();
     if (tid.tid & 1u) {
@@ -76,6 +75,7 @@ inline StablePrimaryKeys StableReadPrimaryKeys(const DataItem& item) {
     }
 
     const bool found = item.IsInitialized() && !item.primary_keys().empty();
+    std::vector<std::string> primary_keys;
     if (found) primary_keys = item.primary_keys();
 
     if (item.transaction_id.load() == tid) {
