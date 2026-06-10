@@ -92,9 +92,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
 
   struct ValidationEntry {
     Table* table = nullptr;
-    Index::SecondaryIndex* index = nullptr;
     std::string table_name;
-    std::string index_name;
     std::string key;
     DataItem* item = nullptr;
     TransactionId captured_tid;
@@ -166,9 +164,8 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
       }
 
       DataItem* item = table.value()->GetPrimaryIndex().Get(read.key);
-      validation_entries.push_back({table.value(), nullptr,
-                                    read.table_name, "", read.key, item,
-                                    UnpackTransactionId(read.tid),
+      validation_entries.push_back({table.value(), read.table_name, read.key,
+                                    item, UnpackTransactionId(read.tid),
                                     read.found});
     }
 
@@ -319,28 +316,20 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     std::string out(reason);
     out += ':';
     out += read.table_name;
-    if (!read.index_name.empty()) {
-      out += ':';
-      out += read.index_name;
-    }
     out += ":key=";
     out += key_hex(read.key);
     return out;
   };
 
   for (const auto& read : validation_entries) {
-    DataItem* item = read.index == nullptr
-                         ? read.table->GetPrimaryIndex().Get(read.key)
-                         : read.index->Get(read.key);
+    DataItem* item = read.table->GetPrimaryIndex().Get(read.key);
     if (item == nullptr) {
       // A read observed as present must still resolve at validation
       // time. An unresolvable key here means a committed delete purged
       // the slot after the read, which is a serializability conflict.
       if (read.found) {
-        return unlock_and_abort(exact_read_reason(
-            read.index_name.empty() ? "exact_read_disappeared"
-                                    : "index_read_disappeared",
-            read));
+        return unlock_and_abort(
+            exact_read_reason("exact_read_disappeared", read));
       }
       continue;
     }
@@ -349,10 +338,8 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
       if (!item->IsInitialized()) {
         continue;
       }
-      return unlock_and_abort(exact_read_reason(
-          read.index_name.empty() ? "exact_read_appeared"
-                                  : "index_read_appeared",
-          read));
+      return unlock_and_abort(
+          exact_read_reason("exact_read_appeared", read));
     }
 
     TransactionId expected = read.captured_tid;
@@ -360,10 +347,8 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
       if (locked.item == item) {
         if (locked.before_lock.epoch != read.captured_tid.epoch ||
             locked.before_lock.tid != read.captured_tid.tid) {
-          return unlock_and_abort(exact_read_reason(
-              read.index_name.empty() ? "exact_read_tid_moved"
-                                      : "index_read_tid_moved",
-              read));
+          return unlock_and_abort(
+              exact_read_reason("exact_read_tid_moved", read));
         }
         expected = locked.locked;
         break;
@@ -371,16 +356,12 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     }
 
     if (item->transaction_id.load() != expected) {
-      return unlock_and_abort(exact_read_reason(
-          read.index_name.empty() ? "exact_read_tid_moved"
-                                  : "index_read_tid_moved",
-          read));
+      return unlock_and_abort(
+          exact_read_reason("exact_read_tid_moved", read));
     }
     if (read.found && !item->IsInitialized()) {
-      return unlock_and_abort(exact_read_reason(
-          read.index_name.empty() ? "exact_read_deleted"
-                                  : "index_read_deleted",
-          read));
+      return unlock_and_abort(
+          exact_read_reason("exact_read_deleted", read));
     }
   }
 
