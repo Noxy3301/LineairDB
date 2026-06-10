@@ -34,6 +34,7 @@ struct TransactionReferences {
   WriteSetType& write_set_ref_;
   EpochFramework& epoch_framework_ref_;
   TxStatus& current_status_ref_;
+  std::function<void(const Snapshot&, TransactionId)> register_deferred_purge_;
 };
 class ConcurrencyControlBase {
  public:

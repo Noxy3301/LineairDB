@@ -72,8 +72,9 @@ class SecondaryIndex {
     return secondary_index_->Delete(key);
   }
 
-  bool Purge(std::string_view key, DataItem* expected) {
-    return secondary_index_->Purge(key, expected);
+  bool Purge(std::string_view key, DataItem* expected,
+             TransactionId retired_tid = {}) {
+    return secondary_index_->Purge(key, expected, retired_tid);
   }
 
   void ForEach(std::function<bool(std::string_view, DataItem&)> f) {

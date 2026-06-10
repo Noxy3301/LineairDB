@@ -67,8 +67,9 @@ class ConcurrentTable {
 
   bool Delete(const std::string_view key);
 
-  bool Purge(std::string_view key, DataItem* expected) {
-    return index_->Purge(key, expected);
+  bool Purge(std::string_view key, DataItem* expected,
+             TransactionId retired_tid = {}) {
+    return index_->Purge(key, expected, retired_tid);
   }
 
   void WaitForIndexIsLinearizable();

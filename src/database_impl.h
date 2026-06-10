@@ -29,6 +29,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -55,6 +56,18 @@
 namespace LineairDB {
 class Database::Impl {
   friend class Transaction::Impl;
+
+ private:
+  enum class DeferredPurgeIndexKind { Primary, Secondary };
+
+  struct DeferredPurgeCandidate {
+    DeferredPurgeIndexKind kind;
+    Index::ConcurrentTable* primary_index = nullptr;
+    Index::SecondaryIndex* secondary_index = nullptr;
+    std::string key;
+    DataItem* item = nullptr;
+    TransactionId delete_commit_tid;
+  };
 
  public:
   inline static Database::Impl* CurrentDBInstance;
@@ -291,6 +304,7 @@ class Database::Impl {
       // DataItem* limbo once min_active_epoch() catches up. Workers
       // release their epoch at tx/RPC boundaries via
       // ReleaseMasstreeThreadEpoch; we only move the watermark here.
+      ReapDeferredPurges(old_epoch);
       Index::MasstreeAdvanceEpoch();
 
       if (config_.enable_checkpointing) {
@@ -685,17 +699,17 @@ class Database::Impl {
    *        waiting on the write lock. Failure aborts with
    *        `unique_si_exists_after_lock`.
    *   9. Install
-   *        Purge then `DataItem::Reset` for deletes, then apply SI
-   *        add/remove via `AddSecondaryIndexValue` /
-   *        `RemoveSecondaryIndexValue`. SI entries are Purged when their
-   *        post-tx primary_keys list is empty.
+   *        `DataItem::Reset` for deletes, then apply SI add/remove via
+   *        `AddSecondaryIndexValue` / `RemoveSecondaryIndexValue`. Empty
+   *        primary and SI slots stay in the tree as tombstones.
    *  10. Log snapshot
    *        capture the post-install snapshot before unlock so a later
    *        transaction cannot overwrite the values we just logged. Only
    *        when logging is enabled.
    *  11. Unlock
    *        rewrite each item's TID. Carry the epoch forward when the
-   *        captured TID is from an earlier epoch.
+   *        captured TID is from an earlier epoch, then register tombstones
+   *        for later physical purge using the published unlocked TID.
    *  12. Log enqueue
    *        push the log set into `logger_`, then call `MakeMeOffline`.
    *
@@ -731,6 +745,7 @@ class Database::Impl {
       std::string value;
       bool is_delete = false;
       DataItem* item = nullptr;
+      Index::ConcurrentTable* index = nullptr;
     };
     struct ResolvedSecondaryIndexOp {
       std::string table_name;
@@ -742,11 +757,18 @@ class Database::Impl {
       Index::SecondaryIndex* index = nullptr;
       Index::SecondaryIndexType index_type;
     };
+    struct LockTarget {
+      DataItem* item = nullptr;
+      Index::ConcurrentTable* primary_index = nullptr;
+      Index::SecondaryIndex* secondary_index = nullptr;
+      std::string key;
+    };
 
     std::vector<ValidationEntry> validation_entries;
     std::vector<ResolvedWrite> resolved_writes;
     std::vector<ResolvedSecondaryIndexOp> resolved_si_ops;
     std::vector<DataItem*> lock_items;
+    std::vector<LockTarget> lock_targets;
     std::unordered_set<std::string> unique_si_adds;
     auto reconciled_range_reads = range_reads;
 
@@ -849,9 +871,11 @@ class Database::Impl {
           return abort_before_lock("range_node_version_changed");
         }
 
+        auto* primary_index = &table.value()->GetPrimaryIndex();
         resolved_writes.push_back({write.table_name, write.key, write.value,
-                                   write.is_delete, item});
+                                   write.is_delete, item, primary_index});
         lock_items.push_back(item);
+        lock_targets.push_back({item, primary_index, nullptr, write.key});
       }
 
       // Resolve secondary-index updates to the secondary-index entries to lock
@@ -896,6 +920,7 @@ class Database::Impl {
                                    op.is_delete, item, index,
                                    index->GetIndexType()});
         lock_items.push_back(item);
+        lock_targets.push_back({item, nullptr, index, op.secondary_key});
       }
     }
 
@@ -915,15 +940,31 @@ class Database::Impl {
 
     auto unlock_and_abort = [&](const std::string& reason) {
       if (abort_reason != nullptr) *abort_reason = reason;
-      for (auto* item : lock_items) {
-        TransactionId current = item->transaction_id.load();
+      for (auto& locked : locked_tids) {
+        TransactionId current = locked.item->transaction_id.load();
         if (current.tid & 1u) {
           current.tid--;
-          item->transaction_id.store(current);
+          locked.item->transaction_id.store(current);
         }
       }
       epoch_framework_.MakeMeOffline();
       return false;
+    };
+
+    auto lock_target_attached = [&](DataItem* item) {
+      for (const auto& target : lock_targets) {
+        if (target.item != item) continue;
+        DataItem* current = nullptr;
+        if (target.primary_index != nullptr) {
+          current = target.primary_index->Get(target.key);
+        } else if (target.secondary_index != nullptr) {
+          current = target.secondary_index->Get(target.key);
+        } else {
+          continue;
+        }
+        if (current != item) return false;
+      }
+      return true;
     };
 
     // Lock loop: spin until the LSB CAS lands.
@@ -938,6 +979,9 @@ class Database::Impl {
         locked.tid |= 1u;
         if (item->transaction_id.compare_exchange_weak(current, locked)) {
           locked_tids.push_back({item, current, locked});
+          if (!lock_target_attached(item)) {
+            return unlock_and_abort("write_target_detached");
+          }
           break;
         }
       }
@@ -974,24 +1018,26 @@ class Database::Impl {
     };
 
     for (const auto& read : validation_entries) {
-      DataItem* item = read.item;
+      DataItem* item = read.index == nullptr
+                           ? read.table->GetPrimaryIndex().Get(read.key)
+                           : read.index->Get(read.key);
       if (item == nullptr) {
-        item = read.index == nullptr
-                   ? read.table->GetPrimaryIndex().Get(read.key)
-                   : read.index->Get(read.key);
-        if (item == nullptr) {
-          // A read observed as present must still resolve at validation
-          // time. An unresolvable key here means a committed delete purged
-          // the slot after the read, which is a serializability conflict.
-          if (read.found) {
-            return unlock_and_abort(exact_read_reason(
-                read.index_name.empty() ? "exact_read_disappeared"
-                                        : "index_read_disappeared",
-                read));
-          }
+        // A read observed as present must still resolve at validation
+        // time. An unresolvable key here means a committed delete purged
+        // the slot after the read, which is a serializability conflict.
+        if (read.found) {
+          return unlock_and_abort(exact_read_reason(
+              read.index_name.empty() ? "exact_read_disappeared"
+                                      : "index_read_disappeared",
+              read));
+        }
+        continue;
+      }
+
+      if (!read.found) {
+        if (!item->IsInitialized()) {
           continue;
         }
-        if (!item->IsInitialized() && !read.found) continue;
         return unlock_and_abort(exact_read_reason(
             read.index_name.empty() ? "exact_read_appeared"
                                     : "index_read_appeared",
@@ -1203,16 +1249,11 @@ class Database::Impl {
       keys.insert(key_it, op.primary_key);
     }
 
-    // Step 9: install row writes/deletes and SI add/remove. Purge
-    // BEFORE Reset on deletes: MasstreeIndex::Insert treats an
-    // uninitialized DataItem as a reusable slot, so flipping first would
-    // let a racing Insert grab it and our erase would drop the new value.
+    // Step 9: install row writes/deletes and SI add/remove. Deletes leave
+    // tombstones in the tree; physical removal is deferred until a later
+    // epoch so same-key reinserts reuse the slot and advance its TID chain.
     for (auto& write : resolved_writes) {
       if (write.is_delete) {
-        auto table = GetTable(write.table_name);
-        if (table.has_value()) {
-          table.value()->GetPrimaryIndex().Purge(write.key, write.item);
-        }
         write.item->Reset(nullptr, 0);
       } else {
         write.item->Reset(reinterpret_cast<const std::byte*>(write.value.data()),
@@ -1220,20 +1261,28 @@ class Database::Impl {
       }
     }
 
-    // Install secondary-index add/remove. Purge per-op when the SI slot's
-    // primary_keys becomes empty after the remove.
+    // Install secondary-index add/remove. Empty SI slots are tombstones too;
+    // their physical removal is deferred with primary rows.
     for (auto& op : resolved_si_ops) {
       const auto* primary_key =
           reinterpret_cast<const std::byte*>(op.primary_key.data());
       if (op.is_delete) {
         op.item->RemoveSecondaryIndexValue(primary_key,
                                            op.primary_key.size());
-        if (op.item->primary_keys().empty()) {
-          op.index->Purge(op.secondary_key, op.item);
-        }
       } else {
         op.item->AddSecondaryIndexValue(primary_key, op.primary_key.size());
       }
+    }
+
+    // Capture SI tombstone state while the slots are still locked. The live
+    // primary_keys vector must not be read after unlock: a concurrent
+    // committer mutates it in place or swaps its buffer under its own lock.
+    // Computed after the whole install loop so a delete-then-add sequence on
+    // the same slot within this transaction reads the final state.
+    std::unordered_map<DataItem*, bool> si_empty_after_install;
+    for (const auto& op : resolved_si_ops) {
+      if (!op.is_delete) continue;
+      si_empty_after_install[op.item] = op.item->primary_keys().empty();
     }
 
     // Step 10: build the log snapshot before unlock so a later transaction
@@ -1264,6 +1313,8 @@ class Database::Impl {
     // Step 11: unlock by writing the new TID. Carry the epoch forward when
     // the captured TID is from an earlier epoch.
     const EpochNumber current_epoch = epoch_framework_.GetMyThreadLocalEpoch();
+    std::unordered_map<DataItem*, TransactionId> unlocked_tids;
+    unlocked_tids.reserve(lock_items.size());
     for (auto* item : lock_items) {
       TransactionId current = item->transaction_id.load();
       TransactionId unlocked;
@@ -1273,6 +1324,29 @@ class Database::Impl {
         unlocked = {current_epoch, 2};
       }
       item->transaction_id.store(unlocked);
+      unlocked_tids.emplace(item, unlocked);
+    }
+
+    for (const auto& write : resolved_writes) {
+      if (!write.is_delete) continue;
+      auto tid_it = unlocked_tids.find(write.item);
+      if (tid_it == unlocked_tids.end()) continue;
+      RegisterDeferredPurge(write.index, nullptr, write.key, write.item,
+                            tid_it->second);
+    }
+
+    std::unordered_set<DataItem*> registered_si_purges;
+    for (const auto& op : resolved_si_ops) {
+      if (!op.is_delete) continue;
+      auto empty_it = si_empty_after_install.find(op.item);
+      if (empty_it == si_empty_after_install.end() || !empty_it->second) {
+        continue;
+      }
+      if (!registered_si_purges.insert(op.item).second) continue;
+      auto tid_it = unlocked_tids.find(op.item);
+      if (tid_it == unlocked_tids.end()) continue;
+      RegisterDeferredPurge(nullptr, op.index, op.secondary_key, op.item,
+                            tid_it->second);
     }
 
     // Step 12: enqueue the log set, then leave the epoch.
@@ -1289,6 +1363,203 @@ class Database::Impl {
   }
 
  private:
+  static bool SameTransactionId(const TransactionId& lhs,
+                                const TransactionId& rhs) {
+    return lhs.epoch == rhs.epoch && lhs.tid == rhs.tid;
+  }
+
+  void RegisterDeferredPurge(Index::ConcurrentTable* primary_index,
+                             Index::SecondaryIndex* secondary_index,
+                             std::string_view key, DataItem* item,
+                             TransactionId delete_commit_tid) {
+    if (item == nullptr || delete_commit_tid.IsEmpty()) return;
+    if (primary_index == nullptr && secondary_index == nullptr) return;
+
+    DeferredPurgeCandidate candidate;
+    candidate.kind = secondary_index == nullptr
+                         ? DeferredPurgeIndexKind::Primary
+                         : DeferredPurgeIndexKind::Secondary;
+    candidate.primary_index = primary_index;
+    candidate.secondary_index = secondary_index;
+    candidate.key = std::string(key);
+    candidate.item = item;
+    candidate.delete_commit_tid = delete_commit_tid;
+
+    std::lock_guard<std::mutex> lk(deferred_purge_mtx_);
+    deferred_purge_candidates_.emplace_back(std::move(candidate));
+  }
+
+  void RegisterDeferredPurge(const Snapshot& snapshot,
+                             TransactionId delete_commit_tid) {
+    const bool primary_delete =
+        snapshot.index_name.empty() && snapshot.pi_ref != nullptr &&
+        !snapshot.data_item_copy.IsInitialized();
+    if (primary_delete) {
+      RegisterDeferredPurge(snapshot.pi_ref, nullptr, snapshot.key,
+                            snapshot.index_cache, delete_commit_tid);
+      return;
+    }
+
+    const bool secondary_delete =
+        !snapshot.index_name.empty() && snapshot.si_ref != nullptr &&
+        snapshot.data_item_copy.primary_keys().empty();
+    if (secondary_delete) {
+      RegisterDeferredPurge(nullptr, snapshot.si_ref, snapshot.key,
+                            snapshot.index_cache, delete_commit_tid);
+    }
+  }
+
+  DataItem* ResolveDeferredPurgeCandidate(
+      const DeferredPurgeCandidate& candidate) {
+    if (candidate.kind == DeferredPurgeIndexKind::Primary) {
+      return candidate.primary_index == nullptr
+                 ? nullptr
+                 : candidate.primary_index->Get(candidate.key);
+    }
+    return candidate.secondary_index == nullptr
+               ? nullptr
+               : candidate.secondary_index->Get(candidate.key);
+  }
+
+  bool PurgeDeferredPurgeCandidate(
+      const DeferredPurgeCandidate& candidate, TransactionId retired_tid) {
+    if (candidate.kind == DeferredPurgeIndexKind::Primary) {
+      return candidate.primary_index != nullptr &&
+             candidate.primary_index->Purge(candidate.key, candidate.item,
+                                            retired_tid);
+    }
+    return candidate.secondary_index != nullptr &&
+           candidate.secondary_index->Purge(candidate.key, candidate.item,
+                                            retired_tid);
+  }
+
+  void ReapDeferredPurges(EpochNumber published_epoch) {
+    std::vector<DeferredPurgeCandidate> ready;
+    size_t pending_before = 0;
+    {
+      std::lock_guard<std::mutex> lk(deferred_purge_mtx_);
+      pending_before = deferred_purge_candidates_.size();
+      std::vector<DeferredPurgeCandidate> pending;
+      pending.reserve(deferred_purge_candidates_.size());
+      for (auto& candidate : deferred_purge_candidates_) {
+        const EpochNumber delete_epoch = candidate.delete_commit_tid.epoch;
+        const bool one_full_epoch_elapsed =
+            published_epoch > delete_epoch &&
+            published_epoch - delete_epoch > 1;
+        if (one_full_epoch_elapsed) {
+          ready.emplace_back(std::move(candidate));
+        } else {
+          pending.emplace_back(std::move(candidate));
+        }
+      }
+      deferred_purge_candidates_.swap(pending);
+    }
+
+    if (ready.empty()) {
+      if (pending_before != 0) {
+        SPDLOG_DEBUG(
+            "Deferred purge epoch={} pending={} reaped=0 requeued=0 "
+            "dropped=0 total_reaped={} total_requeued={} total_dropped={}",
+            published_epoch, pending_before, deferred_purge_reaped_,
+            deferred_purge_requeued_, deferred_purge_dropped_);
+      }
+      return;
+    }
+
+    std::vector<DeferredPurgeCandidate> requeue;
+    requeue.reserve(ready.size());
+    size_t reaped = 0;
+    size_t requeued = 0;
+    size_t dropped = 0;
+
+    for (auto& candidate : ready) {
+      DataItem* item = ResolveDeferredPurgeCandidate(candidate);
+      if (item != candidate.item) {
+        ++dropped;
+        continue;
+      }
+
+      TransactionId observed = item->transaction_id.load();
+      if (observed.tid & 1u) {
+        requeue.emplace_back(std::move(candidate));
+        ++requeued;
+        continue;
+      }
+      if (!SameTransactionId(observed, candidate.delete_commit_tid)) {
+        ++dropped;
+        continue;
+      }
+
+      TransactionId locked = observed;
+      locked.tid |= 1u;
+      if (!item->transaction_id.compare_exchange_strong(observed, locked)) {
+        if (observed.tid & 1u) {
+          requeue.emplace_back(std::move(candidate));
+          ++requeued;
+        } else {
+          ++dropped;
+        }
+        continue;
+      }
+
+      auto unlock_candidate = [&]() {
+        item->transaction_id.store(candidate.delete_commit_tid);
+      };
+
+      if (item->IsInitialized()) {
+        unlock_candidate();
+        ++dropped;
+        continue;
+      }
+      if (ResolveDeferredPurgeCandidate(candidate) != item) {
+        unlock_candidate();
+        ++dropped;
+        continue;
+      }
+      if (!SameTransactionId(item->transaction_id.load(), locked)) {
+        unlock_candidate();
+        ++dropped;
+        continue;
+      }
+
+      TransactionId retired = candidate.delete_commit_tid;
+      retired.tid = (retired.tid + 2u) & ~1u;
+      if (PurgeDeferredPurgeCandidate(candidate, retired)) {
+        ++reaped;
+      } else {
+        unlock_candidate();
+        ++dropped;
+      }
+    }
+
+    [[maybe_unused]] size_t pending_after = 0;
+    [[maybe_unused]] uint64_t total_reaped = 0;
+    [[maybe_unused]] uint64_t total_requeued = 0;
+    [[maybe_unused]] uint64_t total_dropped = 0;
+    {
+      std::lock_guard<std::mutex> lk(deferred_purge_mtx_);
+      deferred_purge_candidates_.insert(
+          deferred_purge_candidates_.end(),
+          std::make_move_iterator(requeue.begin()),
+          std::make_move_iterator(requeue.end()));
+      deferred_purge_reaped_ += reaped;
+      deferred_purge_requeued_ += requeued;
+      deferred_purge_dropped_ += dropped;
+      pending_after = deferred_purge_candidates_.size();
+      total_reaped = deferred_purge_reaped_;
+      total_requeued = deferred_purge_requeued_;
+      total_dropped = deferred_purge_dropped_;
+    }
+
+    SPDLOG_DEBUG(
+        "Deferred purge epoch={} pending={} reaped={} requeued={} dropped={} "
+        "total_reaped={} total_requeued={} total_dropped={}",
+        published_epoch, pending_after, reaped, requeued, dropped,
+        total_reaped, total_requeued, total_dropped);
+
+    Index::MasstreeReleaseThreadEpoch();
+  }
+
   /// Pack a {epoch, tid} pair into one uint64_t so it can travel over the
   /// stateless RPC as an opaque version token.
   static uint64_t PackTransactionId(const TransactionId& tid) {
@@ -1384,6 +1655,11 @@ class Database::Impl {
   std::condition_variable fence_cv_;
   Recovery::CPRManager checkpoint_manager_;
   mutable std::shared_mutex schema_mutex_;
+  std::mutex deferred_purge_mtx_;
+  std::vector<DeferredPurgeCandidate> deferred_purge_candidates_;
+  uint64_t deferred_purge_reaped_ = 0;
+  uint64_t deferred_purge_requeued_ = 0;
+  uint64_t deferred_purge_dropped_ = 0;
 };
 
 }  // namespace LineairDB

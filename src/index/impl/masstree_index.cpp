@@ -318,7 +318,11 @@ struct MasstreeIndex::Impl {
         return false;
       }
       if (existing == nullptr) {
-        lp.value() = new DataItem();
+        // Deleted-slot reuse must preserve the DataItem pointer. The TID
+        // chain on that slot is what lets readers detect delete/reinsert ABA.
+        assert(existing != nullptr);
+        lp.finish(0, *tls_ti);
+        return false;
       }
       fence();
       lp.finish(0, *tls_ti);
@@ -350,14 +354,12 @@ struct MasstreeIndex::Impl {
   // after the DataItem already reads back as !IsInitialized to everyone).
   bool Delete(std::string_view /*key*/) { return true; }
 
-  // Structural removal of a committed delete. Invoked from the OCC backend's
-  // install phase while the per-DataItem lock is still held: this is what
-  // prevents Insert from observing the freshly-uninitialized slot, racing in
-  // a new value, and having the structural erase below silently drop it.
+  // Structural removal of a committed delete. Invoked by the deferred reaper
+  // after it has CAS-locked the DataItem and verified the tombstone TID.
   // Returns true if the key was physically removed; false if the slot is
-  // already gone or a racing replacement won the position (defensive — the
-  // committed-only contract means we should always find our own DataItem).
-  bool Purge(std::string_view key, DataItem* expected) {
+  // already gone or a racing replacement won the position.
+  bool Purge(std::string_view key, DataItem* expected,
+             TransactionId retired_tid) {
     ensure_thread_active();
     cursor_type lp(table_, key.data(), key.size());
     const bool found = lp.find_locked(*tls_ti);
@@ -376,6 +378,9 @@ struct MasstreeIndex::Impl {
     // RCU-frees the leaf if it becomes empty. The DataItem* itself rides on
     // a separate RCU callback below.
     lp.finish(-1, *tls_ti);
+    if (!retired_tid.IsEmpty()) {
+      current->transaction_id.store(retired_tid);
+    }
     schedule_data_item_rcu_free(current);
     return true;
   }
@@ -637,9 +642,9 @@ bool MasstreeIndex::ValidatePhantoms(
   return impl_->ValidatePhantoms(entries, this);
 }
 
-bool MasstreeIndex::Purge(std::string_view key,
-                                            DataItem* expected) {
-  return impl_->Purge(key, expected);
+bool MasstreeIndex::Purge(std::string_view key, DataItem* expected,
+                          TransactionId retired_tid) {
+  return impl_->Purge(key, expected, retired_tid);
 }
 
 void MasstreeAdvanceEpoch() {

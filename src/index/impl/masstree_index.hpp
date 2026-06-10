@@ -58,8 +58,8 @@ class MasstreeIndex final : public IndexBase {
   bool ValidatePhantoms(
       const std::vector<NodeVersionEntry>& entries) override;
 
-  bool Purge(std::string_view key,
-                               DataItem* expected) override;
+  bool Purge(std::string_view key, DataItem* expected,
+             TransactionId retired_tid = {}) override;
 
  private:
   struct Impl;

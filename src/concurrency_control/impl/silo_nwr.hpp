@@ -177,6 +177,18 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
     }
 
     /** Acquire Lock **/
+    std::vector<DataItem*> locked_items;
+    locked_items.reserve(tx_ref_.write_set_ref_.size());
+    auto unlock_locked_items = [&]() {
+      for (auto* locked_item : locked_items) {
+        auto current = locked_item->transaction_id.load();
+        if (current.tid & 1u) {
+          current.tid--;
+          locked_item->transaction_id.store(current);
+        }
+      }
+    };
+
     for (auto& snapshot : tx_ref_.write_set_ref_) {
       auto* item = snapshot.index_cache;
       assert(item != nullptr);
@@ -193,7 +205,22 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
         bool lock_acquired =
             item->transaction_id.compare_exchange_weak(current, desired);
         if (lock_acquired) {
+          locked_items.push_back(item);
           snapshot.data_item_copy.transaction_id.store(desired);
+          DataItem* attached_item = nullptr;
+          bool checked_attachment = false;
+          if (snapshot.index_name.empty() && snapshot.pi_ref != nullptr) {
+            attached_item = snapshot.pi_ref->Get(snapshot.key);
+            checked_attachment = true;
+          } else if (!snapshot.index_name.empty() &&
+                     snapshot.si_ref != nullptr) {
+            attached_item = snapshot.si_ref->Get(snapshot.key);
+            checked_attachment = true;
+          }
+          if (checked_attachment && attached_item != item) {
+            unlock_locked_items();
+            return false;
+          }
           // If this item is in readset, add 1 (lockflag) into snapshot for
           // validation
           //
@@ -256,32 +283,10 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
 
     /** Buffer Update **/
     //
-    // Silo defers physical removal of deleted masstree leaves to a
-    // reaper thread on epoch advance; we erase inline under the
-    // per-DataItem lock we already hold, trading one cursor lock per
-    // delete for no reaper subsystem and bounded tombstone lifetime.
-    //
-    // Ordering: erase BEFORE the *index_cache flip. MasstreeIndex::Insert
-    // treats an !IsInitialized DataItem as a reusable slot, so flipping
-    // first would let a racing Insert grab the slot and silently lose its
-    // value. SI uses primary_keys().empty() as the delete predicate: the
-    // SI entry is removable only when no primary key still maps to it
-    // after this tx's mutations.
+    // Deletes install tombstones. Physical removal is deferred to the
+    // epoch reaper so same-key reinserts reuse the slot and preserve the
+    // slot's monotonic TID chain.
     for (auto& snapshot : tx_ref_.write_set_ref_) {
-      const bool is_primary_delete =
-          snapshot.index_name.empty() &&
-          snapshot.pi_ref != nullptr &&
-          !snapshot.data_item_copy.IsInitialized();
-      if (is_primary_delete) {
-        snapshot.pi_ref->Purge(snapshot.key, snapshot.index_cache);
-      }
-      const bool is_si_delete =
-          !snapshot.index_name.empty() &&
-          snapshot.si_ref != nullptr &&
-          snapshot.data_item_copy.primary_keys().empty();
-      if (is_si_delete) {
-        snapshot.si_ref->Purge(snapshot.key, snapshot.index_cache);
-      }
       *snapshot.index_cache = snapshot.data_item_copy;
     }
 
@@ -313,6 +318,9 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
         }
         item->transaction_id.store(unlocked_id);
         snapshot.data_item_copy.transaction_id.store(unlocked_id);
+        if (tx_ref_.register_deferred_purge_) {
+          tx_ref_.register_deferred_purge_(snapshot, unlocked_id);
+        }
       }
     }
   }

@@ -67,8 +67,12 @@ Transaction::Impl::Impl(Database::Impl* db_pimpl) noexcept
   current_transaction_context =
       reinterpret_cast<void*>(tx_context_thread_tag | (++tx_context_seq & 0xFFFFFFFF));
 
-  TransactionReferences&& tx = {read_set_, write_set_,
-                                db_pimpl_->epoch_framework_, current_status_};
+  auto register_deferred_purge = [this](const Snapshot& snapshot,
+                                        TransactionId delete_commit_tid) {
+    db_pimpl_->RegisterDeferredPurge(snapshot, delete_commit_tid);
+  };
+  TransactionReferences tx{read_set_, write_set_, db_pimpl_->epoch_framework_,
+                           current_status_, std::move(register_deferred_purge)};
 
   // WANTFIX for performance
   // Here we allocate one (derived) concurrency control instance per
@@ -77,21 +81,21 @@ Transaction::Impl::Impl(Database::Impl* db_pimpl) noexcept
   switch (config_ptr_->concurrency_control_protocol) {
     case Config::ConcurrencyControl::SiloNWR:
       concurrency_control_ = std::make_unique<ConcurrencyControl::SiloNWR>(
-          std::forward<TransactionReferences>(tx));
+          std::move(tx));
       break;
     case Config::ConcurrencyControl::Silo:
       concurrency_control_ = std::make_unique<ConcurrencyControl::Silo>(
-          std::forward<TransactionReferences>(tx));
+          std::move(tx));
       break;
     case Config::ConcurrencyControl::TwoPhaseLocking:
       concurrency_control_ =
           std::make_unique<ConcurrencyControl::TwoPhaseLocking>(
-              std::forward<TransactionReferences>(tx));
+              std::move(tx));
       break;
 
     default:
       concurrency_control_ = std::make_unique<ConcurrencyControl::SiloNWR>(
-          std::forward<TransactionReferences>(tx));
+          std::move(tx));
 
       break;
   }
@@ -141,8 +145,13 @@ void Transaction::Impl::Reset(Database::Impl* db_pimpl) {
   remainingNotNullSkWrites_.clear();
   node_version_set_.clear();
 
-  TransactionReferences new_ref{read_set_, write_set_,
-                                db_pimpl_->epoch_framework_, current_status_};
+  auto register_deferred_purge = [this](const Snapshot& snapshot,
+                                        TransactionId delete_commit_tid) {
+    db_pimpl_->RegisterDeferredPurge(snapshot, delete_commit_tid);
+  };
+  TransactionReferences new_ref{
+      read_set_, write_set_, db_pimpl_->epoch_framework_, current_status_,
+      std::move(register_deferred_purge)};
   concurrency_control_->Reset(std::move(new_ref));
 }
 
