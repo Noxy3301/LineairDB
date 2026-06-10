@@ -330,14 +330,14 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
   };
 
   // Silo Phase 2 read validation is wait-free: a record locked by another
-  // transaction is treated as "dirty" and forces abort. Spinning here breaks
+  // transaction is treated as dirty and forces abort. Spinning here breaks
   // the paper's deadlock-freedom invariant — sorted write-lock acquisition
   // protects only write-to-write edges, not read-to-write edges introduced
   // by validators.
-  auto try_snapshot_readable = [&](DataItem* item) -> bool {
+  auto locked_by_another = [&](DataItem* item) {
     TransactionId tid = item->transaction_id.load();
-    if (!(tid.tid & 1u)) return true;
-    return is_own_locked(item);
+    if (!(tid.tid & 1u)) return false;
+    return !is_own_locked(item);
   };
 
   auto validate_primary_key_list =
@@ -348,7 +348,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
         std::vector<std::string> keys;
         bool aborted = false;
         auto collect_key = [&](std::string_view key, DataItem& item) {
-          if (!try_snapshot_readable(&item)) {
+          if (locked_by_another(&item)) {
             aborted = true;
             return true;
           }
@@ -378,11 +378,11 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
         std::vector<std::string> secondary_keys;
         std::vector<std::string> primary_keys;
         bool aborted = false;
-        auto snapshot_base_row = [&](const std::string& secondary_key,
-                                     const std::string& primary_key) {
+        auto collect_base_row = [&](const std::string& secondary_key,
+                                    const std::string& primary_key) {
           DataItem* item = table.value()->GetPrimaryIndex().Get(primary_key);
           if (item == nullptr) return false;
-          if (!try_snapshot_readable(item)) {
+          if (locked_by_another(item)) {
             aborted = true;
             return true;
           }
@@ -418,7 +418,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
             return false;
           }
           for (const auto& primary_key : item_primary_keys) {
-            if (snapshot_base_row(secondary_key, primary_key)) return true;
+            if (collect_base_row(secondary_key, primary_key)) return true;
           }
           return false;
         };

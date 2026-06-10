@@ -102,8 +102,8 @@ StatelessSecondaryRangeScanResult SecondaryRangeScan(
 
   uint64_t returned_rows = 0;
 
-  auto snapshot_base_row = [&](const std::string& secondary_key,
-                               const std::string& primary_key) {
+  auto append_base_row = [&](const std::string& secondary_key,
+                             const std::string& primary_key) {
     DataItem* item = table.value()->GetPrimaryIndex().Get(primary_key);
     if (item == nullptr) {
       return false;
@@ -127,7 +127,7 @@ StatelessSecondaryRangeScanResult SecondaryRangeScan(
 
     auto slot = ConcurrencyControl::StableReadPrimaryKeys(*item);
     for (const auto& primary_key : slot.primary_keys) {
-      if (snapshot_base_row(secondary_key, primary_key)) return true;
+      if (append_base_row(secondary_key, primary_key)) return true;
     }
     return false;
   };
