@@ -21,62 +21,6 @@
 namespace LineairDB {
 namespace Stateless {
 
-/**
- * @brief Run the Silo commit phase against caller-supplied snapshots.
- *
- * Steps, in order:
- *   1. Epoch join
- *        call `MakeMeOnline` so the thread participates in this epoch.
- *   2. Resolve
- *        under `schema_mutex` shared, map each read, write, and
- *        secondary-index op to its DataItem. Writes use `GetOrInsert`.
- *   3. Pre-lock UNIQUE dedup
- *        the same UNIQUE SI key appearing twice in `secondary_index_ops`
- *        is rejected with `unique_si_duplicate_in_request`.
- *   4. Lock
- *        address-sort the write targets and CAS the lock bit (LSB) into
- *        each TID. Remember the `before_lock` TID per item.
- *   5. Epoch fence
- *        bounce off and back on so a fresh epoch starts.
- *   6. Exact-read validation
- *        every ExternalReadEntry has its DataItem's TID compared with the
- *        supplied `tid`. For items we just locked, the comparison uses
- *        `before_lock`. Mismatches abort with `exact_read_tid_moved`.
- *   7. Range validation
- *        for each `range_reads` entry, replay the scan and compare key
- *        lists. Failure aborts with `*_range_result_changed`.
- *   8. Post-lock UNIQUE recheck
- *        simulate the SI slot state across all ops on the same item to
- *        catch a concurrent insert that became visible while we were
- *        waiting on the write lock. Failure aborts with
- *        `unique_si_exists_after_lock`.
- *   9. Install
- *        `DataItem::Reset` for deletes, then apply SI add/remove via
- *        `AddSecondaryIndexValue` / `RemoveSecondaryIndexValue`. Empty
- *        primary and SI slots stay in the tree as tombstones.
- *  10. Log snapshot
- *        capture the post-install snapshot before unlock so a later
- *        transaction cannot overwrite the values we just logged. Only
- *        when logging is enabled.
- *  11. Unlock
- *        rewrite each item's TID. Carry the epoch forward when the
- *        captured TID is from an earlier epoch, then register tombstones
- *        for later physical purge using the published unlocked TID.
- *  12. Log enqueue
- *        push the log set into `logger`, then call `MakeMeOffline`.
- *
- * Range validation is logical-only: a stateless caller cannot hold a
- * Masstree node pointer across the RPC boundary, so a physical
- * node-version token (a `range_reads` entry with an empty `end_key`) or a
- * non-empty `index_reads` set is rejected up front with
- * `physical_range_token_unsupported` / `index_reads_unsupported` instead
- * of being silently skipped.
- *
- * On any failure path the function unlocks every item it owns, sets
- * `*abort_reason` (when non-null) to a short label such as
- * `exact_read_tid_moved`, `primary_range_result_changed`, or
- * `unique_si_exists_after_lock`, and returns false.
- */
 bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
             EpochFramework& epoch_framework, Index::Reaper& reaper,
             Recovery::Logger& logger, const Config& config,
@@ -86,7 +30,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
             const std::vector<ExternalRangeValidationEntry>& range_reads,
             const std::vector<ExternalIndexValidationEntry>& index_reads,
             std::string* abort_reason) {
-  // Step 1: epoch join.
+  // Epoch join.
   epoch_framework.MakeMeOnline();
   if (abort_reason != nullptr) abort_reason->clear();
 
@@ -136,9 +80,9 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     return false;
   };
 
-  // Validation is logical-only. A range entry with an empty end_key is a
-  // physical Masstree node-version token and exact index entries have no
-  // producer; reject both instead of silently skipping them.
+  // Validation is logical-only: a range entry with an empty end_key is a
+  // physical node-version token and index_reads carry physical exact-key
+  // entries; both are unsupported and abort instead of being skipped.
   if (!index_reads.empty()) {
     return abort_before_lock("index_reads_unsupported");
   }
@@ -148,7 +92,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     }
   }
 
-  // Step 2: resolve reads, writes, and SI ops to their DataItems.
+  // Resolve (R1-R2): map reads, writes, and SI ops to their DataItems.
   {
     std::shared_lock<std::shared_mutex> lk(schema_mutex);
 
@@ -169,7 +113,11 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
                                     read.found});
     }
 
-    // Resolve row writes and deletes to the primary-index entries to lock
+    // Resolve row writes and deletes to the primary-index entries to lock.
+    // R2: a key with no DataItem yet cannot be locked, so GetOrInsert
+    // materializes a blank slot (uninitialized, TID 0); this mutates the
+    // tree but takes no row lock — Silo's native insert stages an "absent"
+    // record the same way.
     resolved_writes.reserve(writes.size());
     for (const auto& write : writes) {
       auto table = tables.GetTable(write.table_name);
@@ -204,7 +152,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
         return abort_before_lock("si_index_missing");
       }
 
-      // Step 3: reject the same UNIQUE SI key appearing twice in this request.
+      // R3: reject the same UNIQUE SI key appearing twice in this request.
       if (!op.is_delete && index->IsUnique()) {
         const std::string unique_key =
             op.table_name + '\0' + op.index_name + '\0' + op.secondary_key;
@@ -232,7 +180,10 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     }
   }
 
-  // Step 4: address-sort and CAS-lock every write target.
+  // Phase 1.1: address-sort and CAS-lock every write target. One global
+  // lock order keeps concurrent committers free of write-write deadlock;
+  // the pre-lock TID is kept because validation must compare reads against
+  // it, not against the TID we just dirtied.
   std::sort(lock_items.begin(), lock_items.end());
   lock_items.erase(std::unique(lock_items.begin(), lock_items.end()),
                    lock_items.end());
@@ -295,11 +246,17 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     }
   }
 
-  // Step 5: epoch fence so a fresh epoch covers the validation phase.
+  // Phase 1.2: re-read the global epoch with all locks held — the
+  // serialization point: epoch-grouped commit and recovery follow the
+  // serial order only if the commit epoch is taken here. The thread-local
+  // epoch is fixed at join time, so leaving and re-joining is the only way
+  // to re-read it.
   epoch_framework.MakeMeOffline();
   epoch_framework.MakeMeOnline();
 
-  // Step 6: re-read exact-key TIDs and confirm they have not moved.
+  // Phase 2.1: re-read exact-key TIDs and confirm they have not moved; a
+  // moved TID means a concurrent commit overwrote the row after the caller
+  // read it.
   auto key_hex = [](const std::string& key) {
     static constexpr char kHex[] = "0123456789abcdef";
     std::string out;
@@ -365,7 +322,11 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     }
   }
 
-  // Step 7: replay each range scan and compare the key lists.
+  // Phase 2.2: replay each range scan and compare the key lists. This is
+  // the phantom check Silo performs with Masstree node versions (physical
+  // validation), done by value because a stateless caller cannot hold node
+  // pointers across the RPC boundary. The comparison is membership only;
+  // row TIDs are validated at 2.1.
   auto is_own_locked = [&](DataItem* item) {
     for (const auto& locked : locked_tids) {
       if (locked.item == item) return true;
@@ -490,9 +451,9 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     }
   }
 
-  // Step 8: post-lock UNIQUE recheck. A competing add may have installed
+  // Phase 2.3: post-lock UNIQUE recheck. A competing add may have installed
   // the same secondary key while we were waiting on the write lock, so the
-  // pre-lock dedup at step 3 is not enough on its own.
+  // resolve-time dedup (R3) is not enough on its own.
   std::unordered_map<DataItem*, std::vector<std::string>> si_primary_keys;
   for (const auto& op : resolved_si_ops) {
     if (!op.index_type.IsUnique()) continue;
@@ -518,7 +479,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     keys.insert(key_it, op.primary_key);
   }
 
-  // Step 9: install row writes/deletes and SI add/remove. Deletes leave
+  // Phase 3.1: install row writes/deletes and SI add/remove. Deletes leave
   // tombstones in the tree; physical removal is deferred until a later
   // epoch so same-key reinserts reuse the slot and advance its TID chain.
   for (auto& write : resolved_writes) {
@@ -554,7 +515,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     si_empty_after_install[op.item] = op.item->primary_keys().empty();
   }
 
-  // Step 10: build the log snapshot before unlock so a later transaction
+  // Phase 3.2: build the log snapshot before unlock so a later transaction
   // cannot overwrite the values we just logged.
   WriteSetType log_set;
   bool has_log_set = false;
@@ -579,7 +540,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     }
   }
 
-  // Step 11: unlock by writing the new TID. Carry the epoch forward when
+  // Phase 3.3: unlock by writing the new TID. Carry the epoch forward when
   // the captured TID is from an earlier epoch.
   const EpochNumber current_epoch = epoch_framework.GetMyThreadLocalEpoch();
   std::unordered_map<DataItem*, TransactionId> unlocked_tids;
@@ -596,6 +557,9 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     unlocked_tids.emplace(item, unlocked);
   }
 
+  // Phase 3.4: register slots left empty by this transaction for deferred
+  // physical purge, keyed by the published unlocked TID; immediate removal
+  // could free memory still visible to concurrent readers.
   for (const auto& write : resolved_writes) {
     if (!write.is_delete) continue;
     auto tid_it = unlocked_tids.find(write.item);
@@ -618,7 +582,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
                           tid_it->second);
   }
 
-  // Step 12: enqueue the log set, then leave the epoch.
+  // Phase 3.5: enqueue the log set, then leave the epoch.
   if (has_log_set) {
     logger.Enqueue(log_set, current_epoch, true);
   }
