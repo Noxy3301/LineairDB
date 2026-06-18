@@ -439,8 +439,18 @@ class Database::Impl {
       return false;
     };
 
-    auto live_base_row = [](const DataItem& item) {
-      return item.IsInitialized() && item.size() != 0;
+    // Stable-read base liveness without copying the row payload.
+    auto stable_live_base = [](const DataItem& item) {
+      for (;;) {
+        TransactionId tid = item.transaction_id.load();
+        if (tid.tid & 1u) {
+          _mm_pause();
+          continue;
+        }
+
+        const bool live = item.IsInitialized() && item.size() != 0;
+        if (item.transaction_id.load() == tid) return live;
+      }
     };
 
     static const std::string kFullScanEnd(16, static_cast<char>(0xff));
@@ -451,7 +461,7 @@ class Database::Impl {
       auto scan_result = primary_index.Scan(
           std::string_view(), std::string_view(kFullScanEnd),
           [&](std::string_view key, DataItem& item) -> bool {
-            if (!live_base_row(item)) return false;
+            if (!stable_live_base(item)) return false;
             return count_key(key);
           },
           nullptr);
@@ -461,12 +471,29 @@ class Database::Impl {
           table.value()->GetSecondaryIndex(index_name);
       if (index == nullptr) return false;
 
-      // Secondary entries count only if at least one referenced base row is live.
-      auto secondary_has_live_base = [&](const DataItem& item) {
-        if (!item.IsInitialized()) return false;
-        for (const auto& primary_key : item.primary_keys()) {
+      // Copy the secondary PK list under one stable TID before dereferencing it.
+      auto stable_live_secondary = [&](const DataItem& item) {
+        std::vector<std::string> primary_keys;
+        for (;;) {
+          TransactionId tid = item.transaction_id.load();
+          if (tid.tid & 1u) {
+            _mm_pause();
+            continue;
+          }
+
+          const bool live = item.IsInitialized() && !item.primary_keys().empty();
+          std::vector<std::string> snapshot;
+          if (live) snapshot = item.primary_keys();
+          if (item.transaction_id.load() == tid) {
+            primary_keys = std::move(snapshot);
+            break;
+          }
+        }
+
+        // Secondary entries count only if one referenced base row is live.
+        for (const auto& primary_key : primary_keys) {
           DataItem* base_item = primary_index.Get(primary_key);
-          if (base_item != nullptr && live_base_row(*base_item)) return true;
+          if (base_item != nullptr && stable_live_base(*base_item)) return true;
         }
         return false;
       };
@@ -475,7 +502,7 @@ class Database::Impl {
           std::string_view(), std::string_view(kFullScanEnd),
           [&](std::string_view key) -> bool {
             DataItem* item = index->Get(key);
-            if (item == nullptr || !secondary_has_live_base(*item)) {
+            if (item == nullptr || !stable_live_secondary(*item)) {
               return false;
             }
             return count_key(key);
