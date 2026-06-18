@@ -102,6 +102,14 @@ StatelessSecondaryRangeScanResult Database::StatelessSecondaryRangeScan(
       table_name, index_name, start_key, end_key, row_limit, reverse_scan);
 }
 
+bool Database::ComputeIndexNdvInt(const std::string_view table_name,
+                                  const std::string_view index_name,
+                                  uint32_t num_parts,
+                                  std::vector<uint64_t>& out_ndv) {
+  return db_pimpl_->ComputeIndexNdvInt(table_name, index_name, num_parts,
+                                       out_ndv);
+}
+
 bool Database::ValidateAndCommit(
     const std::vector<ExternalReadEntry>& reads,
     const std::vector<ExternalWriteEntry>& writes,
