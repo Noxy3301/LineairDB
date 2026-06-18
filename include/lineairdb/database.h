@@ -282,6 +282,19 @@ class Database {
       uint64_t row_limit, bool reverse_scan);
 
   /**
+   * @brief Compute per-key-part-prefix NDV for an integer encoded index.
+   *
+   * `out_ndv[d]` is the number of distinct prefixes covering key parts
+   * `0..d` among live entries. `index_name == ""` selects the primary index.
+   * Returns false when the table/index is missing or any scanned key part is
+   * not in the Helios integer key encoding, leaving the caller to use its
+   * existing heuristic.
+   */
+  bool ComputeIndexNdvInt(const std::string_view table_name,
+                          const std::string_view index_name,
+                          uint32_t num_parts, std::vector<uint64_t>& out_ndv);
+
+  /**
    * @brief Validate caller-supplied read and write sets and install the
    *        writes atomically.
    *

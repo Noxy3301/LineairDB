@@ -367,6 +367,131 @@ class Database::Impl {
                                          end_key, row_limit, reverse_scan);
   }
 
+  /**
+   * @brief Compute exact NDV for each integer key-part prefix of one index.
+   *
+   * @details The proxy uses this to set MySQL `rec_per_key`. The scan counts
+   * live index entries only. If any live key cannot be split as Helios integer
+   * key parts, the method returns false so the proxy keeps its old estimate.
+   */
+  bool ComputeIndexNdvInt(const std::string_view table_name,
+                          const std::string_view index_name, uint32_t num_parts,
+                          std::vector<uint64_t>& out_ndv) {
+    out_ndv.assign(num_parts, 0);
+    if (num_parts == 0) return false;
+
+    std::shared_lock<std::shared_mutex> lk(schema_mutex_);
+    auto table = GetTable(table_name);
+    if (!table.has_value()) return false;
+
+    bool ok = true;
+    bool first = true;
+    // Index scans are key-ordered, so one previous key is enough for NDV.
+    std::string prev_key;
+    std::vector<size_t> prev_part_ends(num_parts, 0);
+
+    // Split Helios integer key-parts: [marker][type][2-byte length][payload].
+    auto count_key = [&](std::string_view key) -> bool {
+      std::vector<size_t> part_ends(num_parts, 0);
+      size_t offset = 0;
+      for (uint32_t part = 0; part < num_parts; ++part) {
+        if (offset + 4 > key.size()) {
+          ok = false;
+          return true;
+        }
+        const auto marker = static_cast<unsigned char>(key[offset]);
+        const auto type = static_cast<unsigned char>(key[offset + 1]);
+        if (marker != 0x00 || type != 0x10) {
+          ok = false;
+          return true;
+        }
+        const size_t len =
+            (static_cast<size_t>(
+                 static_cast<unsigned char>(key[offset + 2]))
+             << 8) |
+            static_cast<unsigned char>(key[offset + 3]);
+        offset += 4 + len;
+        if (offset > key.size()) {
+          ok = false;
+          return true;
+        }
+        part_ends[part] = offset;
+      }
+
+      if (first) {
+        // The first live key starts one distinct prefix at every depth.
+        for (uint32_t part = 0; part < num_parts; ++part) out_ndv[part] = 1;
+        first = false;
+      } else {
+        // Count a new prefix whenever bytes up to that key-part boundary differ.
+        const std::string_view prev(prev_key);
+        for (uint32_t part = 0; part < num_parts; ++part) {
+          if (part_ends[part] != prev_part_ends[part] ||
+              key.substr(0, part_ends[part]) !=
+                  prev.substr(0, prev_part_ends[part])) {
+            ++out_ndv[part];
+          }
+        }
+      }
+
+      prev_key.assign(key.data(), key.size());
+      prev_part_ends = std::move(part_ends);
+      return false;
+    };
+
+    auto live_base_row = [](const DataItem& item) {
+      return item.IsInitialized() && item.size() != 0;
+    };
+
+    static const std::string kFullScanEnd(16, static_cast<char>(0xff));
+    auto& primary_index = table.value()->GetPrimaryIndex();
+
+    if (index_name.empty()) {
+      // Primary index entries are base rows, so count live rows directly.
+      auto scan_result = primary_index.Scan(
+          std::string_view(), std::string_view(kFullScanEnd),
+          [&](std::string_view key, DataItem& item) -> bool {
+            if (!live_base_row(item)) return false;
+            return count_key(key);
+          },
+          nullptr);
+      if (!scan_result.has_value()) ok = false;
+    } else {
+      Index::SecondaryIndex* index =
+          table.value()->GetSecondaryIndex(index_name);
+      if (index == nullptr) return false;
+
+      // Secondary entries count only if at least one referenced base row is live.
+      auto secondary_has_live_base = [&](const DataItem& item) {
+        if (!item.IsInitialized()) return false;
+        for (const auto& primary_key : item.primary_keys()) {
+          DataItem* base_item = primary_index.Get(primary_key);
+          if (base_item != nullptr && live_base_row(*base_item)) return true;
+        }
+        return false;
+      };
+
+      auto scan_result = index->Scan(
+          std::string_view(), std::string_view(kFullScanEnd),
+          [&](std::string_view key) -> bool {
+            DataItem* item = index->Get(key);
+            if (item == nullptr || !secondary_has_live_base(*item)) {
+              return false;
+            }
+            return count_key(key);
+          },
+          nullptr);
+      if (!scan_result.has_value()) ok = false;
+    }
+
+    if (!ok) {
+      // Fail closed: caller keeps the old optimizer estimate.
+      out_ndv.assign(num_parts, 0);
+      return false;
+    }
+    return true;
+  }
+
   bool ValidateAndCommit(
       const std::vector<ExternalReadEntry>& reads,
       const std::vector<ExternalWriteEntry>& writes,
