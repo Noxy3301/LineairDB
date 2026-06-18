@@ -221,20 +221,11 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
             unlock_locked_items();
             return false;
           }
-          // If this item is in readset, add 1 (lockflag) into snapshot for
-          // validation
-          //
-          // NOTE: ReadDirect (Scan lightweight path) registers into
-          // validation_set_ but NOT read_set_. A subsequent Read() on the
-          // same key won't detect the duplicate via read_set_index_, causing
-          // the same item to appear twice in validation_set_. With break,
-          // only the first entry's tid gets updated and the second stays
-          // stale, leading to false aborts. Update all entries and use the
-          // actual locked tid (desired) instead of tid++ to handle cases
-          // where another tx modified the item between Read and Lock.
+          // Validate own-locked reads against the read-time TID with our lock
+          // bit set. ReadDirect can duplicate entries, so update all matches.
           for (auto& read_item : validation_set_) {
             if (read_item.item_p_cache == item) {
-              read_item.transaction_id = desired;
+              read_item.transaction_id.tid |= 1llu;
             }
           }
           break;

@@ -4,6 +4,7 @@
 #include "index/index_base.h"
 #include "index/index_factory.hpp"
 #include "index/secondary_index_type.h"
+#include "types/snapshot.hpp"
 #include "util/epoch_framework.hpp"
 
 namespace LineairDB {

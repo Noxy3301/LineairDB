@@ -102,16 +102,22 @@ StatelessSecondaryRangeScanResult Database::StatelessSecondaryRangeScan(
       table_name, index_name, start_key, end_key, row_limit, reverse_scan);
 }
 
+bool Database::ComputeIndexNdvInt(const std::string_view table_name,
+                                  const std::string_view index_name,
+                                  uint32_t num_parts,
+                                  std::vector<uint64_t>& out_ndv) {
+  return db_pimpl_->ComputeIndexNdvInt(table_name, index_name, num_parts,
+                                       out_ndv);
+}
+
 bool Database::ValidateAndCommit(
     const std::vector<ExternalReadEntry>& reads,
     const std::vector<ExternalWriteEntry>& writes,
     const std::vector<ExternalSecondaryIndexEntry>& secondary_index_ops,
-    const std::vector<ExternalRangeValidationEntry>& range_reads,
-    const std::vector<ExternalIndexValidationEntry>& index_reads,
+    const std::vector<ExternalRangeReadEntry>& range_reads,
     std::string* abort_reason) {
   return db_pimpl_->ValidateAndCommit(reads, writes, secondary_index_ops,
-                                      range_reads, index_reads,
-                                      abort_reason);
+                                      range_reads, abort_reason);
 }
 
 }  // namespace LineairDB
