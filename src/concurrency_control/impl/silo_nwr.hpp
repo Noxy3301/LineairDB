@@ -94,6 +94,35 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
       }
     }
   };
+
+  /**
+   * @brief Copy a DataItem using Silo's double-TID stable-read loop.
+   *
+   * @details Unlike Read(), this does not append to validation_set_. It is only
+   * for non-unique secondary-index write seeds whose commit result is later
+   * installed by merging recorded Add/Remove deltas under the write lock.
+   */
+  const DataItem ReadUnvalidated(const std::string_view,
+                                 DataItem* index_leaf) final override {
+    assert(index_leaf != nullptr);
+
+    DataItem snapshot;
+    for (;;) {
+      auto tx_id = index_leaf->transaction_id.load();
+
+      if (tx_id.tid & 1u) {
+        _mm_pause();
+        continue;
+      }
+
+      snapshot = *index_leaf;
+
+      if (index_leaf->transaction_id.load() == tx_id) {
+        return snapshot;
+      }
+    }
+  };
+
   // See concurrency_control_base.h for why ReadDirect exists (Scan perf).
   // TID double-check protocol ensures the returned pointer is consistent.
   //
@@ -278,6 +307,32 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
     // epoch reaper so same-key reinserts reuse the slot and preserve the
     // slot's monotonic TID chain.
     for (auto& snapshot : tx_ref_.write_set_ref_) {
+      if (!snapshot.index_name.empty() &&
+          !snapshot.secondary_index_deltas.empty() &&
+          !snapshot.index_type.IsUnique()) {
+        // Non-unique SI writes commute as Add/Remove deltas. Apply them to
+        // the locked current PK-list instead of overwriting with a stale copy.
+        for (const auto& delta : snapshot.secondary_index_deltas) {
+          const auto* primary_key =
+              reinterpret_cast<const std::byte*>(delta.primary_key.data());
+          switch (delta.op) {
+            case SecondaryIndexOp::Add:
+              snapshot.index_cache->AddSecondaryIndexValue(
+                  primary_key, delta.primary_key.size());
+              break;
+            case SecondaryIndexOp::Remove:
+              snapshot.index_cache->RemoveSecondaryIndexValue(
+                  primary_key, delta.primary_key.size());
+              break;
+            case SecondaryIndexOp::None:
+            case SecondaryIndexOp::Full:
+              assert(false);
+              break;
+          }
+        }
+        snapshot.data_item_copy = *snapshot.index_cache;
+        continue;
+      }
       *snapshot.index_cache = snapshot.data_item_copy;
     }
 
@@ -446,6 +501,12 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
       return false;
     }
 
+    if (RequiresLockBasedInstall()) {
+      // Delta writes must merge with the current locked PK-list; they are not
+      // safe to clear through NWR's omitted-version path.
+      return false;
+    }
+
     // We must updating mRS and mWS for each data item in read/write set,
     // to ensure serializability between this transaction and concurrent NWR
     // procedures. This updating need to execute CAS-loop.
@@ -479,6 +540,24 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
     // Fortunately we can safely omit this transaction.
     nwr_validation_result_ = NWRValidationResult::ACYCLIC;
     return true;
+  }
+
+  /**
+   * @brief Return true when a write must install through the lock-based path.
+   *
+   * @details NWR's omitted-version path can clear the write set without running
+   * the buffer install loop. Non-unique secondary-index deltas must reach that
+   * loop so they can merge with the locked current PK-list.
+   */
+  bool RequiresLockBasedInstall() const {
+    for (const auto& snapshot : tx_ref_.write_set_ref_) {
+      if (!snapshot.index_name.empty() &&
+          !snapshot.secondary_index_deltas.empty() &&
+          !snapshot.index_type.IsUnique()) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
