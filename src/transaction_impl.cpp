@@ -55,6 +55,105 @@ bool HasOwnBaseRowWriteInRange(const WriteSetType& write_set,
   }
   return false;
 }
+
+/**
+ * @brief Build the local starting copy for a secondary-index write.
+ *
+ * @details UNIQUE entries keep a validated read because uniqueness conflicts
+ * must abort. Non-unique entries use an unvalidated seed: the seed is only a
+ * workspace for building Add/Remove intent, and commit installs the intent by
+ * merging deltas into the locked live PK-list.
+ */
+DataItem SeedSecondaryIndexForWrite(
+    ConcurrencyControlBase* concurrency_control, std::string_view key,
+    DataItem* index_leaf, const Index::SecondaryIndexType& index_type) {
+  if (index_type.IsUnique()) {
+    return concurrency_control->Read(key, index_leaf);
+  }
+  return concurrency_control->ReadUnvalidated(key, index_leaf);
+}
+
+/**
+ * @brief True when a snapshot must be installed by non-unique SI delta merge.
+ */
+bool IsNonUniqueSecondaryIndexDeltaWrite(const Snapshot& snapshot) {
+  return !snapshot.index_name.empty() && !snapshot.index_type.IsUnique() &&
+         !snapshot.secondary_index_deltas.empty();
+}
+
+/**
+ * @brief Apply recorded SI Add/Remove operations to a DataItem's PK-list.
+ *
+ * @details Used both for the real commit-time merge and for rebuilding the
+ * transaction-local view before a read-after-write returns SI results.
+ */
+void ApplySecondaryIndexDeltas(
+    DataItem* item,
+    const std::vector<Snapshot::SecondaryIndexDelta>& deltas) {
+  for (const auto& delta : deltas) {
+    const auto* primary_key =
+        reinterpret_cast<const std::byte*>(delta.primary_key.data());
+    switch (delta.op) {
+      case SecondaryIndexOp::Add:
+        item->AddSecondaryIndexValue(primary_key, delta.primary_key.size());
+        break;
+      case SecondaryIndexOp::Remove:
+        item->RemoveSecondaryIndexValue(primary_key, delta.primary_key.size());
+        break;
+      case SecondaryIndexOp::None:
+      case SecondaryIndexOp::Full:
+        assert(false);
+        break;
+    }
+  }
+}
+
+/**
+ * @brief Rebuild an own-written non-unique SI snapshot before it is read.
+ *
+ * @details The write seed may be intentionally unvalidated and stale. A real
+ * read must instead observe a validated current PK-list plus this transaction's
+ * local Add/Remove deltas.
+ */
+void RefreshSecondaryIndexWriteSnapshot(
+    ConcurrencyControlBase* concurrency_control, Snapshot* snapshot) {
+  if (!IsNonUniqueSecondaryIndexDeltaWrite(*snapshot)) return;
+  snapshot->data_item_copy =
+      concurrency_control->Read(snapshot->key, snapshot->index_cache);
+  ApplySecondaryIndexDeltas(&snapshot->data_item_copy,
+                            snapshot->secondary_index_deltas);
+  snapshot->is_read_modify_write = true;
+}
+
+/**
+ * @brief Convert a secondary-index DataItem into the public read-result shape.
+ */
+std::vector<std::pair<const std::byte* const, const size_t>>
+SecondaryIndexReadResult(const DataItem& item) {
+  std::vector<std::pair<const std::byte* const, const size_t>> result;
+  if (item.primary_keys().empty()) return result;
+
+  for (const auto& primary_key : item.primary_keys()) {
+    result.emplace_back(reinterpret_cast<const std::byte*>(primary_key.data()),
+                        primary_key.size());
+  }
+  return result;
+}
+
+/**
+ * @brief Delete an empty UNIQUE SI entry immediately; defer non-unique cleanup.
+ *
+ * @details For non-unique SI, a local Remove can make the seeded copy empty
+ * even while a concurrent Add keeps the locked live PK-list non-empty. The final
+ * non-unique emptiness decision therefore belongs to the locked merge/reaper
+ * path, not the precommit write-construction path.
+ */
+bool MaybeDeleteEmptyUniqueSecondaryIndex(
+    Index::SecondaryIndex* index, const Index::SecondaryIndexType& index_type,
+    std::string_view key, const DataItem& item) {
+  if (!item.primary_keys().empty() || !index_type.IsUnique()) return true;
+  return index->Delete(key);
+}
 }
 
 void* GetCurrentTransactionContext() { return current_transaction_context; }
@@ -221,30 +320,15 @@ Transaction::Impl::ReadSecondaryIndex(const std::string_view index_name,
   for (auto& snapshot : write_set_) {
     if (snapshot.key == key && snapshot.table_name == table_name &&
         snapshot.index_name == index_name) {
-      std::vector<std::pair<const std::byte* const, const size_t>> result;
-      if (!snapshot.data_item_copy.primary_keys().empty()) {
-        for (auto& primary_key : snapshot.data_item_copy.primary_keys()) {
-          result.emplace_back(
-              reinterpret_cast<const std::byte*>(primary_key.data()),
-              primary_key.size());
-        }
-      }
-      return result;
+      RefreshSecondaryIndexWriteSnapshot(concurrency_control_.get(), &snapshot);
+      return SecondaryIndexReadResult(snapshot.data_item_copy);
     }
   }
 
   for (auto& snapshot : read_set_) {
     if (snapshot.key == key && snapshot.table_name == table_name &&
         snapshot.index_name == index_name) {
-      std::vector<std::pair<const std::byte* const, const size_t>> result;
-      if (!snapshot.data_item_copy.primary_keys().empty()) {
-        for (auto& primary_key : snapshot.data_item_copy.primary_keys()) {
-          result.emplace_back(
-              reinterpret_cast<const std::byte*>(primary_key.data()),
-              primary_key.size());
-        }
-      }
-      return result;
+      return SecondaryIndexReadResult(snapshot.data_item_copy);
     }
   }
 
@@ -259,17 +343,7 @@ Transaction::Impl::ReadSecondaryIndex(const std::string_view index_name,
   snapshot.data_item_copy = concurrency_control_->Read(key, index_leaf);
   auto& ref = read_set_.emplace_back(std::move(snapshot));
   if (ref.data_item_copy.IsInitialized()) {
-    std::vector<std::pair<const std::byte* const, const size_t>> result;
-    if (!ref.data_item_copy.primary_keys().empty()) {
-      for (auto& primary_key : ref.data_item_copy.primary_keys()) {
-        result.emplace_back(
-            reinterpret_cast<const std::byte*>(primary_key.data()),
-            primary_key.size());
-      }
-      return result;
-    } else {
-      return {};
-    }
+    return SecondaryIndexReadResult(ref.data_item_copy);
   }
   return {};
 }
@@ -394,7 +468,8 @@ void Transaction::Impl::WriteSecondaryIndex(
                          index_name,
                          0,
                          index_type};
-    snapshot.data_item_copy = concurrency_control_->Read(key, index_leaf);
+    snapshot.data_item_copy = SeedSecondaryIndexForWrite(
+        concurrency_control_.get(), key, index_leaf, index_type);
     snapshot.is_read_modify_write = true;
 
     read_set_.emplace_back(std::move(snapshot));
@@ -856,11 +931,12 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndex(
 
     // Check if key is in write_set
     bool found_in_write_set = false;
-    for (const auto& snapshot : write_set_) {
+    for (auto& snapshot : write_set_) {
       if (snapshot.table_name != si_table_name) continue;
       if (snapshot.index_name != index_name) continue;
       if (snapshot.key != key) continue;
 
+      RefreshSecondaryIndexWriteSnapshot(concurrency_control_.get(), &snapshot);
       const auto& pks = snapshot.data_item_copy.primary_keys();
 
       // Skip deleted keys (empty primary_keys means the entry was deleted)
@@ -964,11 +1040,12 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndexReverse(
 
     const auto& key = *it;
     bool found_in_write_set = false;
-    for (const auto& snapshot : write_set_) {
+    for (auto& snapshot : write_set_) {
       if (snapshot.table_name != si_table_name) continue;
       if (snapshot.index_name != index_name) continue;
       if (snapshot.key != key) continue;
 
+      RefreshSecondaryIndexWriteSnapshot(concurrency_control_.get(), &snapshot);
       const auto& pks = snapshot.data_item_copy.primary_keys();
 
       // Skip deleted keys (empty primary_keys means the entry was deleted)
@@ -1062,11 +1139,10 @@ void Transaction::Impl::DeleteSecondaryIndex(
                                                       primary_key_size);
     snapshot.RecordSecondaryIndexDelta(primary_key_view,
                                        SecondaryIndexOp::Remove);
-    if (snapshot.data_item_copy.primary_keys().empty()) {
-      if (!index->Delete(secondary_key)) {
-        Abort();
-        return;
-      }
+    if (!MaybeDeleteEmptyUniqueSecondaryIndex(
+            index, index_type, secondary_key, snapshot.data_item_copy)) {
+      Abort();
+      return;
     }
     if (is_rmf) snapshot.is_read_modify_write = true;
     break;
@@ -1084,8 +1160,8 @@ void Transaction::Impl::DeleteSecondaryIndex(
                            0,
                            index_type};
 
-      snapshot.data_item_copy =
-          concurrency_control_->Read(secondary_key, index_leaf);
+      snapshot.data_item_copy = SeedSecondaryIndexForWrite(
+          concurrency_control_.get(), secondary_key, index_leaf, index_type);
       read_set_.emplace_back(std::move(snapshot));
       base_data = &read_set_.back().data_item_copy;
     }
@@ -1096,11 +1172,10 @@ void Transaction::Impl::DeleteSecondaryIndex(
     sp.data_item_copy.RemoveSecondaryIndexValue(primary_key_buffer,
                                                 primary_key_size);
 
-    if (sp.data_item_copy.primary_keys().empty()) {
-      if (!index->Delete(secondary_key)) {
-        Abort();
-        return;
-      }
+    if (!MaybeDeleteEmptyUniqueSecondaryIndex(index, index_type, secondary_key,
+                                             sp.data_item_copy)) {
+      Abort();
+      return;
     }
 
     sp.RecordSecondaryIndexDelta(primary_key_view, SecondaryIndexOp::Remove);
@@ -1160,11 +1235,10 @@ void Transaction::Impl::UpdateSecondaryIndex(
                                                       primary_key_size);
     snapshot.RecordSecondaryIndexDelta(primary_key_view,
                                        SecondaryIndexOp::Remove);
-    if (snapshot.data_item_copy.primary_keys().empty()) {
-      if (!index->Delete(old_secondary_key)) {
-        Abort();
-        return;
-      }
+    if (!MaybeDeleteEmptyUniqueSecondaryIndex(
+            index, index_type, old_secondary_key, snapshot.data_item_copy)) {
+      Abort();
+      return;
     }
     if (is_rmf_old_key) snapshot.is_read_modify_write = true;
     break;
@@ -1182,8 +1256,8 @@ void Transaction::Impl::UpdateSecondaryIndex(
                            0,
                            index_type};
 
-      snapshot.data_item_copy =
-          concurrency_control_->Read(old_secondary_key, old_leaf);
+      snapshot.data_item_copy = SeedSecondaryIndexForWrite(
+          concurrency_control_.get(), old_secondary_key, old_leaf, index_type);
       read_set_.emplace_back(std::move(snapshot));
       base_data_old_key = &read_set_.back().data_item_copy;
     }
@@ -1194,11 +1268,11 @@ void Transaction::Impl::UpdateSecondaryIndex(
     sp.data_item_copy.RemoveSecondaryIndexValue(primary_key_buffer,
                                                 primary_key_size);
 
-    if (sp.data_item_copy.primary_keys().empty()) {
-      if (!index->Delete(old_secondary_key)) {
-        Abort();
-        return;
-      }
+    if (!MaybeDeleteEmptyUniqueSecondaryIndex(index, index_type,
+                                             old_secondary_key,
+                                             sp.data_item_copy)) {
+      Abort();
+      return;
     }
 
     concurrency_control_->Write(old_secondary_key, primary_key_buffer,
@@ -1274,8 +1348,8 @@ void Transaction::Impl::UpdateSecondaryIndex(
                            0,
                            index_type};
 
-      snapshot.data_item_copy =
-          concurrency_control_->Read(new_secondary_key, new_leaf);
+      snapshot.data_item_copy = SeedSecondaryIndexForWrite(
+          concurrency_control_.get(), new_secondary_key, new_leaf, index_type);
       read_set_.emplace_back(std::move(snapshot));
       base_data_new_key = &read_set_.back().data_item_copy;
     }

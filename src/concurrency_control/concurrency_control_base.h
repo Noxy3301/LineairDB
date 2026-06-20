@@ -41,6 +41,18 @@ class ConcurrencyControlBase {
   ConcurrencyControlBase(TransactionReferences&& tx) : tx_ref_(tx) {}
   virtual ~ConcurrencyControlBase(){};
   virtual const DataItem Read(std::string_view, DataItem*) = 0;
+
+  /**
+   * @brief Read a stable copy for write preparation without requiring validation.
+   *
+   * @details This is used for internal seed copies that are not logical user
+   * reads. Backends that do not override it keep the conservative behavior by
+   * delegating to Read().
+   */
+  virtual const DataItem ReadUnvalidated(std::string_view key,
+                                         DataItem* index_leaf) {
+    return Read(key, index_leaf);
+  }
   // Zero-copy read for Scan. Returns pointer + size, no DataItem copy.
   // Scan only forwards raw bytes and never inspects DataItem internals
   // (e.g. primary_keys), so the pointer is sufficient.
