@@ -110,6 +110,15 @@ bool Database::ComputeIndexNdvInt(const std::string_view table_name,
                                        out_ndv);
 }
 
+bool Database::ComputeIndexHistogram(const std::string_view table_name,
+                                     const std::string_view index_name,
+                                     uint32_t buckets,
+                                     std::vector<std::string>& out_bounds,
+                                     std::vector<uint64_t>& out_cum) {
+  return db_pimpl_->ComputeIndexHistogram(table_name, index_name, buckets,
+                                          out_bounds, out_cum);
+}
+
 bool Database::ValidateAndCommit(
     const std::vector<ExternalReadEntry>& reads,
     const std::vector<ExternalWriteEntry>& writes,

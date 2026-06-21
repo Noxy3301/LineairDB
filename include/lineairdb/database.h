@@ -295,6 +295,21 @@ class Database {
                           uint32_t num_parts, std::vector<uint64_t>& out_ndv);
 
   /**
+   * @brief Build an equi-depth histogram for one index's leading key part.
+   *
+   * @details `out_bounds[i]` is the raw encoded leading-key prefix for a
+   * bucket boundary, in ascending order. `out_cum[i]` is the cumulative row
+   * count up to that boundary and is monotone; the last value is the total
+   * counted rows. `index_name == ""` selects the primary index. Returns false
+   * when the table/index is missing, the index is empty, or a leading key part
+   * cannot be decoded safely.
+   */
+  bool ComputeIndexHistogram(const std::string_view table_name,
+                             const std::string_view index_name, uint32_t buckets,
+                             std::vector<std::string>& out_bounds,
+                             std::vector<uint64_t>& out_cum);
+
+  /**
    * @brief Validate caller-supplied read and write sets and install the
    *        writes atomically.
    *
