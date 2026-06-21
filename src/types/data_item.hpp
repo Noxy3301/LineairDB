@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <xmmintrin.h>
 #include <memory>
@@ -44,18 +45,43 @@ struct DataItem {
   // std::stringのvectorを保持する
   // lineairdvkeyみたいなエイリアス
   std::shared_ptr<std::vector<std::string>> primary_keys_ptr;
+
+#ifdef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
   std::vector<std::string> checkpoint_primary_keys;
-  bool checkpoint_primary_keys_captured;
+  bool checkpoint_primary_keys_captured = false;
   /* std::unique_ptr<std::vector<DataBuffer>> sec_idx_buffers; */
   DataBuffer checkpoint_buffer;                     // a.k.a. stable version
+#endif
   std::atomic<NWRPivotObject> pivot_object;         // for NWR
+#ifdef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
   Lock::ReadersWritersLockBO readers_writers_lock;  // for 2PL
+#else
+  // Slim layout for plain Silo with checkpointing disabled.
+  // Startup rejects configs that would use these process-wide dummies.
+  static inline std::vector<std::string> checkpoint_primary_keys{};
+  static inline bool checkpoint_primary_keys_captured = false;
+  static inline DataBuffer checkpoint_buffer{};
+  static inline Lock::ReadersWritersLockBO readers_writers_lock{};
+#endif
 
   std::byte* value() { return &buffer.value[0]; }
   const std::byte* value() const { return &buffer.value[0]; }
   size_t size() const { return buffer.size; }
   bool IsInitialized() const { return initialized; }
 
+ private:
+#ifndef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
+  [[noreturn]] static void AbortFullDataItemLayoutRequired(
+      const char* feature) {
+    SPDLOG_ERROR(
+        "{} requires the full DataItem layout. Rebuild with "
+        "-DLINEAIRDB_WITH_2PL_CHECKPOINT_METADATA.",
+        feature);
+    std::abort();
+  }
+#endif
+
+ public:
   // primary_keys accessor (read-only, copy-on-write)
   const std::vector<std::string>& primary_keys() const {
     static const std::vector<std::string> empty;
@@ -73,12 +99,10 @@ struct DataItem {
   DataItem()
       : transaction_id(0),
         initialized(false),
-        checkpoint_primary_keys_captured(false),
         pivot_object(NWRPivotObject()) {}
   DataItem(const std::byte* v, size_t s, TransactionId tid = 0)
       : transaction_id(tid),
         initialized(true),
-        checkpoint_primary_keys_captured(false),
         pivot_object(NWRPivotObject()) {
     Reset(v, s);
   }
@@ -86,7 +110,6 @@ struct DataItem {
       : transaction_id(rhs.transaction_id.load()),
         initialized(rhs.initialized),
         primary_keys_ptr(rhs.primary_keys_ptr),  // shared_ptr copy = refcount++
-        checkpoint_primary_keys_captured(false),
         pivot_object(NWRPivotObject()) {
     buffer.Reset(rhs.buffer);
     /* if (rhs.sec_idx_buffers) {
@@ -117,21 +140,25 @@ struct DataItem {
         initialized(rhs.initialized),
         buffer(std::move(rhs.buffer)),
         primary_keys_ptr(std::move(rhs.primary_keys_ptr)),
-        checkpoint_primary_keys(std::move(rhs.checkpoint_primary_keys)),
-        checkpoint_primary_keys_captured(rhs.checkpoint_primary_keys_captured),
-        checkpoint_buffer(std::move(rhs.checkpoint_buffer)),
-        pivot_object(rhs.pivot_object.load()),
-        readers_writers_lock() {}
+        pivot_object(rhs.pivot_object.load()) {
+#ifdef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
+    checkpoint_primary_keys = std::move(rhs.checkpoint_primary_keys);
+    checkpoint_primary_keys_captured = rhs.checkpoint_primary_keys_captured;
+    checkpoint_buffer = std::move(rhs.checkpoint_buffer);
+#endif
+  }
 
   DataItem& operator=(DataItem&& rhs) noexcept {
     transaction_id.store(rhs.transaction_id.load());
     initialized = rhs.initialized;
     buffer = std::move(rhs.buffer);
     primary_keys_ptr = std::move(rhs.primary_keys_ptr);
+    pivot_object.store(rhs.pivot_object.load());
+#ifdef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
     checkpoint_primary_keys = std::move(rhs.checkpoint_primary_keys);
     checkpoint_primary_keys_captured = rhs.checkpoint_primary_keys_captured;
     checkpoint_buffer = std::move(rhs.checkpoint_buffer);
-    pivot_object.store(rhs.pivot_object.load());
+#endif
     return *this;
   }
 
@@ -164,6 +191,9 @@ struct DataItem {
   }
 
   void CopyLiveVersionToStableVersion() {
+#ifndef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
+    AbortFullDataItemLayoutRequired("Checkpoint stable version");
+#else
     // There is an assumption that this thread can `exclusively` access this
     // data item.
     if (checkpoint_buffer.IsEmpty()) {
@@ -173,19 +203,32 @@ struct DataItem {
       checkpoint_primary_keys = primary_keys();  // deep copy from shared
       checkpoint_primary_keys_captured = true;
     }
+#endif
   }
 
   bool HasCheckpointPrimaryKeys() const {
+#ifndef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
+    AbortFullDataItemLayoutRequired("Checkpoint primary-key metadata");
+#else
     return checkpoint_primary_keys_captured;
+#endif
   }
 
   const std::vector<std::string>& GetCheckpointPrimaryKeys() const {
+#ifndef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
+    AbortFullDataItemLayoutRequired("Checkpoint primary-key metadata");
+#else
     return checkpoint_primary_keys;
+#endif
   }
 
   void ClearCheckpointPrimaryKeys() {
+#ifndef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
+    AbortFullDataItemLayoutRequired("Checkpoint primary-key metadata");
+#else
     checkpoint_primary_keys.clear();
     checkpoint_primary_keys_captured = false;
+#endif
   }
 
  private:
@@ -202,6 +245,9 @@ struct DataItem {
  public:
 
   void ExclusiveLock() {
+#ifndef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
+    AbortFullDataItemLayoutRequired("Checkpoint/2PL exclusive lock");
+#endif
     // Acquire exclusive locking for all protocols:
 
     {
@@ -223,6 +269,9 @@ struct DataItem {
   }
 
   void ExclusiveUnlock() {
+#ifndef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
+    AbortFullDataItemLayoutRequired("Checkpoint/2PL exclusive lock");
+#endif
     // Release exclusive locking for all protocols:
 
     // for Silo, Silo+NWR. they uses transaction_id as the lock
@@ -236,7 +285,11 @@ struct DataItem {
   }
 
   decltype(readers_writers_lock)& GetRWLockRef() {
+#ifndef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
+    AbortFullDataItemLayoutRequired("2PL row lock");
+#else
     return readers_writers_lock;
+#endif
   };
 };
 }  // namespace LineairDB

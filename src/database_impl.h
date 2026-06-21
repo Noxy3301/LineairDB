@@ -65,12 +65,35 @@ class Database::Impl {
  public:
   inline static Database::Impl* CurrentDBInstance;
 
+ private:
+  static const Config& ValidateDataItemLayoutConfig(const Config& config) {
+#ifndef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
+    // The slim DataItem layout keeps only shared dummy storage for these paths.
+    if (config.enable_checkpointing) {
+      SPDLOG_ERROR(
+          "Unsupported configuration: checkpointing requires the full DataItem "
+          "layout. Rebuild with -DLINEAIRDB_WITH_2PL_CHECKPOINT_METADATA.");
+      exit(EXIT_FAILURE);
+    }
+    if (config.concurrency_control_protocol ==
+        Config::ConcurrencyControl::TwoPhaseLocking) {
+      SPDLOG_ERROR(
+          "Unsupported configuration: TwoPhaseLocking requires the full "
+          "DataItem layout. Rebuild with "
+          "-DLINEAIRDB_WITH_2PL_CHECKPOINT_METADATA.");
+      exit(EXIT_FAILURE);
+    }
+#endif
+    return config;
+  }
+
+ public:
   Impl(const Config& c = Config())
-      : config_(c),
-        thread_pool_(c.max_thread),
+      : config_(ValidateDataItemLayoutConfig(c)),
+        thread_pool_(config_.max_thread),
         logger_(config_),
         callback_manager_(config_),
-        epoch_framework_(c.epoch_duration_ms, EventsOnEpochIsUpdated()),
+        epoch_framework_(config_.epoch_duration_ms, EventsOnEpochIsUpdated()),
         checkpoint_manager_(config_, table_dictionary_, epoch_framework_) {
     // 2PL x Masstree unsupported (see 2PL ReadDirect FIXME).
     if (config_.concurrency_control_protocol ==
