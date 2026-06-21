@@ -551,6 +551,147 @@ class Database::Impl {
     return true;
   }
 
+  /**
+   * @brief Build an equi-depth histogram for one index's leading key part.
+   *
+   * @details The proxy uses the returned boundaries to estimate one-column
+   * range cardinality locally. The scan is independent of NDV/rec_per_key:
+   * pass 1 counts row weight, and pass 2 records the leading-key prefix at
+   * each bucket boundary. Secondary-index entries are weighted by their PK
+   * list size so bucket depth tracks rows, not distinct secondary keys.
+   *
+   * Only order-preserving fixed-layout leading parts are accepted. Unsupported
+   * or malformed encodings return false, letting the proxy keep its heuristic.
+   */
+  bool ComputeIndexHistogram(const std::string_view table_name,
+                             const std::string_view index_name, uint32_t buckets,
+                             std::vector<std::string>& out_bounds,
+                             std::vector<uint64_t>& out_cum) {
+    out_bounds.clear();
+    out_cum.clear();
+    if (buckets == 0) return false;
+    std::shared_lock<std::shared_mutex> lk(schema_mutex_);
+    auto table = GetTable(table_name);
+    if (!table.has_value()) return false;
+
+    // Leading key-part layout: [marker][type][2-byte length][payload].
+    // Accept only fixed-layout encodings whose byte order matches value order.
+    auto leading_end = [](std::string_view key) -> size_t {
+      if (key.size() < 4) return 0;
+      if (static_cast<unsigned char>(key[0]) != 0x00) return 0;
+      const unsigned char type = static_cast<unsigned char>(key[1]);
+      if (type != 0x10 && type != 0x30) return 0;  // INT / DATETIME only
+      const size_t len =
+          (static_cast<size_t>(static_cast<unsigned char>(key[2])) << 8) |
+          static_cast<unsigned char>(key[3]);
+      const size_t end = 4 + len;
+      return (end <= key.size()) ? end : 0;
+    };
+
+    // Stable-read base-row liveness without copying the row payload.
+    const auto stable_live_base = [](DataItem& di) -> bool {
+      for (;;) {
+        TransactionId tid = di.transaction_id.load();
+        if (tid.tid & 1u) {
+          _mm_pause();
+          continue;
+        }
+        const bool live = di.IsInitialized() && di.size() != 0;
+        if (di.transaction_id.load() == tid) return live;
+      }
+    };
+
+    // Secondary scans visit one entry per key, but the histogram is over rows.
+    // Use the PK-list length as that key's row weight.
+    const auto stable_pk_count = [](DataItem& di) -> uint64_t {
+      for (;;) {
+        TransactionId tid = di.transaction_id.load();
+        if (tid.tid & 1u) {
+          _mm_pause();
+          continue;
+        }
+        const uint64_t n = di.IsInitialized() ? di.primary_keys().size() : 0;
+        if (di.transaction_id.load() == tid) return n;
+      }
+    };
+    static const std::string kMaxEnd(16, '\xff');
+
+    // Walk one index in key order and expose each live key with its row weight.
+    bool malformed = false;
+    auto walk = [&](auto&& fn) {
+      if (index_name.empty()) {
+        table.value()->GetPrimaryIndex().Scan(
+            std::string_view(), std::string_view(kMaxEnd),
+            [&](std::string_view key, DataItem& di) -> bool {
+              if (stable_live_base(di)) return fn(key, static_cast<uint64_t>(1));
+              return false;
+            },
+            nullptr);
+      } else {
+        Index::SecondaryIndex* index =
+            table.value()->GetSecondaryIndex(index_name);
+        if (index == nullptr) {
+          malformed = true;
+          return;
+        }
+        index->Scan(
+            std::string_view(), std::string_view(kMaxEnd),
+            [&](std::string_view key) -> bool {
+              DataItem* item = index->Get(key);
+              if (item == nullptr) return false;
+              const uint64_t w = stable_pk_count(*item);
+              if (w == 0) return false;  // dead/empty secondary entry
+              return fn(key, w);
+            },
+            nullptr);
+      }
+    };
+
+    // Pass 1: count total rows represented by the index.
+    uint64_t total = 0;
+    walk([&](std::string_view key, uint64_t w) -> bool {
+      if (leading_end(key) == 0) {
+        malformed = true;
+        return true;
+      }
+      total += w;
+      return false;
+    });
+    if (malformed || total == 0) return false;
+
+    // Pass 2: record a boundary at each stride-th row.
+    const uint64_t stride = std::max<uint64_t>(1, total / buckets);
+    uint64_t seen = 0;
+    uint64_t next = stride;
+    std::string last_key;
+    walk([&](std::string_view key, uint64_t w) -> bool {
+      const size_t end = leading_end(key);
+      if (end == 0) {
+        malformed = true;
+        return true;
+      }
+      seen += w;
+      last_key.assign(key.data(), end);
+      if (seen >= next) {
+        out_bounds.emplace_back(key.substr(0, end));
+        out_cum.push_back(seen);
+        while (seen >= next) next += stride;
+      }
+      return false;
+    });
+    if (malformed) {
+      out_bounds.clear();
+      out_cum.clear();
+      return false;
+    }
+    if (out_bounds.empty() || out_cum.back() != total) {
+      // Close the histogram at the max key so the high end is exact.
+      out_bounds.push_back(last_key);
+      out_cum.push_back(total);
+    }
+    return !out_bounds.empty();
+  }
+
   bool ValidateAndCommit(
       const std::vector<ExternalReadEntry>& reads,
       const std::vector<ExternalWriteEntry>& writes,
