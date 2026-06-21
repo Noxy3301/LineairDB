@@ -52,7 +52,13 @@ struct DataItem {
   /* std::unique_ptr<std::vector<DataBuffer>> sec_idx_buffers; */
   DataBuffer checkpoint_buffer;                     // a.k.a. stable version
 #endif
+#ifdef LINEAIRDB_WITH_NWR
   std::atomic<NWRPivotObject> pivot_object;         // for NWR
+#else
+  // Compile NWR/2PL sources without carrying one pivot object per record.
+  // Startup rejects NWR when this process-wide dummy would be used.
+  static inline std::atomic<NWRPivotObject> pivot_object{};
+#endif
 #ifdef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
   Lock::ReadersWritersLockBO readers_writers_lock;  // for 2PL
 #else
@@ -98,19 +104,31 @@ struct DataItem {
 
   DataItem()
       : transaction_id(0),
-        initialized(false),
-        pivot_object(NWRPivotObject()) {}
+        initialized(false)
+#ifdef LINEAIRDB_WITH_NWR
+        ,
+        pivot_object(NWRPivotObject())
+#endif
+  {}
   DataItem(const std::byte* v, size_t s, TransactionId tid = 0)
       : transaction_id(tid),
-        initialized(true),
-        pivot_object(NWRPivotObject()) {
+        initialized(true)
+#ifdef LINEAIRDB_WITH_NWR
+        ,
+        pivot_object(NWRPivotObject())
+#endif
+  {
     Reset(v, s);
   }
   DataItem(const DataItem& rhs)
       : transaction_id(rhs.transaction_id.load()),
         initialized(rhs.initialized),
-        primary_keys_ptr(rhs.primary_keys_ptr),  // shared_ptr copy = refcount++
-        pivot_object(NWRPivotObject()) {
+        primary_keys_ptr(rhs.primary_keys_ptr)  // shared_ptr copy = refcount++
+#ifdef LINEAIRDB_WITH_NWR
+        ,
+        pivot_object(NWRPivotObject())
+#endif
+  {
     buffer.Reset(rhs.buffer);
     /* if (rhs.sec_idx_buffers) {
       sec_idx_buffers =
@@ -139,8 +157,12 @@ struct DataItem {
       : transaction_id(rhs.transaction_id.load()),
         initialized(rhs.initialized),
         buffer(std::move(rhs.buffer)),
-        primary_keys_ptr(std::move(rhs.primary_keys_ptr)),
-        pivot_object(rhs.pivot_object.load()) {
+        primary_keys_ptr(std::move(rhs.primary_keys_ptr))
+#ifdef LINEAIRDB_WITH_NWR
+        ,
+        pivot_object(rhs.pivot_object.load())
+#endif
+  {
 #ifdef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
     checkpoint_primary_keys = std::move(rhs.checkpoint_primary_keys);
     checkpoint_primary_keys_captured = rhs.checkpoint_primary_keys_captured;
@@ -153,7 +175,9 @@ struct DataItem {
     initialized = rhs.initialized;
     buffer = std::move(rhs.buffer);
     primary_keys_ptr = std::move(rhs.primary_keys_ptr);
+#ifdef LINEAIRDB_WITH_NWR
     pivot_object.store(rhs.pivot_object.load());
+#endif
 #ifdef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
     checkpoint_primary_keys = std::move(rhs.checkpoint_primary_keys);
     checkpoint_primary_keys_captured = rhs.checkpoint_primary_keys_captured;

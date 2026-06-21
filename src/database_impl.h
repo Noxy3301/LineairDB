@@ -84,6 +84,15 @@ class Database::Impl {
       exit(EXIT_FAILURE);
     }
 #endif
+#ifndef LINEAIRDB_WITH_NWR
+    if (config.concurrency_control_protocol ==
+        Config::ConcurrencyControl::SiloNWR) {
+      SPDLOG_ERROR(
+          "Unsupported configuration: SiloNWR requires per-record NWR pivot "
+          "metadata. Rebuild with -DLINEAIRDB_WITH_NWR.");
+      exit(EXIT_FAILURE);
+    }
+#endif
     return config;
   }
 
