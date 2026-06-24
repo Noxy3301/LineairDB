@@ -54,13 +54,10 @@ StatelessRangeScanResult RangeScan(TableDictionary& tables,
 
   uint64_t returned_rows = 0;
 
-  auto append_scan_entry = [&](std::string_view key, DataItem&) {
-    DataItem* item = table.value()->GetPrimaryIndex().Get(key);
-    if (item == nullptr) {
-      return false;
-    }
-
-    auto row = ConcurrencyControl::StableReadValue(*item);
+  // The value-yielding Scan/ScanReverse overloads pass the DataItem the leaf
+  // walk already resolved, so read it directly instead of re-fetching by key.
+  auto append_scan_entry = [&](std::string_view key, DataItem& item_ref) {
+    auto row = ConcurrencyControl::StableReadValue(item_ref);
     if (row.found) {
       result.rows.push_back({std::string(key), std::move(row.value),
                              PackTransactionId(row.tid), true});
