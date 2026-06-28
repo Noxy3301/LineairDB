@@ -480,7 +480,7 @@ class Database::Impl {
           continue;
         }
 
-        const bool live = item.IsInitialized() && item.size() != 0;
+        const bool live = item.IsPrimaryInitialized();
         if (item.transaction_id.load() == tid) return live;
       }
     };
@@ -596,7 +596,7 @@ class Database::Impl {
           _mm_pause();
           continue;
         }
-        const bool live = di.IsInitialized() && di.size() != 0;
+        const bool live = di.IsPrimaryInitialized();
         if (di.transaction_id.load() == tid) return live;
       }
     };
@@ -736,8 +736,12 @@ class Database::Impl {
     auto&& recovery_sets = logger_.GetRecoverySetFromLogs(durable_epoch);
 
     for (auto& recovery_set : recovery_sets) {
-      // Skip deleted entries (tombstones with size=0)
-      if (!recovery_set.data_item_copy.IsInitialized()) continue;
+      // Skip deleted entries.
+      const bool live =
+          recovery_set.index_name.empty()
+              ? recovery_set.data_item_copy.IsPrimaryInitialized()
+              : recovery_set.data_item_copy.IsInitialized();
+      if (!live) continue;
       CreateTable(recovery_set.table_name);
       auto table = GetTable(recovery_set.table_name);
       if (!table.has_value()) {

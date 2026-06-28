@@ -287,7 +287,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     }
 
     if (!read.found) {
-      if (!item->IsInitialized()) {
+      if (!item->IsPrimaryInitialized()) {
         continue;
       }
       return unlock_and_abort(
@@ -311,7 +311,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
       return unlock_and_abort(
           exact_read_reason("exact_read_tid_moved", read));
     }
-    if (read.found && !item->IsInitialized()) {
+    if (read.found && !item->IsPrimaryInitialized()) {
       return unlock_and_abort(
           exact_read_reason("exact_read_deleted", read));
     }
@@ -352,7 +352,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
             aborted = true;
             return true;
           }
-          if (item.IsInitialized() && item.size() != 0) {
+          if (item.IsPrimaryInitialized()) {
             keys.emplace_back(key);
           }
           return range.row_limit > 0 && keys.size() >= range.row_limit;
@@ -386,7 +386,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
             aborted = true;
             return true;
           }
-          if (item->IsInitialized() && item->size() != 0) {
+          if (item->IsPrimaryInitialized()) {
             secondary_keys.push_back(secondary_key);
             primary_keys.push_back(primary_key);
           }
@@ -407,14 +407,14 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
             aborted = true;
             return true;
           }
-          const bool initialized = item->IsInitialized();
+          const bool secondary_live = item->IsInitialized();
           std::vector<std::string> item_primary_keys;
-          if (initialized) item_primary_keys = item->primary_keys();
+          if (secondary_live) item_primary_keys = item->primary_keys();
           if (item->transaction_id.load() != observed) {
             aborted = true;
             return true;
           }
-          if (!initialized || item_primary_keys.empty()) {
+          if (!secondary_live || item_primary_keys.empty()) {
             return false;
           }
           for (const auto& primary_key : item_primary_keys) {

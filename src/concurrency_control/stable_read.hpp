@@ -37,8 +37,7 @@ struct StablePrimaryKeys {
 /**
  * @brief Stable read of a base-row DataItem.
  *
- * `found` is false for tombstones (initialized but empty) and
- * uninitialized slots.
+ * `found` is false for tombstones and uninitialized slots.
  */
 inline StableValue StableReadValue(const DataItem& item) {
   for (;;) {
@@ -48,7 +47,7 @@ inline StableValue StableReadValue(const DataItem& item) {
       continue;
     }
 
-    const bool found = item.IsInitialized() && item.size() != 0;
+    const bool found = item.IsPrimaryInitialized();
     std::string value;
     if (found) {
       value.assign(reinterpret_cast<const char*>(item.value()), item.size());

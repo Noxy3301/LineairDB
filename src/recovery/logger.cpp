@@ -245,9 +245,6 @@ WriteSetType Logger::GetRecoverySetFromLogs(const EpochNumber durable_epoch) {
         return recovery_set;
       }
 
-      auto ensure_initialized = [](LineairDB::DataItem& data_item) {
-        data_item.initialized = !data_item.primary_keys().empty();
-      };
       for (auto& log_record : log_records) {
         assert(0 < log_record.epoch);
         if (filename == checkpoint_filename ||
@@ -301,7 +298,6 @@ WriteSetType Logger::GetRecoverySetFromLogs(const EpochNumber durable_epoch) {
                       Index::SecondaryIndexType::FromRaw(kvp.index_type);
                   if (is_secondary_index) {
                     item.data_item_copy.SetPrimaryKeys(kvp.primary_keys);
-                    ensure_initialized(item.data_item_copy);
                   }
 
                   primary_updates++;
@@ -321,7 +317,6 @@ WriteSetType Logger::GetRecoverySetFromLogs(const EpochNumber durable_epoch) {
               };
               if (is_secondary_index) {
                 snapshot.data_item_copy.SetPrimaryKeys(kvp.primary_keys);
-                ensure_initialized(snapshot.data_item_copy);
               }
               recovery_set.emplace_back(std::move(snapshot));
               primary_inserts++;

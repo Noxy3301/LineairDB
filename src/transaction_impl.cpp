@@ -296,7 +296,7 @@ const std::pair<const std::byte* const, const size_t> Transaction::Impl::Read(
 
   snapshot.data_item_copy = concurrency_control_->Read(key, index_leaf);
   auto& ref = read_set_.emplace_back(std::move(snapshot));
-  if (ref.data_item_copy.IsInitialized()) {
+  if (ref.data_item_copy.IsPrimaryInitialized()) {
     return {ref.data_item_copy.value(), ref.data_item_copy.size()};
   } else {
     return {nullptr, 0};
@@ -414,7 +414,6 @@ void Transaction::Impl::WriteSecondaryIndex(
   const auto index_type = index->GetIndexType();
 
   // existing key
-  // unique constraint check out of the transaction
   Index::NodeVersionUpdate si_own_insert;
   DataItem* index_leaf = index->GetOrInsertForWrite(key, &si_own_insert);
   if (index_leaf == nullptr) {
@@ -423,10 +422,6 @@ void Transaction::Impl::WriteSecondaryIndex(
   }
   ReconcileOwnInsertWithNodeVersionSet(si_own_insert);
   if (IsAborted()) return;
-  if (index_leaf->IsInitialized() && index->IsUnique()) {
-    Abort();
-    return;
-  }
 
   bool is_rmf = false;
   const DataItem* base_data = nullptr;
@@ -477,6 +472,12 @@ void Transaction::Impl::WriteSecondaryIndex(
     is_rmf = true;
   }
 
+  if (index->IsUnique() && base_data != nullptr &&
+      base_data->IsInitialized()) {
+    Abort();
+    return;
+  }
+
   concurrency_control_->Write(key, primary_key_buffer, primary_key_size,
                               index_leaf);
   Snapshot sp(key, nullptr, 0, index_leaf, current_table_->GetTableName(),
@@ -525,7 +526,7 @@ void Transaction::Impl::Update(const std::string_view key,
     if (snapshot.key == key && snapshot.table_name == table_name &&
         snapshot.index_name.empty()) {
       // If the key was deleted within this transaction, Update should fail.
-      if (!snapshot.data_item_copy.IsInitialized()) {
+      if (!snapshot.data_item_copy.IsPrimaryInitialized()) {
         Abort();
         return;
       }
@@ -535,7 +536,7 @@ void Transaction::Impl::Update(const std::string_view key,
   }
 
   auto* index_leaf = current_table_->GetPrimaryIndex().Get(key);
-  if (index_leaf == nullptr || !index_leaf->IsInitialized()) {
+  if (index_leaf == nullptr || !index_leaf->IsPrimaryInitialized()) {
     Abort();
     return;
   }
@@ -580,7 +581,7 @@ const std::optional<size_t> Transaction::Impl::ScanPrimaryIndexWithEarlyStop(
       if (snapshot.key != key || snapshot.table_name != table_name || !snapshot.index_name.empty()) {
         continue;
       }
-      if (snapshot.data_item_copy.IsInitialized()) {
+      if (snapshot.data_item_copy.IsPrimaryInitialized()) {
         std::pair<const void*, const size_t> value_pair = {
           snapshot.data_item_copy.value(), snapshot.data_item_copy.size()};
         total_count++;
@@ -688,7 +689,7 @@ const std::optional<size_t> Transaction::Impl::Scan(
       found_in_write_set = true;
 
       // If the key is deleted within this transaction, skip it
-      if (!snapshot.data_item_copy.IsInitialized()) {
+      if (!snapshot.data_item_copy.IsPrimaryInitialized()) {
         break;
       }
 
@@ -711,7 +712,7 @@ const std::optional<size_t> Transaction::Impl::Scan(
         if (snapshot.key != key || snapshot.table_name != scan_table ||
             !snapshot.index_name.empty()) continue;
         found_in_read_set = true;
-        if (snapshot.data_item_copy.IsInitialized()) {
+        if (snapshot.data_item_copy.IsPrimaryInitialized()) {
           std::pair<const void*, const size_t> value_pair = {
               snapshot.data_item_copy.value(),
               snapshot.data_item_copy.size()};
@@ -822,7 +823,7 @@ const std::optional<size_t> Transaction::Impl::ScanReverse(
 
       found_in_write_set = true;
 
-      if (!snapshot.data_item_copy.IsInitialized()) {
+      if (!snapshot.data_item_copy.IsPrimaryInitialized()) {
         break;
       }
 
@@ -843,7 +844,7 @@ const std::optional<size_t> Transaction::Impl::ScanReverse(
         if (snapshot.key != key || snapshot.table_name != scan_table ||
             !snapshot.index_name.empty()) continue;
         found_in_read_set = true;
-        if (snapshot.data_item_copy.IsInitialized()) {
+        if (snapshot.data_item_copy.IsPrimaryInitialized()) {
           std::pair<const void*, const size_t> value_pair = {
               snapshot.data_item_copy.value(),
               snapshot.data_item_copy.size()};
@@ -1293,11 +1294,6 @@ void Transaction::Impl::UpdateSecondaryIndex(
   }
   ReconcileOwnInsertWithNodeVersionSet(si_own_insert_new);
   if (IsAborted()) return;
-  // unique constraint check out of the transaction
-  if (new_leaf->IsInitialized() && index->IsUnique()) {
-    Abort();
-    return;
-  }
   bool new_found_in_write_set = false;
 
   bool is_rmf_new_key = false;
@@ -1352,6 +1348,11 @@ void Transaction::Impl::UpdateSecondaryIndex(
           concurrency_control_.get(), new_secondary_key, new_leaf, index_type);
       read_set_.emplace_back(std::move(snapshot));
       base_data_new_key = &read_set_.back().data_item_copy;
+    }
+    if (index->IsUnique() && base_data_new_key != nullptr &&
+        base_data_new_key->IsInitialized()) {
+      Abort();
+      return;
     }
     Snapshot sp(new_secondary_key, nullptr, 0, new_leaf,
                 current_table_->GetTableName(), index_name, 0, index_type);

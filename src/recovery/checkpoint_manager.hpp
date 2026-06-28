@@ -121,8 +121,8 @@ class CPRManager {
                     [&](std::string_view key, LineairDB::DataItem& data_item) {
                       data_item.ExclusiveLock();
 
-                      // Skip deleted items (not initialized)
-                      if (!data_item.IsInitialized()) {
+                      // Skip deleted primary rows.
+                      if (!data_item.IsPrimaryInitialized()) {
                         data_item.ExclusiveUnlock();
                         return true;
                       }

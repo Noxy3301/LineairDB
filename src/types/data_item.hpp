@@ -40,7 +40,6 @@ namespace LineairDB {
 
 struct DataItem {
   std::atomic<TransactionId> transaction_id;
-  bool initialized;
   DataBuffer buffer;
   // std::stringのvectorを保持する
   // lineairdvkeyみたいなエイリアス
@@ -73,7 +72,11 @@ struct DataItem {
   std::byte* value() { return &buffer.value[0]; }
   const std::byte* value() const { return &buffer.value[0]; }
   size_t size() const { return buffer.size; }
-  bool IsInitialized() const { return initialized; }
+  bool IsInitialized() const {
+    return buffer.size != 0 ||
+           (primary_keys_ptr && !primary_keys_ptr->empty());
+  }
+  bool IsPrimaryInitialized() const { return buffer.size != 0; }
 
  private:
 #ifndef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
@@ -103,26 +106,14 @@ struct DataItem {
   }
 
   DataItem()
-      : transaction_id(0),
-        initialized(false)
+      : transaction_id(0)
 #ifdef LINEAIRDB_WITH_NWR
         ,
         pivot_object(NWRPivotObject())
 #endif
   {}
-  DataItem(const std::byte* v, size_t s, TransactionId tid = 0)
-      : transaction_id(tid),
-        initialized(true)
-#ifdef LINEAIRDB_WITH_NWR
-        ,
-        pivot_object(NWRPivotObject())
-#endif
-  {
-    Reset(v, s);
-  }
   DataItem(const DataItem& rhs)
       : transaction_id(rhs.transaction_id.load()),
-        initialized(rhs.initialized),
         primary_keys_ptr(rhs.primary_keys_ptr)  // shared_ptr copy = refcount++
 #ifdef LINEAIRDB_WITH_NWR
         ,
@@ -138,10 +129,7 @@ struct DataItem {
 
   DataItem& operator=(const DataItem& rhs) {
     transaction_id.store(rhs.transaction_id.load());
-    initialized = rhs.initialized;
-    if (initialized) {
-      buffer.Reset(rhs.buffer);
-    }
+    buffer.Reset(rhs.buffer);
 
     /* if (rhs.sec_idx_buffers) {
       sec_idx_buffers =
@@ -155,7 +143,6 @@ struct DataItem {
 
   DataItem(DataItem&& rhs) noexcept
       : transaction_id(rhs.transaction_id.load()),
-        initialized(rhs.initialized),
         buffer(std::move(rhs.buffer)),
         primary_keys_ptr(std::move(rhs.primary_keys_ptr))
 #ifdef LINEAIRDB_WITH_NWR
@@ -172,7 +159,6 @@ struct DataItem {
 
   DataItem& operator=(DataItem&& rhs) noexcept {
     transaction_id.store(rhs.transaction_id.load());
-    initialized = rhs.initialized;
     buffer = std::move(rhs.buffer);
     primary_keys_ptr = std::move(rhs.primary_keys_ptr);
 #ifdef LINEAIRDB_WITH_NWR
@@ -189,8 +175,6 @@ struct DataItem {
   void Reset(const std::byte* v, const size_t s, TransactionId tid = 0) {
     buffer.Reset(v, s);
     if (!tid.IsEmpty()) transaction_id.store(tid);
-    initialized = (v != nullptr && s != 0) ||
-                  (primary_keys_ptr && !primary_keys_ptr->empty());
   }
 
   void AddSecondaryIndexValue(const std::byte* v, size_t s) {
@@ -200,7 +184,6 @@ struct DataItem {
     auto it = std::lower_bound(pks.begin(), pks.end(), new_key, cmp);
     if (it != pks.end() && std::string_view(*it) == new_key) return;
     pks.emplace(it, new_key);
-    initialized = buffer.size != 0 || !pks.empty();
   }
 
   void RemoveSecondaryIndexValue(const std::byte* v, size_t s) {
@@ -211,7 +194,6 @@ struct DataItem {
     auto it = std::lower_bound(pks.begin(), pks.end(), target, cmp);
     if (it == pks.end() || std::string_view(*it) != target) return;
     pks.erase(it);
-    initialized = buffer.size != 0 || !pks.empty();
   }
 
   void CopyLiveVersionToStableVersion() {

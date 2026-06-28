@@ -70,7 +70,7 @@ struct DataBuffer {
 
   // NOTE: capacity only grows; consider shrink-to-fit if large records cause bloat.
   void Reset(const std::byte* v, const size_t s) {
-    if (v == nullptr) {
+    if (v == nullptr || s == 0) {
       size = 0;
       return;
     }
