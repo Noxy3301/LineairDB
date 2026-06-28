@@ -36,7 +36,7 @@ void Reaper::Enqueue(const Snapshot& snapshot,
                                    TransactionId delete_commit_tid) {
   const bool primary_delete = snapshot.index_name.empty() &&
                               snapshot.pi_ref != nullptr &&
-                              !snapshot.data_item_copy.IsInitialized();
+                              !snapshot.data_item_copy.IsPrimaryInitialized();
   if (primary_delete) {
     Enqueue(snapshot.pi_ref, nullptr, snapshot.key, snapshot.index_cache,
             delete_commit_tid);
@@ -45,7 +45,8 @@ void Reaper::Enqueue(const Snapshot& snapshot,
 
   const bool secondary_delete = !snapshot.index_name.empty() &&
                                 snapshot.si_ref != nullptr &&
-                                snapshot.data_item_copy.primary_keys().empty();
+                                snapshot.data_item_copy.primary_keys_view()
+                                    .empty();
   if (secondary_delete) {
     Enqueue(nullptr, snapshot.si_ref, snapshot.key, snapshot.index_cache,
             delete_commit_tid);
@@ -149,7 +150,11 @@ void Reaper::Reap(EpochNumber published_epoch) {
       item->transaction_id.store(candidate.delete_commit_tid);
     };
 
-    if (item->IsInitialized()) {
+    const bool item_initialized =
+        candidate.kind == DeferredPurgeIndexKind::Primary
+            ? item->IsPrimaryInitialized()
+            : item->IsInitialized();
+    if (item_initialized) {
       unlock_candidate();
       ++dropped;
       continue;

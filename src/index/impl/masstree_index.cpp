@@ -313,7 +313,7 @@ struct MasstreeIndex::Impl {
     bool found = lp.find_insert(*tls_ti);
     if (found) {
       DataItem* existing = lp.value();
-      if (existing != nullptr && existing->IsInitialized()) {
+      if (existing != nullptr && existing->IsPrimaryInitialized()) {
         lp.finish(0, *tls_ti);
         return false;
       }

@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -33,6 +34,7 @@
 #include "concurrency_control/pivot_object.hpp"
 #include "data_buffer.hpp"
 #include "lock/impl/readers_writers_lock.hpp"
+#include "packed_primary_keys.hpp"
 #include "types/transaction_id.hpp"
 #include "util/logger.hpp"
 
@@ -40,11 +42,8 @@ namespace LineairDB {
 
 struct DataItem {
   std::atomic<TransactionId> transaction_id;
-  bool initialized;
   DataBuffer buffer;
-  // std::stringのvectorを保持する
-  // lineairdvkeyみたいなエイリアス
-  std::shared_ptr<std::vector<std::string>> primary_keys_ptr;
+  std::shared_ptr<const PackedPrimaryKeys> primary_keys_;
 
 #ifdef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
   std::vector<std::string> checkpoint_primary_keys;
@@ -73,7 +72,12 @@ struct DataItem {
   std::byte* value() { return &buffer.value[0]; }
   const std::byte* value() const { return &buffer.value[0]; }
   size_t size() const { return buffer.size; }
-  bool IsInitialized() const { return initialized; }
+  bool IsInitialized() const {
+    if (buffer.size != 0) return true;
+    const auto primary_keys = std::atomic_load(&primary_keys_);
+    return primary_keys && primary_keys->count != 0;
+  }
+  bool IsPrimaryInitialized() const { return buffer.size != 0; }
 
  private:
 #ifndef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
@@ -88,42 +92,41 @@ struct DataItem {
 #endif
 
  public:
-  // primary_keys accessor (read-only, copy-on-write)
-  const std::vector<std::string>& primary_keys() const {
-    static const std::vector<std::string> empty;
-    if (primary_keys_ptr) return *primary_keys_ptr;
-    return empty;
+  PackedPrimaryKeysView primary_keys_view() const {
+    return PackedPrimaryKeysView(primary_keys_);
   }
 
-  void SetPrimaryKeys(const std::vector<std::string>& pks) {
-    primary_keys_ptr = std::make_shared<std::vector<std::string>>(pks);
+  std::vector<std::string> primary_keys_vector() const {
+    std::vector<std::string> keys;
+    const auto view = primary_keys_view();
+    keys.reserve(view.size());
+    for (std::string_view key : view) {
+      keys.emplace_back(key.data(), key.size());
+    }
+    return keys;
   }
-  void SetPrimaryKeys(std::vector<std::string>&& pks) {
-    primary_keys_ptr = std::make_shared<std::vector<std::string>>(std::move(pks));
+
+  void SetPrimaryKeys(const std::vector<std::string>& primary_keys) {
+    assert(IsSortedDeduped(primary_keys));
+    auto packed = PackedPrimaryKeys::FromSortedDeduped(primary_keys);
+    std::atomic_store(&primary_keys_, std::move(packed));
+  }
+  void SetPrimaryKeys(std::vector<std::string>&& primary_keys) {
+    assert(IsSortedDeduped(primary_keys));
+    auto packed = PackedPrimaryKeys::FromSortedDeduped(primary_keys);
+    std::atomic_store(&primary_keys_, std::move(packed));
   }
 
   DataItem()
-      : transaction_id(0),
-        initialized(false)
+      : transaction_id(0)
 #ifdef LINEAIRDB_WITH_NWR
         ,
         pivot_object(NWRPivotObject())
 #endif
   {}
-  DataItem(const std::byte* v, size_t s, TransactionId tid = 0)
-      : transaction_id(tid),
-        initialized(true)
-#ifdef LINEAIRDB_WITH_NWR
-        ,
-        pivot_object(NWRPivotObject())
-#endif
-  {
-    Reset(v, s);
-  }
   DataItem(const DataItem& rhs)
       : transaction_id(rhs.transaction_id.load()),
-        initialized(rhs.initialized),
-        primary_keys_ptr(rhs.primary_keys_ptr)  // shared_ptr copy = refcount++
+        primary_keys_(std::atomic_load(&rhs.primary_keys_))
 #ifdef LINEAIRDB_WITH_NWR
         ,
         pivot_object(NWRPivotObject())
@@ -138,10 +141,7 @@ struct DataItem {
 
   DataItem& operator=(const DataItem& rhs) {
     transaction_id.store(rhs.transaction_id.load());
-    initialized = rhs.initialized;
-    if (initialized) {
-      buffer.Reset(rhs.buffer);
-    }
+    buffer.Reset(rhs.buffer);
 
     /* if (rhs.sec_idx_buffers) {
       sec_idx_buffers =
@@ -149,15 +149,15 @@ struct DataItem {
     } else {
       sec_idx_buffers = nullptr;
     } */
-    primary_keys_ptr = rhs.primary_keys_ptr;  // refcount++
+    auto primary_keys = std::atomic_load(&rhs.primary_keys_);
+    std::atomic_store(&primary_keys_, std::move(primary_keys));
     return *this;
   }
 
   DataItem(DataItem&& rhs) noexcept
       : transaction_id(rhs.transaction_id.load()),
-        initialized(rhs.initialized),
         buffer(std::move(rhs.buffer)),
-        primary_keys_ptr(std::move(rhs.primary_keys_ptr))
+        primary_keys_(std::move(rhs.primary_keys_))
 #ifdef LINEAIRDB_WITH_NWR
         ,
         pivot_object(rhs.pivot_object.load())
@@ -172,9 +172,8 @@ struct DataItem {
 
   DataItem& operator=(DataItem&& rhs) noexcept {
     transaction_id.store(rhs.transaction_id.load());
-    initialized = rhs.initialized;
     buffer = std::move(rhs.buffer);
-    primary_keys_ptr = std::move(rhs.primary_keys_ptr);
+    std::atomic_store(&primary_keys_, std::move(rhs.primary_keys_));
 #ifdef LINEAIRDB_WITH_NWR
     pivot_object.store(rhs.pivot_object.load());
 #endif
@@ -189,29 +188,24 @@ struct DataItem {
   void Reset(const std::byte* v, const size_t s, TransactionId tid = 0) {
     buffer.Reset(v, s);
     if (!tid.IsEmpty()) transaction_id.store(tid);
-    initialized = (v != nullptr && s != 0) ||
-                  (primary_keys_ptr && !primary_keys_ptr->empty());
   }
 
   void AddSecondaryIndexValue(const std::byte* v, size_t s) {
-    auto& pks = MutablePrimaryKeys();
     std::string_view new_key(reinterpret_cast<const char*>(v), s);
-    auto cmp = [](const std::string& a, std::string_view b) { return a < b; };
-    auto it = std::lower_bound(pks.begin(), pks.end(), new_key, cmp);
-    if (it != pks.end() && std::string_view(*it) == new_key) return;
-    pks.emplace(it, new_key);
-    initialized = buffer.size != 0 || !pks.empty();
+    auto current = std::atomic_load(&primary_keys_);
+    auto next = PackedPrimaryKeys::Insert(current, new_key);
+    if (next != current) {
+      std::atomic_store(&primary_keys_, std::move(next));
+    }
   }
 
   void RemoveSecondaryIndexValue(const std::byte* v, size_t s) {
-    if (!primary_keys_ptr || primary_keys_ptr->empty()) return;
-    auto& pks = MutablePrimaryKeys();
     std::string_view target(reinterpret_cast<const char*>(v), s);
-    auto cmp = [](const std::string& a, std::string_view b) { return a < b; };
-    auto it = std::lower_bound(pks.begin(), pks.end(), target, cmp);
-    if (it == pks.end() || std::string_view(*it) != target) return;
-    pks.erase(it);
-    initialized = buffer.size != 0 || !pks.empty();
+    auto current = std::atomic_load(&primary_keys_);
+    auto next = PackedPrimaryKeys::Erase(current, target);
+    if (next != current) {
+      std::atomic_store(&primary_keys_, std::move(next));
+    }
   }
 
   void CopyLiveVersionToStableVersion() {
@@ -224,7 +218,7 @@ struct DataItem {
       checkpoint_buffer.Reset(buffer);
     }
     if (!checkpoint_primary_keys_captured) {
-      checkpoint_primary_keys = primary_keys();  // deep copy from shared
+      checkpoint_primary_keys = primary_keys_vector();
       checkpoint_primary_keys_captured = true;
     }
 #endif
@@ -256,14 +250,12 @@ struct DataItem {
   }
 
  private:
-  // copy-on-write: returns a mutable reference, making a private copy if shared
-  std::vector<std::string>& MutablePrimaryKeys() {
-    if (!primary_keys_ptr) {
-      primary_keys_ptr = std::make_shared<std::vector<std::string>>();
-    } else if (primary_keys_ptr.use_count() > 1) {
-      primary_keys_ptr = std::make_shared<std::vector<std::string>>(*primary_keys_ptr);
-    }
-    return *primary_keys_ptr;
+  static bool IsSortedDeduped(const std::vector<std::string>& keys) {
+    return std::adjacent_find(keys.begin(), keys.end(),
+                              [](const std::string& lhs,
+                                 const std::string& rhs) {
+                                return !(lhs < rhs);
+                              }) == keys.end();
   }
 
  public:
@@ -316,5 +308,11 @@ struct DataItem {
 #endif
   };
 };
+
+#if !defined(LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA) && \
+    !defined(LINEAIRDB_WITH_NWR)
+static_assert(sizeof(DataItem) == 48,
+              "DataItem must remain 48 bytes in the slim layout");
+#endif
 }  // namespace LineairDB
 #endif /* LINEAIRDB_DATA_ITEM_HPP */

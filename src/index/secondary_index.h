@@ -1,6 +1,7 @@
 #ifndef LINEAIRDB_SECONDARY_INDEX_H
 #define LINEAIRDB_SECONDARY_INDEX_H
 
+#include "concurrency_control/stable_read.hpp"
 #include "index/index_base.h"
 #include "index/index_factory.hpp"
 #include "index/secondary_index_type.h"
@@ -38,7 +39,8 @@ class SecondaryIndex {
     // EnsureVisibleForSecondaryWrite so the range index can run its phantom
     // detection.
     auto* item = secondary_index_->Get(key);
-    if (item == nullptr || !item->IsInitialized()) {
+    if (item == nullptr ||
+        !ConcurrencyControl::StableReadPrimaryKeys(*item).found) {
       if (!secondary_index_->EnsureVisibleForSecondaryWrite(key, out_update))
         return nullptr;
       item = secondary_index_->Get(key);

@@ -155,9 +155,9 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
       }
 
       // Step 3: Read value pointer + size from DataItem buffer (no memcpy).
-      // Also snapshot the initialized flag: a logical delete leaves the
-      // buffer untouched, so Scan must skip non-live leaves like Read does.
-      const bool live = index_leaf->initialized;
+      // Primary rows never use the secondary posting-list pointer, so keep
+      // this hot path to the size-only liveness check.
+      const bool live = index_leaf->IsPrimaryInitialized();
       const std::byte* val = index_leaf->buffer.value;
       size_t sz = index_leaf->buffer.size;
 

@@ -73,9 +73,9 @@ StatelessRangeScanResult RangeScan(TableDictionary& tables,
  * @brief Range-scan a secondary index and resolve each hit to its base
  *        row.
  *
- * For every secondary key in `[start_key, end_key)`, looks up its
- * `primary_keys()` and, for each one, performs the same double-TID base
- * read as Read. The caller assembles the commit-time
+ * For every secondary key in `[start_key, end_key)`, pins its immutable
+ * primary-key list and, for each key in the view, performs the same double-TID
+ * base read as Read. The caller assembles the commit-time
  * ExternalRangeReadEntry from its own scan arguments and both returned
  * key lists. `ok == false` is the abort signal, as in RangeScan.
  */

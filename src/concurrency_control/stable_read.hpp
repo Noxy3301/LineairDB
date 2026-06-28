@@ -2,6 +2,7 @@
 #define LINEAIRDB_CONCURRENCY_CONTROL_STABLE_READ_HPP
 
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include <xmmintrin.h>
@@ -30,15 +31,28 @@ struct StableValue {
 
 struct StablePrimaryKeys {
   bool found = false;
-  std::vector<std::string> primary_keys;
+  PackedPrimaryKeys::Ptr primary_keys;
   TransactionId tid;
+
+  PackedPrimaryKeysView primary_keys_view() const {
+    return PackedPrimaryKeysView(primary_keys);
+  }
+
+  std::vector<std::string> primary_keys_vector() const {
+    std::vector<std::string> result;
+    const auto view = primary_keys_view();
+    result.reserve(view.size());
+    for (std::string_view primary_key : view) {
+      result.emplace_back(primary_key.data(), primary_key.size());
+    }
+    return result;
+  }
 };
 
 /**
  * @brief Stable read of a base-row DataItem.
  *
- * `found` is false for tombstones (initialized but empty) and
- * uninitialized slots.
+ * `found` is false for tombstones and uninitialized slots.
  */
 inline StableValue StableReadValue(const DataItem& item) {
   for (;;) {
@@ -48,7 +62,7 @@ inline StableValue StableReadValue(const DataItem& item) {
       continue;
     }
 
-    const bool found = item.IsInitialized() && item.size() != 0;
+    const bool found = item.IsPrimaryInitialized();
     std::string value;
     if (found) {
       value.assign(reinterpret_cast<const char*>(item.value()), item.size());
@@ -61,7 +75,7 @@ inline StableValue StableReadValue(const DataItem& item) {
 }
 
 /**
- * @brief Stable read of a secondary-index DataItem, copying its
+ * @brief Stable read of a secondary-index DataItem, pinning its immutable
  * primary-key list.
  *
  * `found` is false when the slot is uninitialized or the list is empty.
@@ -74,9 +88,8 @@ inline StablePrimaryKeys StableReadPrimaryKeys(const DataItem& item) {
       continue;
     }
 
-    const bool found = item.IsInitialized() && !item.primary_keys().empty();
-    std::vector<std::string> primary_keys;
-    if (found) primary_keys = item.primary_keys();
+    auto primary_keys = std::atomic_load(&item.primary_keys_);
+    const bool found = primary_keys && primary_keys->count != 0;
 
     if (item.transaction_id.load() == tid) {
       return {found, std::move(primary_keys), tid};
