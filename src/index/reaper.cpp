@@ -45,7 +45,8 @@ void Reaper::Enqueue(const Snapshot& snapshot,
 
   const bool secondary_delete = !snapshot.index_name.empty() &&
                                 snapshot.si_ref != nullptr &&
-                                snapshot.data_item_copy.primary_keys().empty();
+                                snapshot.data_item_copy.primary_keys_view()
+                                    .empty();
   if (secondary_delete) {
     Enqueue(nullptr, snapshot.si_ref, snapshot.key, snapshot.index_cache,
             delete_commit_tid);

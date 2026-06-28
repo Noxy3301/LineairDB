@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -375,11 +376,11 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
         auto* index = table.value()->GetSecondaryIndex(range.index_name);
         if (index == nullptr) return false;
 
-        std::vector<std::string> secondary_keys;
-        std::vector<std::string> primary_keys;
+        size_t result_pos = 0;
         bool aborted = false;
+        bool matches = true;
         auto collect_base_row = [&](const std::string& secondary_key,
-                                    const std::string& primary_key) {
+                                    std::string_view primary_key) {
           DataItem* item = table.value()->GetPrimaryIndex().Get(primary_key);
           if (item == nullptr) return false;
           if (locked_by_another(item)) {
@@ -387,37 +388,45 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
             return true;
           }
           if (item->IsPrimaryInitialized()) {
-            secondary_keys.push_back(secondary_key);
-            primary_keys.push_back(primary_key);
+            if (result_pos >= range.result_keys.size() ||
+                result_pos >= range.result_primary_keys.size() ||
+                std::string_view(range.result_keys[result_pos]) !=
+                    std::string_view(secondary_key) ||
+                std::string_view(range.result_primary_keys[result_pos]) !=
+                    primary_key) {
+              matches = false;
+              return true;
+            }
+            ++result_pos;
           }
           return range.row_limit > 0 &&
-                 primary_keys.size() >= range.row_limit;
+                 result_pos >= range.row_limit;
         };
 
         auto collect_secondary_key = [&](std::string_view key) {
           const std::string secondary_key(key);
           DataItem* item = index->Get(key);
           if (item == nullptr) return false;
-          // Copy the primary-key list under a double-TID read, as in the
-          // staging scan: a committer mutates the live vector in place
-          // under its lock. The TID stays constant while locked, so the
-          // lock bit is checked before the copy and the TID after it.
+          // Pin the immutable primary-key list under a double-TID read, as in
+          // the staging scan. A committer publishes a new list under its lock;
+          // the TID stays constant while own-locked, so re-check after loading.
           const TransactionId observed = item->transaction_id.load();
           if ((observed.tid & 1u) && !is_own_locked(item)) {
             aborted = true;
             return true;
           }
-          const bool secondary_live = item->IsInitialized();
-          std::vector<std::string> item_primary_keys;
-          if (secondary_live) item_primary_keys = item->primary_keys();
+          auto primary_keys = std::atomic_load(&item->primary_keys_);
+          const bool secondary_live =
+              primary_keys && primary_keys->count != 0;
           if (item->transaction_id.load() != observed) {
             aborted = true;
             return true;
           }
-          if (!secondary_live || item_primary_keys.empty()) {
+          if (!secondary_live) {
             return false;
           }
-          for (const auto& primary_key : item_primary_keys) {
+          for (std::string_view primary_key :
+               PackedPrimaryKeysView(primary_keys)) {
             if (collect_base_row(secondary_key, primary_key)) return true;
           }
           return false;
@@ -430,9 +439,9 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
                 : index->Scan(range.start_key, range.end_key,
                               collect_secondary_key, nullptr);
         if (aborted) return false;
-        return scan_result.has_value() &&
-               secondary_keys == range.result_keys &&
-               primary_keys == range.result_primary_keys;
+        return scan_result.has_value() && matches &&
+               result_pos == range.result_keys.size() &&
+               result_pos == range.result_primary_keys.size();
       };
 
   for (const auto& range : range_reads) {
@@ -449,29 +458,33 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
   // Phase 2.3: post-lock UNIQUE recheck. A competing add may have installed
   // the same secondary key while we were waiting on the write lock, so the
   // resolve-time dedup (R3) is not enough on its own.
-  std::unordered_map<DataItem*, std::vector<std::string>> si_primary_keys;
+  std::unordered_map<DataItem*, PackedPrimaryKeys::Ptr> si_primary_keys;
   for (const auto& op : resolved_si_ops) {
     if (!op.index_type.IsUnique()) continue;
 
     auto [state_it, inserted] =
-        si_primary_keys.emplace(op.item, std::vector<std::string>{});
-    if (inserted) state_it->second = op.item->primary_keys();
-    auto& keys = state_it->second;
+        si_primary_keys.emplace(op.item, PackedPrimaryKeys::Ptr{});
+    if (inserted) {
+      state_it->second = std::atomic_load(&op.item->primary_keys_);
+    }
+    auto& primary_keys = state_it->second;
+    const PackedPrimaryKeysView keys(primary_keys);
 
-    auto key_it = std::lower_bound(keys.begin(), keys.end(),
-                                   op.primary_key);
+    auto key_it = keys.lower_bound(op.primary_key);
     const bool key_exists =
-        key_it != keys.end() && *key_it == op.primary_key;
+        key_it != keys.end() && *key_it == std::string_view(op.primary_key);
 
     if (op.is_delete) {
-      if (key_exists) keys.erase(key_it);
+      if (key_exists) {
+        primary_keys = PackedPrimaryKeys::Erase(primary_keys, op.primary_key);
+      }
       continue;
     }
 
     if (!keys.empty()) {
       return unlock_and_abort("unique_si_exists_after_lock");
     }
-    keys.insert(key_it, op.primary_key);
+    primary_keys = PackedPrimaryKeys::Insert(primary_keys, op.primary_key);
   }
 
   // Phase 3.1: install row writes/deletes and SI add/remove. Deletes leave
@@ -500,14 +513,16 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
   }
 
   // Capture SI tombstone state while the slots are still locked. The live
-  // primary_keys vector must not be read after unlock: a concurrent
-  // committer mutates it in place or swaps its buffer under its own lock.
+  // primary-key list pointer must not be read after unlock: a concurrent
+  // committer can publish a replacement under its own lock.
   // Computed after the whole install loop so a delete-then-add sequence on
   // the same slot within this transaction reads the final state.
   std::unordered_map<DataItem*, bool> si_empty_after_install;
   for (const auto& op : resolved_si_ops) {
     if (!op.is_delete) continue;
-    si_empty_after_install[op.item] = op.item->primary_keys().empty();
+    const auto primary_keys = std::atomic_load(&op.item->primary_keys_);
+    si_empty_after_install[op.item] =
+        PackedPrimaryKeysView(primary_keys).empty();
   }
 
   // Phase 3.2: build the log snapshot before unlock so a later transaction

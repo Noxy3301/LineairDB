@@ -297,7 +297,12 @@ WriteSetType Logger::GetRecoverySetFromLogs(const EpochNumber durable_epoch) {
                   item.index_type =
                       Index::SecondaryIndexType::FromRaw(kvp.index_type);
                   if (is_secondary_index) {
-                    item.data_item_copy.SetPrimaryKeys(kvp.primary_keys);
+                    auto primary_keys = kvp.primary_keys;
+                    std::sort(primary_keys.begin(), primary_keys.end());
+                    primary_keys.erase(std::unique(primary_keys.begin(),
+                                                   primary_keys.end()),
+                                       primary_keys.end());
+                    item.data_item_copy.SetPrimaryKeys(std::move(primary_keys));
                   }
 
                   primary_updates++;
@@ -316,7 +321,12 @@ WriteSetType Logger::GetRecoverySetFromLogs(const EpochNumber durable_epoch) {
                   Index::SecondaryIndexType::FromRaw(kvp.index_type),
               };
               if (is_secondary_index) {
-                snapshot.data_item_copy.SetPrimaryKeys(kvp.primary_keys);
+                auto primary_keys = kvp.primary_keys;
+                std::sort(primary_keys.begin(), primary_keys.end());
+                primary_keys.erase(std::unique(primary_keys.begin(),
+                                               primary_keys.end()),
+                                   primary_keys.end());
+                snapshot.data_item_copy.SetPrimaryKeys(std::move(primary_keys));
               }
               recovery_set.emplace_back(std::move(snapshot));
               primary_inserts++;
@@ -354,6 +364,9 @@ WriteSetType Logger::GetRecoverySetFromLogs(const EpochNumber durable_epoch) {
   for (auto& [group_key, entry] : grouped_secondary) {
     if (entry.primary_keys.empty()) continue;
     std::sort(entry.primary_keys.begin(), entry.primary_keys.end());
+    entry.primary_keys.erase(
+        std::unique(entry.primary_keys.begin(), entry.primary_keys.end()),
+        entry.primary_keys.end());
     Snapshot snapshot = {
         group_key.secondary_key,
         nullptr,

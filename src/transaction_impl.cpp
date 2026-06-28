@@ -131,9 +131,11 @@ void RefreshSecondaryIndexWriteSnapshot(
 std::vector<std::pair<const std::byte* const, const size_t>>
 SecondaryIndexReadResult(const DataItem& item) {
   std::vector<std::pair<const std::byte* const, const size_t>> result;
-  if (item.primary_keys().empty()) return result;
+  const auto primary_keys = item.primary_keys_view();
+  if (primary_keys.empty()) return result;
 
-  for (const auto& primary_key : item.primary_keys()) {
+  result.reserve(primary_keys.size());
+  for (std::string_view primary_key : primary_keys) {
     result.emplace_back(reinterpret_cast<const std::byte*>(primary_key.data()),
                         primary_key.size());
   }
@@ -151,7 +153,7 @@ SecondaryIndexReadResult(const DataItem& item) {
 bool MaybeDeleteEmptyUniqueSecondaryIndex(
     Index::SecondaryIndex* index, const Index::SecondaryIndexType& index_type,
     std::string_view key, const DataItem& item) {
-  if (!item.primary_keys().empty() || !index_type.IsUnique()) return true;
+  if (!item.primary_keys_view().empty() || !index_type.IsUnique()) return true;
   return index->Delete(key);
 }
 }
@@ -938,16 +940,16 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndex(
       if (snapshot.key != key) continue;
 
       RefreshSecondaryIndexWriteSnapshot(concurrency_control_.get(), &snapshot);
-      const auto& pks = snapshot.data_item_copy.primary_keys();
+      auto primary_keys = snapshot.data_item_copy.primary_keys_vector();
 
       // Skip deleted keys (empty primary_keys means the entry was deleted)
-      if (pks.empty()) {
+      if (primary_keys.empty()) {
         found_in_write_set = true;
         break;
       }
 
       total_count++;
-      bool stop_scan = operation(key, pks);
+      bool stop_scan = operation(key, primary_keys);
       if (stop_scan) return total_count;
 
       found_in_write_set = true;
@@ -1032,9 +1034,9 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndexReverse(
   all_keys.erase(std::unique(all_keys.begin(), all_keys.end()), all_keys.end());
 
   // Step 4: Process keys in reverse order
-  // Forward scan passes primary_keys by const ref directly, but reverse scan
-  // needs a reversed copy. Reuse this buffer across iterations to keep capacity.
-  std::vector<std::string> reversed_pks;
+  // Reverse scan needs a reversed vector at the public callback boundary.
+  // Reuse this buffer across iterations to keep capacity.
+  std::vector<std::string> reversed_primary_keys;
   size_t total_count = 0;
   for (auto it = all_keys.rbegin(); it != all_keys.rend(); ++it) {
     if (IsAborted()) return std::nullopt;
@@ -1047,17 +1049,23 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndexReverse(
       if (snapshot.key != key) continue;
 
       RefreshSecondaryIndexWriteSnapshot(concurrency_control_.get(), &snapshot);
-      const auto& pks = snapshot.data_item_copy.primary_keys();
+      auto primary_keys = snapshot.data_item_copy.primary_keys_view();
 
       // Skip deleted keys (empty primary_keys means the entry was deleted)
-      if (pks.empty()) {
+      if (primary_keys.empty()) {
         found_in_write_set = true;
         break;
       }
 
-      reversed_pks.assign(pks.rbegin(), pks.rend());
+      reversed_primary_keys.clear();
+      reversed_primary_keys.reserve(primary_keys.size());
+      for (std::string_view primary_key : primary_keys) {
+        reversed_primary_keys.emplace_back(primary_key.data(),
+                                           primary_key.size());
+      }
+      std::reverse(reversed_primary_keys.begin(), reversed_primary_keys.end());
       total_count++;
-      bool stop_scan = operation(key, reversed_pks);
+      bool stop_scan = operation(key, reversed_primary_keys);
       if (stop_scan) return total_count;
 
       found_in_write_set = true;
@@ -1068,20 +1076,20 @@ const std::optional<size_t> Transaction::Impl::ScanSecondaryIndexReverse(
       const auto read_result = ReadSecondaryIndex(index_name, key);
       if (IsAborted()) return std::nullopt;
 
-      reversed_pks.clear();
-      reversed_pks.reserve(read_result.size());
+      reversed_primary_keys.clear();
+      reversed_primary_keys.reserve(read_result.size());
       for (const auto& primary_key : read_result) {
-        reversed_pks.emplace_back(
+        reversed_primary_keys.emplace_back(
             reinterpret_cast<const char*>(primary_key.first),
             primary_key.second);
       }
-      std::reverse(reversed_pks.begin(), reversed_pks.end());
+      std::reverse(reversed_primary_keys.begin(), reversed_primary_keys.end());
 
       // Skip deleted keys
-      if (reversed_pks.empty()) continue;
+      if (reversed_primary_keys.empty()) continue;
 
       total_count++;
-      bool stop_scan = operation(key, reversed_pks);
+      bool stop_scan = operation(key, reversed_primary_keys);
       if (stop_scan) return total_count;
     }
   }

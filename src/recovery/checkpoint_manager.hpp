@@ -158,16 +158,21 @@ class CPRManager {
                         kvp.index_name = index_name;
                         kvp.index_type = sec_index.GetIndexType().Raw();
                         kvp.key = key;
-                        const auto& primary_keys =
-                            data_item.HasCheckpointPrimaryKeys()
-                                ? data_item.GetCheckpointPrimaryKeys()
-                                : data_item.primary_keys();
-                        if (primary_keys.empty()) {
+                        std::vector<std::string> live_primary_keys;
+                        const std::vector<std::string>* primary_keys =
+                            nullptr;
+                        if (data_item.HasCheckpointPrimaryKeys()) {
+                          primary_keys = &data_item.GetCheckpointPrimaryKeys();
+                        } else {
+                          live_primary_keys = data_item.primary_keys_vector();
+                          primary_keys = &live_primary_keys;
+                        }
+                        if (primary_keys->empty()) {
                           data_item.ClearCheckpointPrimaryKeys();
                           data_item.ExclusiveUnlock();
                           return true;
                         }
-                        kvp.primary_keys = primary_keys;
+                        kvp.primary_keys = *primary_keys;
                         kvp.secondary_op =
                             static_cast<uint8_t>(SecondaryIndexOp::Full);
                         kvp.tid.epoch = record.epoch;

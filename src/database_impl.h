@@ -503,9 +503,9 @@ class Database::Impl {
           table.value()->GetSecondaryIndex(index_name);
       if (index == nullptr) return false;
 
-      // Copy the secondary PK list under one stable TID before dereferencing it.
+      // Pin the secondary primary-key list under one stable TID.
       auto stable_live_secondary = [&](const DataItem& item) {
-        std::vector<std::string> primary_keys;
+        PackedPrimaryKeys::Ptr primary_keys;
         for (;;) {
           TransactionId tid = item.transaction_id.load();
           if (tid.tid & 1u) {
@@ -513,17 +513,17 @@ class Database::Impl {
             continue;
           }
 
-          const bool live = item.IsInitialized() && !item.primary_keys().empty();
-          std::vector<std::string> snapshot;
-          if (live) snapshot = item.primary_keys();
+          auto snapshot = std::atomic_load(&item.primary_keys_);
+          const bool live = snapshot && snapshot->count != 0;
           if (item.transaction_id.load() == tid) {
-            primary_keys = std::move(snapshot);
+            if (live) primary_keys = std::move(snapshot);
             break;
           }
         }
 
         // Secondary entries count only if one referenced base row is live.
-        for (const auto& primary_key : primary_keys) {
+        for (std::string_view primary_key :
+             PackedPrimaryKeysView(primary_keys)) {
           DataItem* base_item = primary_index.Get(primary_key);
           if (base_item != nullptr && stable_live_base(*base_item)) return true;
         }
@@ -610,7 +610,8 @@ class Database::Impl {
           _mm_pause();
           continue;
         }
-        const uint64_t n = di.IsInitialized() ? di.primary_keys().size() : 0;
+        const auto primary_keys = std::atomic_load(&di.primary_keys_);
+        const uint64_t n = primary_keys ? primary_keys->count : 0;
         if (di.transaction_id.load() == tid) return n;
       }
     };
@@ -765,12 +766,12 @@ class Database::Impl {
         table.value()->GetOrCreateSecondaryIndex(recovery_set.index_name,
                                                  recovery_set.index_type, &idx);
         if (idx != nullptr) {
-          idx->Put(recovery_set.key, std::move(recovery_set.data_item_copy));
           SPDLOG_DEBUG(
-              "  Recovery: Secondary index '{0}' restored key '{1}' with {2} "
+              "  Recovery: Secondary index '{0}' restoring key '{1}' with {2} "
               "primary keys",
               recovery_set.index_name, recovery_set.key,
-              recovery_set.data_item_copy.primary_keys().size());
+              recovery_set.data_item_copy.primary_keys_view().size());
+          idx->Put(recovery_set.key, std::move(recovery_set.data_item_copy));
         } else {
           SPDLOG_ERROR(
               "Recovery failed: Could not create secondary index {0} for "
