@@ -38,6 +38,10 @@ class ConcurrentTable {
   ConcurrentTable(EpochFramework& epoch_framework, Config config = Config(),
                   WriteSetType recovery_set = WriteSetType());
 
+  // PAX single-copy storage: route blank-item creation of this (primary)
+  // index into the table's PaxStore. See IndexBase::SetPaxStore.
+  void SetPaxStore(Pax::PaxStore* store) { index_->SetPaxStore(store); }
+
   DataItem* Get(const std::string_view key);
   // GetOrInsert reports a non-null `out_update->valid=true` only when the
   // missing-key path actually structurally inserted a placeholder leaf.

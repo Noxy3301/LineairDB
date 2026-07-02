@@ -195,6 +195,19 @@ class Database {
    */
   bool CreateTable(const std::string_view table_name);
 
+  /**
+   * @brief Enable PAX single-copy storage for a table.
+   *
+   * Installs the per-field maximum cell widths (index 0 = the row format's
+   * null-flags field, then one entry per column in field order). Rows
+   * installed afterwards are shredded into per-column strips; rows that do
+   * not fit fall back to the heap path per row. Call once right after
+   * CreateTable, before loading rows. Idempotent: returns false when the
+   * table is missing or a schema is already installed.
+   */
+  bool InstallPaxSchema(const std::string_view table_name,
+                        const std::vector<uint32_t>& field_max_bytes);
+
   // ----------------------------------------------------------------------
   // Stateless read / validate-and-commit API.
   //

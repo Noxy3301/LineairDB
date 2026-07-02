@@ -44,6 +44,12 @@ class IndexBase {
  public:
   virtual ~IndexBase() = default;
 
+  // PAX single-copy storage: when set, blank DataItems created by this
+  // (primary) index are born in PAX mode so their payload bytes land in the
+  // table's PaxStore at install time. Backends without support ignore it
+  // (rows simply stay on the heap path). Secondary indexes never set this.
+  virtual void SetPaxStore(Pax::PaxStore* /*store*/) {}
+
   // Point operations. The optional `out_update` lets the OCC layer learn
   // whether the call structurally bumped a leaf version, so it can apply
   // the Silo §4.6 own-write node-set rule (advance any matching node-set

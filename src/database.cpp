@@ -71,6 +71,11 @@ bool Database::CreateTable(const std::string_view table_name) {
   return db_pimpl_->CreateTable(table_name);
 }
 
+bool Database::InstallPaxSchema(const std::string_view table_name,
+                                const std::vector<uint32_t>& field_max_bytes) {
+  return db_pimpl_->InstallPaxSchema(table_name, field_max_bytes);
+}
+
 bool Database::CreateSecondaryIndex(const std::string_view table_name,
                                     const std::string_view index_name,
                                     const uint index_type) {
