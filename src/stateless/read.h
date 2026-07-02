@@ -70,6 +70,24 @@ StatelessRangeScanResult RangeScan(TableDictionary& tables,
                                    uint64_t row_limit, bool reverse_scan);
 
 /**
+ * @brief Range-scan the primary index returning PAX cell references
+ *        instead of materialized rows.
+ *
+ * Same iteration/tombstone semantics as RangeScan, but each hit yields
+ * {key, PaxGroup*, slot, size, tid, DataItem*} so the caller can evaluate
+ * filters/aggregates straight on the column strips and gather only
+ * surviving rows, re-checking the DataItem TID after its cell reads.
+ * Fails (`ok == false`) when the table has no PAX store or any row is not
+ * PAX-resident (heap fallback) — callers then use RangeScan.
+ */
+StatelessPaxRefScanResult PaxRefScan(TableDictionary& tables,
+                                     std::shared_mutex& schema_mutex,
+                                     std::string_view table_name,
+                                     std::string_view start_key,
+                                     std::string_view end_key,
+                                     uint64_t row_limit, bool reverse_scan);
+
+/**
  * @brief Range-scan a secondary index and resolve each hit to its base
  *        row.
  *

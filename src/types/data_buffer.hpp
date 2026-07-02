@@ -28,19 +28,9 @@
 #include <string>
 #include <vector>
 
-#include "pax/pax_store.h"
+#include <lineairdb/pax_store.h>
 
 namespace LineairDB {
-
-namespace Pax {
-// Process-wide diagnostic: rows that did not fit their PAX cell widths and
-// fell back to the heap path. Non-zero means schema widths need attention;
-// correctness is unaffected.
-inline std::atomic<uint64_t>& GlobalOverflowCount() {
-  static std::atomic<uint64_t> count{0};
-  return count;
-}
-}  // namespace Pax
 
 /*
  * DataBuffer is the payload slot of a DataItem. It has two modes:
@@ -205,14 +195,17 @@ struct DataBuffer {
   // Caller holds the row's TID lock (Silo install discipline).
   void ResetPax(const std::byte* v, const size_t s) {
     if (v == nullptr || s == 0) {
-      size = 0;  // tombstone; keep the slot for the (possible) re-insert
+      // Tombstone: keep the slot for the (possible) re-insert of the same
+      // key, but hide it from strip-direct readers.
+      if (pax_allocated() && size != 0) pax_group()->RetireSlot(pax_slot());
+      size = 0;
       return;
     }
     if (!pax_allocated()) {
       auto* store = pax_store();
       auto [group, slot] = store->AllocateSlot();
       if (group == nullptr) {  // table full: permanent heap fallback
-        Pax::GlobalOverflowCount().fetch_add(1, std::memory_order_relaxed);
+        store->BumpOverflow();
         value = nullptr;
         capacity = 0;
         Reset(v, s);
@@ -227,9 +220,11 @@ struct DataBuffer {
       return;
     }
     // Row does not fit (width overflow / shape mismatch): permanent heap
-    // fallback for this row. The abandoned slot stays invisible (its cells
-    // are only reachable through this buffer, which now points to heap).
-    Pax::GlobalOverflowCount().fetch_add(1, std::memory_order_relaxed);
+    // fallback for this row. Retire the abandoned slot so strip-direct
+    // readers never see its (possibly stale) cells, and disable strip scans
+    // for the table via the store's overflow counter.
+    pax_group()->store()->BumpOverflow();
+    pax_group()->RetireSlot(pax_slot());
     value = nullptr;
     capacity = 0;
     Reset(v, s);

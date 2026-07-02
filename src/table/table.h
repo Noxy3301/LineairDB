@@ -8,7 +8,7 @@
 #include "index/concurrent_table.h"
 #include "index/secondary_index.h"
 #include "lineairdb/config.h"
-#include "pax/pax_store.h"
+#include <lineairdb/pax_store.h>
 #include "types/definitions.h"
 #include "util/epoch_framework.hpp"
 

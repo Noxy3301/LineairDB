@@ -33,6 +33,10 @@
 
 namespace LineairDB {
 
+namespace Pax {
+class PaxStore;
+}
+
 class Database {
  public:
   /**
@@ -207,6 +211,22 @@ class Database {
    */
   bool InstallPaxSchema(const std::string_view table_name,
                         const std::vector<uint32_t>& field_max_bytes);
+
+  /**
+   * @brief PAX store handle for strip-direct server-side scans.
+   * @return nullptr when the table is missing or has no PAX schema.
+   */
+  Pax::PaxStore* GetPaxStore(const std::string_view table_name);
+
+  /**
+   * @brief Primary-index range scan yielding PAX cell references instead of
+   * materialized rows. See StatelessPaxRefScanResult for the contract;
+   * `ok == false` (no PAX store, heap-fallback rows, index retry) means the
+   * caller must use StatelessRangeScan instead.
+   */
+  StatelessPaxRefScanResult StatelessPaxRefScan(
+      const std::string_view table_name, const std::string_view start_key,
+      const std::string_view end_key, uint64_t row_limit, bool reverse_scan);
 
   // ----------------------------------------------------------------------
   // Stateless read / validate-and-commit API.

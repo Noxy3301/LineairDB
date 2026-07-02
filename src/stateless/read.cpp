@@ -81,6 +81,68 @@ StatelessRangeScanResult RangeScan(TableDictionary& tables,
   return result;
 }
 
+}  // namespace Stateless
+uint64_t PaxRefCurrentTid(const StatelessPaxRefRow& row) {
+  const auto* item = static_cast<const DataItem*>(row.item);
+  return Stateless::PackTransactionId(item->transaction_id.load());
+}
+namespace Stateless {
+
+StatelessPaxRefScanResult PaxRefScan(TableDictionary& tables,
+                                     std::shared_mutex& schema_mutex,
+                                     const std::string_view table_name,
+                                     const std::string_view start_key,
+                                     const std::string_view end_key,
+                                     uint64_t row_limit, bool reverse_scan) {
+  StatelessPaxRefScanResult result;
+  if (end_key.empty()) return result;
+
+  std::shared_lock<std::shared_mutex> lk(schema_mutex);
+  auto table = tables.GetTable(table_name);
+  if (!table.has_value()) return result;
+  auto* store = table.value()->GetPaxStore();
+  // Heap-fallback rows are invisible to strips; refuse the whole scan.
+  if (store == nullptr || store->overflow_count() > 0) return result;
+  result.ok = true;
+
+  uint64_t returned_rows = 0;
+  bool saw_non_pax = false;
+
+  auto append_ref = [&](std::string_view key, DataItem& item_ref) {
+    // Stable TID observation point (same spin-on-lock as StableReadValue);
+    // the caller re-checks this TID after reading the row's cells.
+    TransactionId tid;
+    for (;;) {
+      tid = item_ref.transaction_id.load();
+      if (!(tid.tid & 1u)) break;
+      _mm_pause();
+    }
+    const size_t sz = item_ref.buffer.size;
+    if (sz == 0) return false;  // tombstone: skip, keep scanning
+    if (!item_ref.buffer.is_pax() || !item_ref.buffer.pax_allocated()) {
+      saw_non_pax = true;
+      return true;  // cancel: mixed storage, caller must materialize
+    }
+    result.rows.push_back({std::string(key), item_ref.buffer.pax_group(),
+                           item_ref.buffer.pax_slot(),
+                           static_cast<uint32_t>(sz), PackTransactionId(tid),
+                           &item_ref});
+    ++returned_rows;
+    return row_limit > 0 && returned_rows >= row_limit;
+  };
+
+  auto scan_result =
+      reverse_scan ? table.value()->GetPrimaryIndex().ScanReverse(
+                         start_key, end_key, append_ref)
+                   : table.value()->GetPrimaryIndex().Scan(start_key, end_key,
+                                                           append_ref);
+  if (!scan_result.has_value() || saw_non_pax) {
+    result.ok = false;
+    result.rows.clear();
+  }
+  return result;
+}
+
 StatelessSecondaryRangeScanResult SecondaryRangeScan(
     TableDictionary& tables, std::shared_mutex& schema_mutex,
     const std::string_view table_name, const std::string_view index_name,

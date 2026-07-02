@@ -66,6 +66,44 @@ struct StatelessRangeScanResult {
 };
 
 /**
+ * @brief One row reference from a PAX ref-scan: the row's payload is not
+ * materialized; the caller reads the cells it needs straight from the PAX
+ * group and re-checks `item TID == tid` afterwards (torn-read rejection).
+ *
+ * `group`/`slot` stay valid for the lifetime of the store; `item` stays
+ * valid until the caller releases its Masstree epoch (RPC boundary).
+ */
+struct StatelessPaxRefRow {
+  std::string key;
+  const void* group = nullptr;  ///< Pax::PaxGroup*, opaque to keep this header light.
+  uint32_t slot = 0;
+  uint32_t row_size = 0;        ///< Payload byte size observed at scan time.
+  uint64_t tid = 0;             ///< Packed version observed at scan time.
+  const void* item = nullptr;   ///< DataItem*, for the post-read TID re-check.
+};
+
+/**
+ * @brief Outcome of Database::StatelessPaxRefScan.
+ *
+ * `ok == false` when the table is missing, has no PAX store, contains any
+ * heap-fallback row (overflow), or the index scan gave up — the caller must
+ * use the materializing scan instead.
+ */
+struct StatelessPaxRefScanResult {
+  bool ok = false;
+  std::vector<StatelessPaxRefRow> rows;
+};
+
+/**
+ * @brief Re-read the packed TID behind a PAX ref row (post-cell-read check).
+ *
+ * Returns a value different from `row.tid` (or with the lock bit set) when
+ * a writer touched the row after the scan observed it — the caller must
+ * re-read that row through a validated path (e.g. StatelessRead).
+ */
+uint64_t PaxRefCurrentTid(const StatelessPaxRefRow& row);
+
+/**
  * @brief Outcome of Database::StatelessSecondaryRangeScan.
  */
 struct StatelessSecondaryRangeScanResult {
