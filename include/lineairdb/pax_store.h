@@ -83,6 +83,15 @@ class PaxGroup {
   bool GatherRowProjected(uint32_t slot, const uint32_t* columns,
                           size_t n_columns, std::string& out) const;
 
+  // Reconstruct the full row SHAPE but with real payloads only for the
+  // given columns (0-based, strictly ascending); every other column becomes
+  // the 1-byte empty field (0xFF). Field headers stay parseable and column
+  // indexes stay stable, so filters/projections that only touch the listed
+  // columns behave exactly as on the full row while the gather touches only
+  // those strips. Appends to `out`.
+  void GatherRowSparse(uint32_t slot, const uint32_t* columns,
+                       size_t n_columns, std::string& out) const;
+
   bool IsVisible(uint32_t slot) const {
     return (visible_[slot >> 6].load(std::memory_order_acquire) >>
             (slot & 63)) &

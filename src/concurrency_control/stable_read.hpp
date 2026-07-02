@@ -83,6 +83,41 @@ inline StableValue StableReadValue(const DataItem& item) {
 }
 
 /**
+ * @brief Stable read that materializes only the listed columns (0-based,
+ * ascending) for PAX-resident rows, leaving the other fields as 1-byte
+ * placeholders (full row shape, sparse payload). Heap rows return the full
+ * row — the sparse form is an optimization, never a semantic change, so
+ * mixed storage stays correct. Same double-TID torn-read discipline as
+ * StableReadValue.
+ */
+inline StableValue StableReadValueSparse(const DataItem& item,
+                                         const uint32_t* columns,
+                                         size_t n_columns) {
+  for (;;) {
+    TransactionId tid = item.transaction_id.load();
+    if (tid.tid & 1u) {
+      _mm_pause();
+      continue;
+    }
+
+    const bool found = item.IsPrimaryInitialized();
+    std::string value;
+    if (found) {
+      if (item.buffer.is_pax()) {
+        item.buffer.pax_group()->GatherRowSparse(item.buffer.pax_slot(),
+                                                 columns, n_columns, value);
+      } else {
+        value.assign(reinterpret_cast<const char*>(item.value()), item.size());
+      }
+    }
+
+    if (item.transaction_id.load() == tid) {
+      return {found, std::move(value), tid};
+    }
+  }
+}
+
+/**
  * @brief Stable read of a secondary-index DataItem, pinning its immutable
  * primary-key list.
  *

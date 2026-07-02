@@ -253,8 +253,9 @@ class Database {
    * @return Result with `found` set when the key exists and was non-empty.
    *         When the table does not exist, `found` is false and `tid` is 0.
    */
-  StatelessReadResult StatelessRead(const std::string_view table_name,
-                                    const std::string_view key);
+  StatelessReadResult StatelessRead(
+      const std::string_view table_name, const std::string_view key,
+      const std::vector<uint32_t>* sparse_columns = nullptr);
 
   /**
    * @brief Read several rows in one call.
@@ -288,7 +289,8 @@ class Database {
    */
   StatelessRangeScanResult StatelessRangeScan(
       const std::string_view table_name, const std::string_view start_key,
-      const std::string_view end_key, uint64_t row_limit, bool reverse_scan);
+      const std::string_view end_key, uint64_t row_limit, bool reverse_scan,
+      const std::vector<uint32_t>* sparse_columns = nullptr);
 
   /**
    * @brief Range-scan a secondary index and resolve each hit to its base row.
@@ -312,7 +314,8 @@ class Database {
   StatelessSecondaryRangeScanResult StatelessSecondaryRangeScan(
       const std::string_view table_name, const std::string_view index_name,
       const std::string_view start_key, const std::string_view end_key,
-      uint64_t row_limit, bool reverse_scan);
+      uint64_t row_limit, bool reverse_scan,
+      const std::vector<uint32_t>* sparse_columns = nullptr);
 
   /**
    * @brief Compute per-key-part-prefix NDV for an integer encoded index.
