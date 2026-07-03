@@ -210,7 +210,9 @@ class Database {
    * table is missing or a schema is already installed.
    */
   bool InstallPaxSchema(const std::string_view table_name,
-                        const std::vector<uint32_t>& field_max_bytes);
+                        const std::vector<uint32_t>& field_max_bytes,
+                        const std::vector<uint8_t>& field_kind = {},
+                        const std::vector<int8_t>& field_scale = {});
 
   /**
    * @brief PAX store handle for strip-direct server-side scans.

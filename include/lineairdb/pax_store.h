@@ -46,11 +46,40 @@
 namespace LineairDB {
 namespace Pax {
 
+// Per-field storage kind (M2: typed numeric cells). UNTYPED keeps the cell
+// verbatim (ASCII val_str bytes, the original layout); the typed kinds shred
+// the numeric value into a fixed-width little-endian binary payload whose width
+// is field_max_bytes[f] (4 or 8). A typed cell's u16 len prefix is 0 for SQL
+// NULL and == the binary width for a present value, so "empty cell == NULL"
+// still holds. ScatterRow parses the ASCII once (heap fallback on any
+// parse/range failure); GatherRow reformats the binary back to the exact
+// val_str ASCII (byte-identical round trip — the row-format contract).
+enum FieldKind : uint8_t {
+  FK_UNTYPED = 0,  // verbatim bytes (default; strings, floats, DECIMAL pre-M2b)
+  FK_INT32 = 1,    // 4-byte LE signed int   (TINY/SHORT/INT24/LONG, YEAR)
+  FK_INT64 = 2,    // 8-byte LE signed int   (LONG UNSIGNED, BIGINT)
+  FK_DATE = 3,     // 4-byte LE YYYYMMDD int (DATE)
+  FK_DEC64 = 4,    // 8-byte LE scaled int   (DECIMAL(p,s); scale=field_scale)
+};
+
 struct TableSchema {
   // Max payload bytes per field, index 0 = the null-flags field, then one
-  // entry per MySQL column in field order. Cells store [u16 len][payload].
+  // entry per MySQL column in field order. UNTYPED cells store [u16 len]
+  // [payload up to field_max_bytes]; typed cells store [u16 len][fixed-width
+  // LE binary] with field_max_bytes == the binary width (4/8).
   std::vector<uint32_t> field_max_bytes;
+  // Per-field storage kind (see FieldKind). Empty => every field UNTYPED
+  // (byte-identical to the pre-M2 layout). Same length as field_max_bytes.
+  std::vector<uint8_t> field_kind;
+  // Per-field DECIMAL scale for FK_DEC64 (else 0). Same length when present.
+  std::vector<int8_t> field_scale;
   size_t field_count() const { return field_max_bytes.size(); }
+  uint8_t kind_of(size_t f) const {
+    return f < field_kind.size() ? field_kind[f] : FK_UNTYPED;
+  }
+  int scale_of(size_t f) const {
+    return f < field_scale.size() ? field_scale[f] : 0;
+  }
 };
 
 class PaxStore;
@@ -110,6 +139,11 @@ class PaxGroup {
     return std::string_view(reinterpret_cast<const char*>(c) + kCellLenBytes,
                             len);
   }
+
+  // Append one field's proxy-format value into `out` (verbatim for UNTYPED,
+  // reformatted to the exact val_str ASCII for a typed cell). Used by the
+  // projected/sparse gathers.
+  void AppendCellField(uint32_t field, uint32_t slot, std::string& out) const;
 
   const std::byte* strip(size_t field) const {
     return arena_.get() + strip_offset_[field];
