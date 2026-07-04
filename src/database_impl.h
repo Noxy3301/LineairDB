@@ -361,6 +361,7 @@ class Database::Impl {
 
   bool InstallPaxSchema(const std::string_view table_name,
                         const std::vector<uint32_t>& field_max_bytes) {
+    if (!config_.enable_pax_storage) return false;
     if (field_max_bytes.empty()) return false;
     // PAX blank-item routing is implemented for the Masstree backend only;
     // other index structures keep the heap-backed DataBuffer layout.

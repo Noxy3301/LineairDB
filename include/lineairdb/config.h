@@ -85,6 +85,15 @@ struct Config {
    */
   IndexStructure index_structure = HashTableWithPrecisionLockingIndex;
 
+  /**
+   * @brief
+   * If true, tables may install PAX storage metadata and route newly-created
+   * row payloads through PaxStore.
+   *
+   * Default: false.
+   */
+  bool enable_pax_storage = false;
+
   enum CallbackEngine { ThreadLocal };
   /**
    * @brief
