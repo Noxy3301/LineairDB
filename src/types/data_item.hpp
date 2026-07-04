@@ -69,8 +69,16 @@ struct DataItem {
   static inline Lock::ReadersWritersLockBO readers_writers_lock{};
 #endif
 
-  std::byte* value() { return &buffer.value[0]; }
-  const std::byte* value() const { return &buffer.value[0]; }
+  // Direct byte access is invalid for PAX-resident rows (no contiguous
+  // bytes); those callers must go through DataBuffer::GatherInto / copies.
+  std::byte* value() {
+    assert(!buffer.is_pax());
+    return &buffer.value[0];
+  }
+  const std::byte* value() const {
+    assert(!buffer.is_pax());
+    return &buffer.value[0];
+  }
   size_t size() const { return buffer.size; }
   bool IsInitialized() const {
     if (buffer.size != 0) return true;
