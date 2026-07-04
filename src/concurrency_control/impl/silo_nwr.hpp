@@ -158,8 +158,27 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
       // Primary rows never use the secondary posting-list pointer, so keep
       // this hot path to the size-only liveness check.
       const bool live = index_leaf->IsPrimaryInitialized();
-      const std::byte* val = index_leaf->buffer.value;
-      size_t sz = index_leaf->buffer.size;
+      const std::byte* val;
+      size_t sz;
+      if (index_leaf->buffer.is_pax()) {
+        // PAX rows have no contiguous bytes: gather into a thread-local
+        // scratch. The callback consumes the pointer before the next
+        // ReadDirect on this thread; a torn gather is rejected by the TID
+        // re-check in Step 4 (same discipline as the zero-copy pointer).
+        thread_local std::vector<std::byte> pax_scratch;
+        sz = index_leaf->buffer.size;
+        if (live && sz > 0) {
+          if (pax_scratch.size() < sz) pax_scratch.resize(sz);
+          index_leaf->buffer.GatherInto(pax_scratch.data());
+          val = pax_scratch.data();
+        } else {
+          val = nullptr;
+          sz = 0;
+        }
+      } else {
+        val = index_leaf->buffer.value;
+        sz = index_leaf->buffer.size;
+      }
 
       // Step 4: Re-check TID. If unchanged, no concurrent writer modified the
       // data between Step 1 and Step 3, so the pointer is safe to return.
