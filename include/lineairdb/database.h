@@ -195,6 +195,24 @@ class Database {
    */
   bool CreateTable(const std::string_view table_name);
 
+  /**
+   * @brief Enables PAX storage for rows created after the call.
+   *
+   * @details Installs the per-field maximum cell widths: index 0 is the row
+   * format's null-flags field, followed by one entry per column in field order.
+   * Rows written after installation are stored in per-column strips when they
+   * fit the configured cell widths; oversize rows fall back to heap storage.
+   * Call once after CreateTable and before loading rows.
+   *
+   * @param[in] table_name The table that should use PAX storage.
+   * @param[in] field_max_bytes Maximum encoded bytes for each row field.
+   * @return true when the schema is installed for the table.
+   * @return false when the table is missing, the schema is empty, unsupported
+   * by the configured index backend, or already installed.
+   */
+  bool InstallPaxSchema(const std::string_view table_name,
+                        const std::vector<uint32_t>& field_max_bytes);
+
   // ----------------------------------------------------------------------
   // Stateless read / validate-and-commit API.
   //

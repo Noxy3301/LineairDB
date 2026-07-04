@@ -359,6 +359,20 @@ class Database::Impl {
     return table_dictionary_.CreateTable(table_name, epoch_framework_, config_);
   }
 
+  bool InstallPaxSchema(const std::string_view table_name,
+                        const std::vector<uint32_t>& field_max_bytes) {
+    if (field_max_bytes.empty()) return false;
+    // PAX blank-item routing is implemented for the Masstree backend only;
+    // other index structures keep the heap-backed DataBuffer layout.
+    if (config_.index_structure != Config::IndexStructure::Masstree)
+      return false;
+    auto table = GetTable(table_name);
+    if (!table.has_value()) return false;
+    Pax::TableSchema schema;
+    schema.field_max_bytes = field_max_bytes;
+    return table.value()->InstallPaxSchema(std::move(schema));
+  }
+
   bool CreateSecondaryIndex(const std::string_view table_name,
                             const std::string_view index_name,
                             const uint index_type) {
