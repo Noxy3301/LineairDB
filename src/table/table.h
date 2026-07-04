@@ -8,6 +8,7 @@
 #include "index/concurrent_table.h"
 #include "index/secondary_index.h"
 #include "lineairdb/config.h"
+#include "pax/pax_store.h"
 #include "types/definitions.h"
 #include "util/epoch_framework.hpp"
 
@@ -30,6 +31,29 @@ class Table {
     secondary_indices_[std::string(index_name)] = std::move(new_index);
     return true;
   }
+
+  /**
+   * @brief Installs PAX storage metadata for rows created after the call.
+   *
+   * @details The schema records per-field maximum cell widths. Existing rows
+   * remain on the heap-backed DataBuffer layout; future rows are initialized
+   * with the table's PaxStore. A table accepts only one PAX schema.
+   *
+   * @return true when the schema is installed for this table.
+   * @return false when a schema has already been installed.
+   */
+  bool InstallPaxSchema(Pax::TableSchema schema) {
+    std::unique_lock<std::shared_mutex> lk(table_lock_);
+    if (pax_store_ != nullptr) return false;
+    pax_store_ = std::make_unique<Pax::PaxStore>(std::move(schema));
+    primary_index_.SetPaxStore(pax_store_.get());
+    return true;
+  }
+
+  /**
+   * @brief Returns the table's PAX store, or nullptr when PAX is disabled.
+   */
+  Pax::PaxStore* GetPaxStore() const { return pax_store_.get(); }
 
   bool Delete(const std::string_view key) { return primary_index_.Delete(key); }
 
@@ -73,6 +97,7 @@ class Table {
   EpochFramework& epoch_framework_;
   Config config_;
   Index::ConcurrentTable primary_index_;
+  std::unique_ptr<Pax::PaxStore> pax_store_;
   mutable std::shared_mutex table_lock_;
   std::unordered_map<std::string, std::unique_ptr<Index::SecondaryIndex>>
       secondary_indices_;
