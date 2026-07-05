@@ -394,9 +394,11 @@ class Database::Impl {
             static_cast<Index::SecondaryIndexType::RawType>(index_type)));
   }
 
-  StatelessReadResult StatelessRead(const std::string_view table_name,
-                                    const std::string_view key) {
-    return Stateless::Read(table_dictionary_, schema_mutex_, table_name, key);
+  StatelessReadResult StatelessRead(
+      const std::string_view table_name, const std::string_view key,
+      const std::vector<uint32_t>* selected_columns = nullptr) {
+    return Stateless::Read(table_dictionary_, schema_mutex_, table_name, key,
+                           selected_columns);
   }
 
   std::vector<StatelessReadResult> StatelessBatchRead(
@@ -406,9 +408,11 @@ class Database::Impl {
 
   StatelessRangeScanResult StatelessRangeScan(
       const std::string_view table_name, const std::string_view start_key,
-      const std::string_view end_key, uint64_t row_limit, bool reverse_scan) {
+      const std::string_view end_key, uint64_t row_limit, bool reverse_scan,
+      const std::vector<uint32_t>* selected_columns = nullptr) {
     return Stateless::RangeScan(table_dictionary_, schema_mutex_, table_name,
-                                start_key, end_key, row_limit, reverse_scan);
+                                start_key, end_key, row_limit, reverse_scan,
+                                selected_columns);
   }
 
   StatelessPaxRowRefScanResult StatelessPaxRowRefScan(
@@ -421,10 +425,11 @@ class Database::Impl {
   StatelessSecondaryRangeScanResult StatelessSecondaryRangeScan(
       const std::string_view table_name, const std::string_view index_name,
       const std::string_view start_key, const std::string_view end_key,
-      uint64_t row_limit, bool reverse_scan) {
-    return Stateless::SecondaryRangeScan(table_dictionary_, schema_mutex_,
-                                         table_name, index_name, start_key,
-                                         end_key, row_limit, reverse_scan);
+      uint64_t row_limit, bool reverse_scan,
+      const std::vector<uint32_t>* selected_columns = nullptr) {
+    return Stateless::SecondaryRangeScan(
+        table_dictionary_, schema_mutex_, table_name, index_name, start_key,
+        end_key, row_limit, reverse_scan, selected_columns);
   }
 
   /**

@@ -86,9 +86,10 @@ bool Database::CreateSecondaryIndex(const std::string_view table_name,
   return db_pimpl_->CreateSecondaryIndex(table_name, index_name, index_type);
 }
 
-StatelessReadResult Database::StatelessRead(const std::string_view table_name,
-                                            const std::string_view key) {
-  return db_pimpl_->StatelessRead(table_name, key);
+StatelessReadResult Database::StatelessRead(
+    const std::string_view table_name, const std::string_view key,
+    const std::vector<uint32_t>* selected_columns) {
+  return db_pimpl_->StatelessRead(table_name, key, selected_columns);
 }
 
 std::vector<StatelessReadResult> Database::StatelessBatchRead(
@@ -98,9 +99,11 @@ std::vector<StatelessReadResult> Database::StatelessBatchRead(
 
 StatelessRangeScanResult Database::StatelessRangeScan(
     const std::string_view table_name, const std::string_view start_key,
-    const std::string_view end_key, uint64_t row_limit, bool reverse_scan) {
+    const std::string_view end_key, uint64_t row_limit, bool reverse_scan,
+    const std::vector<uint32_t>* selected_columns) {
   return db_pimpl_->StatelessRangeScan(table_name, start_key, end_key,
-                                       row_limit, reverse_scan);
+                                       row_limit, reverse_scan,
+                                       selected_columns);
 }
 
 StatelessPaxRowRefScanResult Database::StatelessPaxRowRefScan(
@@ -113,9 +116,12 @@ StatelessPaxRowRefScanResult Database::StatelessPaxRowRefScan(
 StatelessSecondaryRangeScanResult Database::StatelessSecondaryRangeScan(
     const std::string_view table_name, const std::string_view index_name,
     const std::string_view start_key, const std::string_view end_key,
-    uint64_t row_limit, bool reverse_scan) {
-  return db_pimpl_->StatelessSecondaryRangeScan(
-      table_name, index_name, start_key, end_key, row_limit, reverse_scan);
+    uint64_t row_limit, bool reverse_scan,
+    const std::vector<uint32_t>* selected_columns) {
+  return db_pimpl_->StatelessSecondaryRangeScan(table_name, index_name,
+                                                start_key, end_key, row_limit,
+                                                reverse_scan,
+                                                selected_columns);
 }
 
 bool Database::ComputeIndexNdvInt(const std::string_view table_name,

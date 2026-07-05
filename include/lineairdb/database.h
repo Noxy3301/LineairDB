@@ -248,11 +248,14 @@ class Database {
    *
    * @param table_name Target table.
    * @param key Primary key to look up.
+   * @param selected_columns Optional zero-based MySQL columns to materialize
+   * for PAX-resident rows. Unselected PAX columns are returned as empty fields.
    * @return Result with `found` set when the key exists and was non-empty.
    *         When the table does not exist, `found` is false and `tid` is 0.
    */
-  StatelessReadResult StatelessRead(const std::string_view table_name,
-                                    const std::string_view key);
+  StatelessReadResult StatelessRead(
+      const std::string_view table_name, const std::string_view key,
+      const std::vector<uint32_t>* selected_columns = nullptr);
 
   /**
    * @brief Read several rows in one call.
@@ -281,12 +284,15 @@ class Database {
    * @param end_key   Exclusive end of the range. Must be non-empty.
    * @param row_limit Maximum rows to return. 0 means no cap.
    * @param reverse_scan When true, iterate from `end_key` toward `start_key`.
+   * @param selected_columns Optional zero-based MySQL columns to materialize
+   * for PAX-resident rows. Unselected PAX columns are returned as empty fields.
    * @return Result with `ok == false` if the scan retried out or the table
    *         is missing. Callers should treat `!ok` as an abort signal.
    */
   StatelessRangeScanResult StatelessRangeScan(
       const std::string_view table_name, const std::string_view start_key,
-      const std::string_view end_key, uint64_t row_limit, bool reverse_scan);
+      const std::string_view end_key, uint64_t row_limit, bool reverse_scan,
+      const std::vector<uint32_t>* selected_columns = nullptr);
 
   /**
    * @brief Range-scans the primary index and returns PAX cell references.
@@ -320,13 +326,17 @@ class Database {
    * @param end_key Exclusive end of the secondary range. Must be non-empty.
    * @param row_limit Maximum rows to return. 0 means no cap.
    * @param reverse_scan When true, iterate in reverse secondary-key order.
+   * @param selected_columns Optional zero-based MySQL columns to materialize
+   * for PAX-resident base rows. Unselected PAX columns are returned as empty
+   * fields.
    * @return Result with `ok == false` if the scan retried out or the
    *         table/index is missing.
    */
   StatelessSecondaryRangeScanResult StatelessSecondaryRangeScan(
       const std::string_view table_name, const std::string_view index_name,
       const std::string_view start_key, const std::string_view end_key,
-      uint64_t row_limit, bool reverse_scan);
+      uint64_t row_limit, bool reverse_scan,
+      const std::vector<uint32_t>* selected_columns = nullptr);
 
   /**
    * @brief Compute per-key-part-prefix NDV for an integer encoded index.
