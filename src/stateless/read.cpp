@@ -15,7 +15,8 @@ namespace Stateless {
 StatelessReadResult Read(TableDictionary& tables,
                          std::shared_mutex& schema_mutex,
                          const std::string_view table_name,
-                         const std::string_view key) {
+                         const std::string_view key,
+                         const std::vector<uint32_t>* selected_columns) {
   std::shared_lock<std::shared_mutex> lk(schema_mutex);
   auto table = tables.GetTable(table_name);
   if (!table.has_value()) return {};
@@ -23,7 +24,11 @@ StatelessReadResult Read(TableDictionary& tables,
   DataItem* item = table.value()->GetPrimaryIndex().Get(key);
   if (item == nullptr) return {};
 
-  auto row = ConcurrencyControl::StableReadValue(*item);
+  auto row = selected_columns != nullptr
+                 ? ConcurrencyControl::StableReadValueMasked(
+                       *item, selected_columns->data(),
+                       selected_columns->size())
+                 : ConcurrencyControl::StableReadValue(*item);
   return {row.found, std::move(row.value), PackTransactionId(row.tid)};
 }
 
@@ -43,7 +48,9 @@ StatelessRangeScanResult RangeScan(TableDictionary& tables,
                                    const std::string_view table_name,
                                    const std::string_view start_key,
                                    const std::string_view end_key,
-                                   uint64_t row_limit, bool reverse_scan) {
+                                   uint64_t row_limit, bool reverse_scan,
+                                   const std::vector<uint32_t>*
+                                       selected_columns) {
   StatelessRangeScanResult result;
   if (end_key.empty()) return result;
 
@@ -57,7 +64,11 @@ StatelessRangeScanResult RangeScan(TableDictionary& tables,
   // The value-yielding Scan/ScanReverse overloads pass the DataItem the leaf
   // walk already resolved, so read it directly instead of re-fetching by key.
   auto append_scan_entry = [&](std::string_view key, DataItem& item_ref) {
-    auto row = ConcurrencyControl::StableReadValue(item_ref);
+    auto row = selected_columns != nullptr
+                   ? ConcurrencyControl::StableReadValueMasked(
+                         item_ref, selected_columns->data(),
+                         selected_columns->size())
+                   : ConcurrencyControl::StableReadValue(item_ref);
     if (row.found) {
       result.rows.push_back({std::string(key), std::move(row.value),
                              PackTransactionId(row.tid), true});
@@ -154,7 +165,8 @@ StatelessSecondaryRangeScanResult SecondaryRangeScan(
     TableDictionary& tables, std::shared_mutex& schema_mutex,
     const std::string_view table_name, const std::string_view index_name,
     const std::string_view start_key, const std::string_view end_key,
-    uint64_t row_limit, bool reverse_scan) {
+    uint64_t row_limit, bool reverse_scan,
+    const std::vector<uint32_t>* selected_columns) {
   StatelessSecondaryRangeScanResult result;
   if (end_key.empty()) return result;
 
@@ -175,7 +187,11 @@ StatelessSecondaryRangeScanResult SecondaryRangeScan(
       return false;
     }
 
-    auto row = ConcurrencyControl::StableReadValue(*item);
+    auto row = selected_columns != nullptr
+                   ? ConcurrencyControl::StableReadValueMasked(
+                         *item, selected_columns->data(),
+                         selected_columns->size())
+                   : ConcurrencyControl::StableReadValue(*item);
     if (row.found) {
       result.rows.push_back({std::string(secondary_key),
                              std::string(primary_key), std::move(row.value),

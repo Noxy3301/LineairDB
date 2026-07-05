@@ -36,7 +36,9 @@ namespace Stateless {
  */
 StatelessReadResult Read(TableDictionary& tables,
                          std::shared_mutex& schema_mutex,
-                         std::string_view table_name, std::string_view key);
+                         std::string_view table_name, std::string_view key,
+                         const std::vector<uint32_t>* selected_columns =
+                             nullptr);
 
 /**
  * @brief Read several rows in one call.
@@ -67,7 +69,9 @@ StatelessRangeScanResult RangeScan(TableDictionary& tables,
                                    std::string_view table_name,
                                    std::string_view start_key,
                                    std::string_view end_key,
-                                   uint64_t row_limit, bool reverse_scan);
+                                   uint64_t row_limit, bool reverse_scan,
+                                   const std::vector<uint32_t>*
+                                       selected_columns = nullptr);
 
 /**
  * @brief Range-scans the primary index and returns PAX cell references.
@@ -94,7 +98,8 @@ StatelessSecondaryRangeScanResult SecondaryRangeScan(
     TableDictionary& tables, std::shared_mutex& schema_mutex,
     std::string_view table_name, std::string_view index_name,
     std::string_view start_key, std::string_view end_key, uint64_t row_limit,
-    bool reverse_scan);
+    bool reverse_scan,
+    const std::vector<uint32_t>* selected_columns = nullptr);
 
 }  // namespace Stateless
 }  // namespace LineairDB
