@@ -29,24 +29,9 @@
 #include <string>
 #include <vector>
 
-#include "pax/pax_store.h"
+#include <lineairdb/pax_store.h>
 
 namespace LineairDB {
-
-namespace Pax {
-
-/**
- * @brief Returns the process-wide count of rows that fell back from PAX cells.
- *
- * @details A non-zero count means the configured cell widths did not cover all
- * observed row payloads. Correctness is unaffected because those rows use heap
- * storage.
- */
-inline std::atomic<uint64_t>& GlobalOverflowCount() {
-  static std::atomic<uint64_t> count{0};
-  return count;
-}
-}  // namespace Pax
 
 /**
  * @brief Owns or references the row payload stored in a DataItem.
@@ -231,6 +216,7 @@ struct DataBuffer {
    */
   void ResetPax(const std::byte* v, const size_t s) {
     if (v == nullptr || s == 0) {
+      if (pax_allocated() && size != 0) pax_group()->RetireSlot(pax_slot());
       size = 0;  // tombstone; keep the slot for the (possible) re-insert
       return;
     }
@@ -238,7 +224,7 @@ struct DataBuffer {
       auto* store = pax_store();
       auto [group, slot] = store->AllocateSlot();
       if (group == nullptr) {  // Table full: permanent heap fallback.
-        Pax::GlobalOverflowCount().fetch_add(1, std::memory_order_relaxed);
+        store->RecordHeapFallback();
         value = nullptr;
         capacity = 0;
         Reset(v, s);
@@ -253,10 +239,12 @@ struct DataBuffer {
       size = s;
       return;
     }
+
     // Row does not fit (width overflow / shape mismatch): permanent heap
-    // fallback for this row. The abandoned slot stays invisible (its cells
-    // are only reachable through this buffer, which now points to heap).
-    Pax::GlobalOverflowCount().fetch_add(1, std::memory_order_relaxed);
+    // fallback for this row. Hide the abandoned slot and disable strip-direct
+    // scans for this table because heap fallback rows are not in strips.
+    pax_group()->store()->RecordHeapFallback();
+    pax_group()->RetireSlot(pax_slot());
     value = nullptr;
     capacity = 0;
     Reset(v, s);

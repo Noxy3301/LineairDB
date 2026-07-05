@@ -4,8 +4,11 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -32,20 +35,20 @@ struct TableSchema {
   size_t field_count() const { return field_max_bytes.size(); }
 };
 
+class PaxStore;
+
 /**
  * @brief Stores a fixed-size row group as per-field PAX strips.
  *
- * @details A `PaxGroup` is the LineairDB-PAX equivalent of a page-sized row
- * group: each logical row occupies the same slot number in every field strip.
- * The row's bytes are stored in the strip cells; `DataItem` continues to own
- * the transaction id word, so Silo validation remains outside this storage
- * class.
- *
- * Concurrency contract: callers invoke `ScatterRow()` only while holding the
- * row's existing Silo TID lock. `GatherRow()` is memory-safe under a concurrent
+ * @details Each logical row occupies the same slot number in every field
+ * strip. The row's bytes are stored in the strip cells; `DataItem` continues
+ * to own the transaction id word, so Silo validation remains outside this
+ * storage class. Callers invoke `ScatterRow()` only while holding the row's
+ * existing Silo TID lock. `GatherRow()` is memory-safe under a concurrent
  * scatter to the same slot, and callers reject torn rows with the normal TID
- * re-check. `write_counter` supports strip-direct readers that bypass per-row
- * TID checks and need to detect group-level writes.
+ * re-check. Strip-direct readers can use `IsVisible()` and `write_counter` to
+ * read a whole group without materializing rows, then fall back when the group
+ * changed during the read.
  */
 class PaxGroup {
  public:
@@ -60,7 +63,7 @@ class PaxGroup {
    *
    * @param schema Table schema owned by `PaxStore`; must outlive this group.
    */
-  explicit PaxGroup(const TableSchema& schema);
+  PaxGroup(const TableSchema& schema, PaxStore* store);
 
   /**
    * @brief Scatters one proxy row payload into this group's strip cells.
@@ -74,6 +77,13 @@ class PaxGroup {
   bool ScatterRow(uint32_t slot, const std::byte* row, size_t size);
 
   /**
+   * @brief Marks one slot as invisible to strip-direct readers.
+   *
+   * @param slot Target slot inside this group.
+   */
+  void RetireSlot(uint32_t slot);
+
+  /**
    * @brief Gathers one slot's strip cells back into a byte-identical proxy row.
    *
    * @param slot Source slot inside this group.
@@ -83,6 +93,47 @@ class PaxGroup {
    * quiet and the stored row is intact.
    */
   size_t GatherRow(uint32_t slot, std::byte* dst, size_t expected_size) const;
+
+  /**
+   * @brief Gathers the null-flags field and selected columns into `out`.
+   *
+   * @param slot Source slot inside this group.
+   * @param columns Zero-based MySQL column indexes to gather.
+   * @param n_columns Number of entries in `columns`.
+   * @param out Destination string; gathered bytes are appended.
+   * @return false when a column index is outside this group's schema.
+   */
+  bool GatherRowProjected(uint32_t slot, const uint32_t* columns,
+                          size_t n_columns, std::string& out) const;
+
+  /**
+   * @brief Returns whether strip-direct readers should consider `slot` live.
+   *
+   * @param slot Slot inside this group.
+   */
+  bool IsVisible(uint32_t slot) const {
+    // Read this slot's visibility flag for strip-direct scans.
+    return (visible_[slot >> 6].load(std::memory_order_acquire) >>
+            (slot & 63)) &
+           1u;
+  }
+
+  /**
+   * @brief Returns a memory-safe view of one cell payload.
+   *
+   * @param field Field index, where 0 is the null-flags field and MySQL column
+   * i is field i + 1.
+   * @param slot Slot inside this group.
+   */
+  std::string_view cell(size_t field, uint32_t slot) const {
+    const std::byte* cell = arena_.get() + strip_offset_[field] +
+                            static_cast<size_t>(stride_[field]) * slot;
+    uint16_t len;
+    std::memcpy(&len, cell, sizeof(len));
+    if (len > schema_.field_max_bytes[field]) len = 0;
+    return std::string_view(reinterpret_cast<const char*>(cell) + kCellLenBytes,
+                            len);
+  }
 
   /**
    * @brief Returns the first cell byte for `field` in this group.
@@ -105,6 +156,11 @@ class PaxGroup {
    */
   const TableSchema& schema() const { return schema_; }
 
+  /**
+   * @brief Returns the table store that owns this group.
+   */
+  PaxStore* store() const { return store_; }
+
   // Group-level seqlock-style counter for strip-direct readers. Writers bump
   // it once before and once after scattering cells. A reader that observes the
   // same even value before and after scanning saw no completed or in-progress
@@ -113,9 +169,12 @@ class PaxGroup {
 
  private:
   const TableSchema& schema_;  // Owned by PaxStore; outlives all groups.
+  PaxStore* store_;
   std::vector<uint32_t> stride_;
   std::vector<size_t> strip_offset_;
   std::unique_ptr<std::byte[]> arena_;
+  // Slot visibility flags for strip-direct scans.
+  std::unique_ptr<std::atomic<uint64_t>[]> visible_;
 };
 
 /**
@@ -170,9 +229,18 @@ class PaxStore {
   }
 
   /**
+   * @brief Returns the number of row groups that may contain allocated slots.
+   */
+  size_t group_count() const {
+    const uint64_t slots = slots_allocated();
+    return static_cast<size_t>((slots + PaxGroup::kRows - 1) /
+                               PaxGroup::kRows);
+  }
+
+  /**
    * @brief Records one row that used heap fallback instead of PAX cells.
    */
-  void BumpOverflow() {
+  void RecordHeapFallback() {
     overflow_count_.fetch_add(1, std::memory_order_relaxed);
   }
 

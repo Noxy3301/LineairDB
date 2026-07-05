@@ -1,4 +1,4 @@
-#include "pax/pax_store.h"
+#include <lineairdb/pax_store.h>
 
 #include <cassert>
 #include <cstring>
@@ -67,7 +67,8 @@ size_t ParseRow(const std::byte* row, size_t size, FieldRef* out,
 }
 }  // namespace
 
-PaxGroup::PaxGroup(const TableSchema& schema) : schema_(schema) {
+PaxGroup::PaxGroup(const TableSchema& schema, PaxStore* store)
+    : schema_(schema), store_(store) {
   const size_t fields = schema.field_count();
   stride_.resize(fields);
   strip_offset_.resize(fields);
@@ -79,6 +80,8 @@ PaxGroup::PaxGroup(const TableSchema& schema) : schema_(schema) {
     total += static_cast<size_t>(stride_[f]) * kRows;
   }
   arena_.reset(new std::byte[total]());  // zero-init: len=0 everywhere
+  // Allocate visibility flags for this group's slots.
+  visible_.reset(new std::atomic<uint64_t>[kRows / 64]());
 }
 
 bool PaxGroup::ScatterRow(uint32_t slot, const std::byte* row, size_t size) {
@@ -103,8 +106,20 @@ bool PaxGroup::ScatterRow(uint32_t slot, const std::byte* row, size_t size) {
     std::memcpy(cell, &len, sizeof(len));
     if (len > 0) std::memcpy(cell + kCellLenBytes, refs[f].payload, len);
   }
+  // Publish this slot to strip-direct readers after the cells are written.
+  visible_[slot >> 6].fetch_or(uint64_t{1} << (slot & 63),
+                               std::memory_order_release);
   write_counter.fetch_add(1, std::memory_order_release);
   return true;
+}
+
+void PaxGroup::RetireSlot(uint32_t slot) {
+  assert(slot < kRows);
+  write_counter.fetch_add(1, std::memory_order_release);
+  // Hide this slot from strip-direct readers.
+  visible_[slot >> 6].fetch_and(~(uint64_t{1} << (slot & 63)),
+                                std::memory_order_release);
+  write_counter.fetch_add(1, std::memory_order_release);
 }
 
 size_t PaxGroup::GatherRow(uint32_t slot, std::byte* dst,
@@ -137,6 +152,37 @@ size_t PaxGroup::GatherRow(uint32_t slot, std::byte* dst,
   return off;
 }
 
+namespace {
+
+void AppendField(std::string& out, std::string_view payload) {
+  if (payload.empty()) {
+    out.push_back(static_cast<char>(0xFF));
+    return;
+  }
+  const uint32_t len = static_cast<uint32_t>(payload.size());
+  const uint32_t prefix = LengthPrefixBytes(len);
+  out.push_back(static_cast<char>(prefix));
+  for (uint32_t i = 0; i < prefix; i++) {
+    out.push_back(static_cast<char>((len >> (8 * i)) & 0xFF));
+  }
+  out.append(payload.data(), payload.size());
+}
+
+}  // namespace
+
+bool PaxGroup::GatherRowProjected(uint32_t slot, const uint32_t* columns,
+                                  size_t n_columns, std::string& out) const {
+  assert(slot < kRows);
+  const size_t fields = schema_.field_count();
+  AppendField(out, cell(0, slot));
+  for (size_t i = 0; i < n_columns; i++) {
+    const size_t field = static_cast<size_t>(columns[i]) + 1;
+    if (field >= fields) return false;
+    AppendField(out, cell(field, slot));
+  }
+  return true;
+}
+
 PaxStore::PaxStore(TableSchema schema) : schema_(std::move(schema)) {
   dir_.reset(new std::atomic<PaxGroup*>[kMaxGroups]());
 }
@@ -150,7 +196,7 @@ std::pair<PaxGroup*, uint32_t> PaxStore::AllocateSlot() {
     std::lock_guard<std::mutex> lk(grow_mutex_);
     grp = dir_[group_idx].load(std::memory_order_acquire);
     if (grp == nullptr) {
-      grp = new PaxGroup(schema_);
+      grp = new PaxGroup(schema_, this);
       dir_[group_idx].store(grp, std::memory_order_release);
     }
   }

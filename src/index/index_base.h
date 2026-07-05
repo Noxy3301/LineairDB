@@ -7,7 +7,8 @@
 #include <string_view>
 #include <vector>
 
-#include "pax/pax_store.h"
+#include <lineairdb/pax_store.h>
+
 #include "types/data_item.hpp"
 
 namespace LineairDB {
