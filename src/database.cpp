@@ -76,6 +76,10 @@ bool Database::InstallPaxSchema(const std::string_view table_name,
   return db_pimpl_->InstallPaxSchema(table_name, field_max_bytes);
 }
 
+Pax::PaxStore* Database::GetPaxStore(const std::string_view table_name) {
+  return db_pimpl_->GetPaxStore(table_name);
+}
+
 bool Database::CreateSecondaryIndex(const std::string_view table_name,
                                     const std::string_view index_name,
                                     const uint index_type) {
@@ -97,6 +101,13 @@ StatelessRangeScanResult Database::StatelessRangeScan(
     const std::string_view end_key, uint64_t row_limit, bool reverse_scan) {
   return db_pimpl_->StatelessRangeScan(table_name, start_key, end_key,
                                        row_limit, reverse_scan);
+}
+
+StatelessPaxRowRefScanResult Database::StatelessPaxRowRefScan(
+    const std::string_view table_name, const std::string_view start_key,
+    const std::string_view end_key, uint64_t row_limit, bool reverse_scan) {
+  return db_pimpl_->StatelessPaxRowRefScan(table_name, start_key, end_key,
+                                        row_limit, reverse_scan);
 }
 
 StatelessSecondaryRangeScanResult Database::StatelessSecondaryRangeScan(

@@ -33,6 +33,10 @@
 
 namespace LineairDB {
 
+namespace Pax {
+class PaxStore;
+}
+
 class Database {
  public:
   /**
@@ -213,6 +217,15 @@ class Database {
   bool InstallPaxSchema(const std::string_view table_name,
                         const std::vector<uint32_t>& field_max_bytes);
 
+  /**
+   * @brief Returns the PAX store installed for `table_name`.
+   *
+   * @param table_name Target table.
+   * @return Store pointer, or nullptr when the table is missing or has no PAX
+   * schema.
+   */
+  Pax::PaxStore* GetPaxStore(const std::string_view table_name);
+
   // ----------------------------------------------------------------------
   // Stateless read / validate-and-commit API.
   //
@@ -272,6 +285,22 @@ class Database {
    *         is missing. Callers should treat `!ok` as an abort signal.
    */
   StatelessRangeScanResult StatelessRangeScan(
+      const std::string_view table_name, const std::string_view start_key,
+      const std::string_view end_key, uint64_t row_limit, bool reverse_scan);
+
+  /**
+   * @brief Range-scans the primary index and returns PAX cell references.
+   *
+   * @details The returned rows are not materialized. `ok == false` means the
+   * caller must fall back to StatelessRangeScan.
+   *
+   * @param table_name Target table.
+   * @param start_key Inclusive start of the range.
+   * @param end_key Exclusive end of the range. Must be non-empty.
+   * @param row_limit Maximum live rows to return. 0 means no cap.
+   * @param reverse_scan When true, iterate in reverse key order.
+   */
+  StatelessPaxRowRefScanResult StatelessPaxRowRefScan(
       const std::string_view table_name, const std::string_view start_key,
       const std::string_view end_key, uint64_t row_limit, bool reverse_scan);
 

@@ -359,6 +359,12 @@ class Database::Impl {
     return table_dictionary_.CreateTable(table_name, epoch_framework_, config_);
   }
 
+  Pax::PaxStore* GetPaxStore(const std::string_view table_name) {
+    auto table = GetTable(table_name);
+    if (!table.has_value()) return nullptr;
+    return table.value()->GetPaxStore();
+  }
+
   bool InstallPaxSchema(const std::string_view table_name,
                         const std::vector<uint32_t>& field_max_bytes) {
     if (!config_.enable_pax_storage) return false;
@@ -403,6 +409,13 @@ class Database::Impl {
       const std::string_view end_key, uint64_t row_limit, bool reverse_scan) {
     return Stateless::RangeScan(table_dictionary_, schema_mutex_, table_name,
                                 start_key, end_key, row_limit, reverse_scan);
+  }
+
+  StatelessPaxRowRefScanResult StatelessPaxRowRefScan(
+      const std::string_view table_name, const std::string_view start_key,
+      const std::string_view end_key, uint64_t row_limit, bool reverse_scan) {
+    return Stateless::PaxRowRefScan(table_dictionary_, schema_mutex_, table_name,
+                                 start_key, end_key, row_limit, reverse_scan);
   }
 
   StatelessSecondaryRangeScanResult StatelessSecondaryRangeScan(

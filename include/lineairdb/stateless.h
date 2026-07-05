@@ -66,6 +66,42 @@ struct StatelessRangeScanResult {
 };
 
 /**
+ * @brief One row reference from a PAX primary-index range scan.
+ *
+ * @details `group` is a `Pax::PaxGroup*` and `item` is a `DataItem*`, kept
+ * opaque so this public header does not expose internal storage headers.
+ * Callers read the cells they need, then call PaxRowRefCurrentTid() and compare
+ * the result with `tid` to reject torn reads.
+ */
+struct StatelessPaxRowRef {
+  std::string key;
+  const void* group = nullptr;
+  uint32_t slot = 0;
+  uint32_t row_size = 0;
+  uint64_t tid = 0;
+  const void* item = nullptr;
+};
+
+/**
+ * @brief Outcome of a PAX primary-index range scan.
+ *
+ * @details `ok == false` means the caller must use the materializing
+ * StatelessRangeScan path instead. This happens when the table is missing, has
+ * no PAX store, contains heap-fallback rows, or the index scan retries out.
+ */
+struct StatelessPaxRowRefScanResult {
+  bool ok = false;
+  std::vector<StatelessPaxRowRef> rows;
+};
+
+/**
+ * @brief Returns the current packed TID for a PAX row reference.
+ *
+ * @param row Row reference returned by Database::StatelessPaxRowRefScan.
+ */
+uint64_t PaxRowRefCurrentTid(const StatelessPaxRowRef& row);
+
+/**
  * @brief Outcome of Database::StatelessSecondaryRangeScan.
  */
 struct StatelessSecondaryRangeScanResult {

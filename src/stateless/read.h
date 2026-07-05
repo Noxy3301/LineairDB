@@ -70,6 +70,17 @@ StatelessRangeScanResult RangeScan(TableDictionary& tables,
                                    uint64_t row_limit, bool reverse_scan);
 
 /**
+ * @brief Range-scans the primary index and returns PAX cell references.
+ *
+ * @details The caller evaluates cells directly and re-checks each row TID
+ * after reading. `ok == false` means the caller should use RangeScan instead.
+ */
+StatelessPaxRowRefScanResult PaxRowRefScan(
+    TableDictionary& tables, std::shared_mutex& schema_mutex,
+    std::string_view table_name, std::string_view start_key,
+    std::string_view end_key, uint64_t row_limit, bool reverse_scan);
+
+/**
  * @brief Range-scan a secondary index and resolve each hit to its base
  *        row.
  *
