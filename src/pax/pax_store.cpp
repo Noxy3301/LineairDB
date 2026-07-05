@@ -183,6 +183,23 @@ bool PaxGroup::GatherRowProjected(uint32_t slot, const uint32_t* columns,
   return true;
 }
 
+void PaxGroup::GatherRowMasked(uint32_t slot, const uint32_t* columns,
+                               size_t n_columns, std::string& out) const {
+  const size_t fields = schema_.field_count();
+  AppendField(out, cell(0, slot));
+
+  size_t column_index = 0;
+  for (size_t field = 1; field < fields; ++field) {
+    if (column_index < n_columns &&
+        static_cast<size_t>(columns[column_index]) + 1 == field) {
+      AppendField(out, cell(field, slot));
+      ++column_index;
+      continue;
+    }
+    out.push_back(static_cast<char>(0xFF));
+  }
+}
+
 PaxStore::PaxStore(TableSchema schema) : schema_(std::move(schema)) {
   dir_.reset(new std::atomic<PaxGroup*>[kMaxGroups]());
 }

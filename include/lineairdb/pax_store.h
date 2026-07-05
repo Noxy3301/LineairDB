@@ -107,6 +107,23 @@ class PaxGroup {
                           size_t n_columns, std::string& out) const;
 
   /**
+   * @brief Gathers a row-shaped payload with unselected columns masked out.
+   *
+   * @details The null-flags field is always gathered. Zero-based MySQL columns
+   * listed in `columns` are gathered from their strips; unlisted columns are
+   * emitted as one-byte empty fields, preserving field indexes without reading
+   * unused strips.
+   *
+   * @param slot Source slot inside this group.
+   * @param columns Zero-based MySQL column indexes to materialize, in ascending
+   * order.
+   * @param n_columns Number of entries in `columns`.
+   * @param out Destination string; gathered bytes are appended.
+   */
+  void GatherRowMasked(uint32_t slot, const uint32_t* columns,
+                       size_t n_columns, std::string& out) const;
+
+  /**
    * @brief Returns whether strip-direct readers should consider `slot` live.
    *
    * @param slot Slot inside this group.
