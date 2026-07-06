@@ -366,7 +366,9 @@ class Database::Impl {
   }
 
   bool InstallPaxSchema(const std::string_view table_name,
-                        const std::vector<uint32_t>& field_max_bytes) {
+                        const std::vector<uint32_t>& field_max_bytes,
+                        const std::vector<uint8_t>& field_kind = {},
+                        const std::vector<int8_t>& field_scale = {}) {
     if (!config_.enable_pax_storage) return false;
     if (field_max_bytes.empty()) return false;
     // PAX blank-item routing is implemented for the Masstree backend only;
@@ -377,6 +379,15 @@ class Database::Impl {
     if (!table.has_value()) return false;
     Pax::TableSchema schema;
     schema.field_max_bytes = field_max_bytes;
+    // Typed cells only when the kinds vector matches the field count; otherwise
+    // every field stays UNTYPED (byte-identical to the untyped layout).
+    if (field_kind.size() == field_max_bytes.size()) {
+      schema.field_kind = field_kind;
+      if (field_scale.size() == field_max_bytes.size())
+        schema.field_scale = field_scale;
+      else
+        schema.field_scale.assign(field_max_bytes.size(), 0);
+    }
     return table.value()->InstallPaxSchema(std::move(schema));
   }
 

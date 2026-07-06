@@ -16,6 +16,26 @@ namespace LineairDB {
 namespace Pax {
 
 /**
+ * @brief Per-field storage kind for typed numeric cells.
+ *
+ * @details FK_UNTYPED keeps the cell verbatim (the original ASCII val_str
+ * bytes). The typed kinds shred the numeric value into a fixed-width
+ * little-endian binary payload whose width is `field_max_bytes[f]` (4 or 8). A
+ * typed cell's u16 length prefix is 0 for SQL NULL and equal to the binary
+ * width for a present value, so "empty cell == NULL" still holds. `ScatterRow`
+ * parses the ASCII once (heap fallback on any parse/range failure);
+ * `GatherRow` reformats the binary back into the exact original val_str ASCII
+ * (byte-identical round trip -- the row-format contract).
+ */
+enum FieldKind : uint8_t {
+  FK_UNTYPED = 0,  // verbatim bytes (default; strings, floats, DECIMAL pre-DEC64)
+  FK_INT32 = 1,    // 4-byte LE signed int   (TINY/SHORT/INT24/LONG)
+  FK_INT64 = 2,    // 8-byte LE signed int   (LONG UNSIGNED, BIGINT)
+  FK_DATE = 3,     // 4-byte LE YYYYMMDD int (DATE)
+  FK_DEC64 = 4,    // 8-byte LE scaled int   (DECIMAL(p,s); scale=field_scale)
+};
+
+/**
  * @brief Describes the proxy row fields that a PAX-enabled table stores in
  * strips.
  *
@@ -24,15 +44,37 @@ namespace Pax {
  * `[byte_size:1][value_length:byte_size little-endian][value_bytes]`, with
  * `byte_size == 0xFF` representing an empty/no-value field. `PaxGroup` uses
  * the maximum payload byte widths here to split a row into fixed-width cells.
+ * UNTYPED cells store `[u16 len][payload up to field_max_bytes]`; typed cells
+ * store `[u16 len][fixed-width LE binary]` with `field_max_bytes` equal to the
+ * binary width (4/8).
  */
 struct TableSchema {
   // Max payload bytes per field, starting with the null-flags field.
   std::vector<uint32_t> field_max_bytes;
+  // Per-field storage kind (see FieldKind). Empty => every field UNTYPED
+  // (byte-identical to the untyped layout). Same length as field_max_bytes.
+  std::vector<uint8_t> field_kind;
+  // Per-field DECIMAL scale for FK_DEC64 (else 0). Same length when present.
+  std::vector<int8_t> field_scale;
 
   /**
    * @brief Returns the number of encoded fields in a proxy row payload.
    */
   size_t field_count() const { return field_max_bytes.size(); }
+
+  /**
+   * @brief Returns the storage kind of field `f` (UNTYPED when untyped).
+   */
+  uint8_t kind_of(size_t f) const {
+    return f < field_kind.size() ? field_kind[f] : FK_UNTYPED;
+  }
+
+  /**
+   * @brief Returns the DECIMAL scale of field `f` (0 when untyped).
+   */
+  int scale_of(size_t f) const {
+    return f < field_scale.size() ? field_scale[f] : 0;
+  }
 };
 
 class PaxStore;
@@ -151,6 +193,20 @@ class PaxGroup {
     return std::string_view(reinterpret_cast<const char*>(cell) + kCellLenBytes,
                             len);
   }
+
+  /**
+   * @brief Appends one field's proxy-format value into `out`.
+   *
+   * @details Verbatim for an UNTYPED cell; reformatted to the exact val_str
+   * ASCII for a typed present cell. An empty cell is emitted as a NULL field.
+   * Used by the projected and masked gathers.
+   *
+   * @param field Field index, where 0 is the null-flags field and MySQL column
+   * i is field i + 1.
+   * @param slot Slot inside this group.
+   * @param out Destination string; the encoded field is appended.
+   */
+  void AppendCellField(uint32_t field, uint32_t slot, std::string& out) const;
 
   /**
    * @brief Returns the first cell byte for `field` in this group.

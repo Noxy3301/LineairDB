@@ -215,7 +215,9 @@ class Database {
    * by the configured index backend, or already installed.
    */
   bool InstallPaxSchema(const std::string_view table_name,
-                        const std::vector<uint32_t>& field_max_bytes);
+                        const std::vector<uint32_t>& field_max_bytes,
+                        const std::vector<uint8_t>& field_kind = {},
+                        const std::vector<int8_t>& field_scale = {});
 
   /**
    * @brief Returns the PAX store installed for `table_name`.
