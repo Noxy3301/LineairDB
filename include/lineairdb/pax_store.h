@@ -195,6 +195,20 @@ class PaxGroup {
   }
 
   /**
+   * @brief Appends one field's proxy-format value into `out`.
+   *
+   * @details Verbatim for an UNTYPED cell; reformatted to the exact val_str
+   * ASCII for a typed present cell. An empty cell is emitted as a NULL field.
+   * Used by the projected and masked gathers.
+   *
+   * @param field Field index, where 0 is the null-flags field and MySQL column
+   * i is field i + 1.
+   * @param slot Slot inside this group.
+   * @param out Destination string; the encoded field is appended.
+   */
+  void AppendCellField(uint32_t field, uint32_t slot, std::string& out) const;
+
+  /**
    * @brief Returns the first cell byte for `field` in this group.
    *
    * @param field Field index, starting with the null-flags field.
