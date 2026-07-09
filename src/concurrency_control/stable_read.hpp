@@ -65,7 +65,54 @@ inline StableValue StableReadValue(const DataItem& item) {
     const bool found = item.IsPrimaryInitialized();
     std::string value;
     if (found) {
-      value.assign(reinterpret_cast<const char*>(item.value()), item.size());
+      if (item.buffer.is_pax()) {
+        // Gather the row from its PAX strips; a torn gather (concurrent
+        // install) is rejected by the TID re-check below, same as a torn
+        // pointer copy would be.
+        value.resize(item.size());
+        item.buffer.GatherInto(reinterpret_cast<std::byte*>(value.data()));
+      } else {
+        value.assign(reinterpret_cast<const char*>(item.value()), item.size());
+      }
+    }
+
+    if (item.transaction_id.load() == tid) {
+      return {found, std::move(value), tid};
+    }
+  }
+}
+
+/**
+ * @brief Stable-read a row while masking unselected PAX columns.
+ *
+ * @details PAX-resident rows keep their full field shape, but unlisted columns
+ * are emitted as one-byte empty fields. Heap rows are returned in full, so
+ * masked reads remain an optimization and do not change row semantics.
+ *
+ * @param item Primary row slot.
+ * @param columns Zero-based MySQL column indexes to materialize, in ascending
+ * order.
+ * @param n_columns Number of entries in `columns`.
+ */
+inline StableValue StableReadValueMasked(const DataItem& item,
+                                         const uint32_t* columns,
+                                         size_t n_columns) {
+  for (;;) {
+    TransactionId tid = item.transaction_id.load();
+    if (tid.tid & 1u) {
+      _mm_pause();
+      continue;
+    }
+
+    const bool found = item.IsPrimaryInitialized();
+    std::string value;
+    if (found) {
+      if (item.buffer.is_pax()) {
+        item.buffer.pax_group()->GatherRowMasked(item.buffer.pax_slot(),
+                                                 columns, n_columns, value);
+      } else {
+        value.assign(reinterpret_cast<const char*>(item.value()), item.size());
+      }
     }
 
     if (item.transaction_id.load() == tid) {

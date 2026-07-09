@@ -33,6 +33,10 @@
 
 namespace LineairDB {
 
+namespace Pax {
+class PaxStore;
+}
+
 class Database {
  public:
   /**
@@ -195,6 +199,35 @@ class Database {
    */
   bool CreateTable(const std::string_view table_name);
 
+  /**
+   * @brief Enables PAX storage for rows created after the call.
+   *
+   * @details Installs the per-field maximum cell widths: index 0 is the row
+   * format's null-flags field, followed by one entry per column in field order.
+   * Rows written after installation are stored in per-column strips when they
+   * fit the configured cell widths; oversize rows fall back to heap storage.
+   * Call once after CreateTable and before loading rows.
+   *
+   * @param[in] table_name The table that should use PAX storage.
+   * @param[in] field_max_bytes Maximum encoded bytes for each row field.
+   * @return true when the schema is installed for the table.
+   * @return false when the table is missing, the schema is empty, unsupported
+   * by the configured index backend, or already installed.
+   */
+  bool InstallPaxSchema(const std::string_view table_name,
+                        const std::vector<uint32_t>& field_max_bytes,
+                        const std::vector<uint8_t>& field_kind = {},
+                        const std::vector<int8_t>& field_scale = {});
+
+  /**
+   * @brief Returns the PAX store installed for `table_name`.
+   *
+   * @param table_name Target table.
+   * @return Store pointer, or nullptr when the table is missing or has no PAX
+   * schema.
+   */
+  Pax::PaxStore* GetPaxStore(const std::string_view table_name);
+
   // ----------------------------------------------------------------------
   // Stateless read / validate-and-commit API.
   //
@@ -217,11 +250,14 @@ class Database {
    *
    * @param table_name Target table.
    * @param key Primary key to look up.
+   * @param selected_columns Optional zero-based MySQL columns to materialize
+   * for PAX-resident rows. Unselected PAX columns are returned as empty fields.
    * @return Result with `found` set when the key exists and was non-empty.
    *         When the table does not exist, `found` is false and `tid` is 0.
    */
-  StatelessReadResult StatelessRead(const std::string_view table_name,
-                                    const std::string_view key);
+  StatelessReadResult StatelessRead(
+      const std::string_view table_name, const std::string_view key,
+      const std::vector<uint32_t>* selected_columns = nullptr);
 
   /**
    * @brief Read several rows in one call.
@@ -250,10 +286,29 @@ class Database {
    * @param end_key   Exclusive end of the range. Must be non-empty.
    * @param row_limit Maximum rows to return. 0 means no cap.
    * @param reverse_scan When true, iterate from `end_key` toward `start_key`.
+   * @param selected_columns Optional zero-based MySQL columns to materialize
+   * for PAX-resident rows. Unselected PAX columns are returned as empty fields.
    * @return Result with `ok == false` if the scan retried out or the table
    *         is missing. Callers should treat `!ok` as an abort signal.
    */
   StatelessRangeScanResult StatelessRangeScan(
+      const std::string_view table_name, const std::string_view start_key,
+      const std::string_view end_key, uint64_t row_limit, bool reverse_scan,
+      const std::vector<uint32_t>* selected_columns = nullptr);
+
+  /**
+   * @brief Range-scans the primary index and returns PAX cell references.
+   *
+   * @details The returned rows are not materialized. `ok == false` means the
+   * caller must fall back to StatelessRangeScan.
+   *
+   * @param table_name Target table.
+   * @param start_key Inclusive start of the range.
+   * @param end_key Exclusive end of the range. Must be non-empty.
+   * @param row_limit Maximum live rows to return. 0 means no cap.
+   * @param reverse_scan When true, iterate in reverse key order.
+   */
+  StatelessPaxRowRefScanResult StatelessPaxRowRefScan(
       const std::string_view table_name, const std::string_view start_key,
       const std::string_view end_key, uint64_t row_limit, bool reverse_scan);
 
@@ -273,13 +328,17 @@ class Database {
    * @param end_key Exclusive end of the secondary range. Must be non-empty.
    * @param row_limit Maximum rows to return. 0 means no cap.
    * @param reverse_scan When true, iterate in reverse secondary-key order.
+   * @param selected_columns Optional zero-based MySQL columns to materialize
+   * for PAX-resident base rows. Unselected PAX columns are returned as empty
+   * fields.
    * @return Result with `ok == false` if the scan retried out or the
    *         table/index is missing.
    */
   StatelessSecondaryRangeScanResult StatelessSecondaryRangeScan(
       const std::string_view table_name, const std::string_view index_name,
       const std::string_view start_key, const std::string_view end_key,
-      uint64_t row_limit, bool reverse_scan);
+      uint64_t row_limit, bool reverse_scan,
+      const std::vector<uint32_t>* selected_columns = nullptr);
 
   /**
    * @brief Compute per-key-part-prefix NDV for an integer encoded index.

@@ -263,6 +263,15 @@ struct MasstreeIndex::Impl {
     return nullptr;
   }
 
+  // Blank rows created after SetPaxStore are initialized in PAX mode so their
+  // first committed payload scatters into the table's strips.
+  Pax::PaxStore* pax_store_ = nullptr;
+  DataItem* NewBlankItem() {
+    auto* item = new DataItem();
+    if (pax_store_ != nullptr) item->buffer.InitPaxBlank(pax_store_);
+    return item;
+  }
+
   // Upsert with a freshly-allocated DataItem. Returns true on success.
   // When `out_update` is non-null and the call structurally bumps the leaf
   // (state=1 = key was absent), records (leaf, prev_version, next_version) so
@@ -336,7 +345,7 @@ struct MasstreeIndex::Impl {
           static_cast<std::uint64_t>(lp.next_full_version_value(1));
       out_update->valid = true;
     }
-    lp.value() = new DataItem();
+    lp.value() = NewBlankItem();
     fence();
     lp.finish(1, *tls_ti);
     return true;
@@ -395,7 +404,7 @@ struct MasstreeIndex::Impl {
     cursor_type lp(table_, key.data(), key.size());
     bool found = lp.find_insert(*tls_ti);
     if (!found) {
-      lp.value() = new DataItem();
+      lp.value() = NewBlankItem();
     }
     if (out_update != nullptr && !found) {
       out_update->node_ptr = static_cast<const void*>(lp.node());
@@ -562,6 +571,10 @@ MasstreeIndex::MasstreeIndex(Config /*c*/, EpochFramework& /*e*/)
     : impl_(std::make_unique<Impl>()) {}
 
 MasstreeIndex::~MasstreeIndex() = default;
+
+void MasstreeIndex::SetPaxStore(Pax::PaxStore* store) {
+  impl_->pax_store_ = store;
+}
 
 DataItem* MasstreeIndex::Get(std::string_view key) {
   return impl_->Get(key);

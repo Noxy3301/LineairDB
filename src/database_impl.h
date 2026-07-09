@@ -359,6 +359,38 @@ class Database::Impl {
     return table_dictionary_.CreateTable(table_name, epoch_framework_, config_);
   }
 
+  Pax::PaxStore* GetPaxStore(const std::string_view table_name) {
+    auto table = GetTable(table_name);
+    if (!table.has_value()) return nullptr;
+    return table.value()->GetPaxStore();
+  }
+
+  bool InstallPaxSchema(const std::string_view table_name,
+                        const std::vector<uint32_t>& field_max_bytes,
+                        const std::vector<uint8_t>& field_kind = {},
+                        const std::vector<int8_t>& field_scale = {}) {
+    if (!config_.enable_pax_storage) return false;
+    if (field_max_bytes.empty()) return false;
+    // PAX blank-item routing is implemented for the Masstree backend only;
+    // other index structures keep the heap-backed DataBuffer layout.
+    if (config_.index_structure != Config::IndexStructure::Masstree)
+      return false;
+    auto table = GetTable(table_name);
+    if (!table.has_value()) return false;
+    Pax::TableSchema schema;
+    schema.field_max_bytes = field_max_bytes;
+    // Typed cells only when the kinds vector matches the field count; otherwise
+    // every field stays UNTYPED (byte-identical to the untyped layout).
+    if (field_kind.size() == field_max_bytes.size()) {
+      schema.field_kind = field_kind;
+      if (field_scale.size() == field_max_bytes.size())
+        schema.field_scale = field_scale;
+      else
+        schema.field_scale.assign(field_max_bytes.size(), 0);
+    }
+    return table.value()->InstallPaxSchema(std::move(schema));
+  }
+
   bool CreateSecondaryIndex(const std::string_view table_name,
                             const std::string_view index_name,
                             const uint index_type) {
@@ -373,9 +405,11 @@ class Database::Impl {
             static_cast<Index::SecondaryIndexType::RawType>(index_type)));
   }
 
-  StatelessReadResult StatelessRead(const std::string_view table_name,
-                                    const std::string_view key) {
-    return Stateless::Read(table_dictionary_, schema_mutex_, table_name, key);
+  StatelessReadResult StatelessRead(
+      const std::string_view table_name, const std::string_view key,
+      const std::vector<uint32_t>* selected_columns = nullptr) {
+    return Stateless::Read(table_dictionary_, schema_mutex_, table_name, key,
+                           selected_columns);
   }
 
   std::vector<StatelessReadResult> StatelessBatchRead(
@@ -385,18 +419,28 @@ class Database::Impl {
 
   StatelessRangeScanResult StatelessRangeScan(
       const std::string_view table_name, const std::string_view start_key,
-      const std::string_view end_key, uint64_t row_limit, bool reverse_scan) {
+      const std::string_view end_key, uint64_t row_limit, bool reverse_scan,
+      const std::vector<uint32_t>* selected_columns = nullptr) {
     return Stateless::RangeScan(table_dictionary_, schema_mutex_, table_name,
-                                start_key, end_key, row_limit, reverse_scan);
+                                start_key, end_key, row_limit, reverse_scan,
+                                selected_columns);
+  }
+
+  StatelessPaxRowRefScanResult StatelessPaxRowRefScan(
+      const std::string_view table_name, const std::string_view start_key,
+      const std::string_view end_key, uint64_t row_limit, bool reverse_scan) {
+    return Stateless::PaxRowRefScan(table_dictionary_, schema_mutex_, table_name,
+                                 start_key, end_key, row_limit, reverse_scan);
   }
 
   StatelessSecondaryRangeScanResult StatelessSecondaryRangeScan(
       const std::string_view table_name, const std::string_view index_name,
       const std::string_view start_key, const std::string_view end_key,
-      uint64_t row_limit, bool reverse_scan) {
-    return Stateless::SecondaryRangeScan(table_dictionary_, schema_mutex_,
-                                         table_name, index_name, start_key,
-                                         end_key, row_limit, reverse_scan);
+      uint64_t row_limit, bool reverse_scan,
+      const std::vector<uint32_t>* selected_columns = nullptr) {
+    return Stateless::SecondaryRangeScan(
+        table_dictionary_, schema_mutex_, table_name, index_name, start_key,
+        end_key, row_limit, reverse_scan, selected_columns);
   }
 
   /**

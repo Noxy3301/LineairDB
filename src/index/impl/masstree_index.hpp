@@ -21,6 +21,8 @@ class MasstreeIndex final : public IndexBase {
   MasstreeIndex(Config c, EpochFramework& e);
   ~MasstreeIndex() override;
 
+  void SetPaxStore(Pax::PaxStore* store) override;
+
   DataItem* Get(std::string_view key) override;
   bool Put(std::string_view key, DataItem&& rhs,
            NodeVersionUpdate* out_update = nullptr) override;

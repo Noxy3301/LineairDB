@@ -7,6 +7,8 @@
 #include <string_view>
 #include <vector>
 
+#include <lineairdb/pax_store.h>
+
 #include "types/data_item.hpp"
 
 namespace LineairDB {
@@ -43,6 +45,15 @@ struct NodeVersionUpdate {
 class IndexBase {
  public:
   virtual ~IndexBase() = default;
+
+  /**
+   * @brief Routes future blank primary rows through a table PAX store.
+   *
+   * @details Backends without PAX support ignore this hook, so their rows keep
+   * the ordinary heap-backed DataBuffer layout. Secondary indexes never set a
+   * PaxStore because they store index metadata rather than table row payloads.
+   */
+  virtual void SetPaxStore(Pax::PaxStore* /*store*/) {}
 
   // Point operations. The optional `out_update` lets the OCC layer learn
   // whether the call structurally bumped a leaf version, so it can apply
