@@ -281,14 +281,35 @@ bool PaxGroup::ScatterRow(uint32_t slot, const std::byte* row, size_t size) {
   FieldRef refs[kMaxFields];
   const size_t parsed = ParseRow(row, size, refs, fields);
   if (parsed != fields) return false;
+  // Validate every field before any cell write. UNTYPED fields must fit their
+  // cell width; typed non-null fields are parsed into a fixed-width LE binary
+  // scratch. Any failure takes the per-row heap fallback with the slot
+  // untouched -- the write_counter is only bumped once every field validates.
+  const bool has_kinds = !schema_.field_kind.empty();
+  uint64_t typed_bin[kMaxFields];  // low field_max_bytes[f] bytes = LE payload
   for (size_t f = 0; f < fields; f++) {
-    if (refs[f].len > schema_.field_max_bytes[f]) return false;
-    if (refs[f].len > 0xFFFF) return false;
+    const uint8_t k = has_kinds ? schema_.field_kind[f] : FK_UNTYPED;
+    if (k == FK_UNTYPED) {
+      if (refs[f].len > schema_.field_max_bytes[f]) return false;
+      if (refs[f].len > 0xFFFF) return false;
+    } else if (refs[f].len != 0) {  // typed present value
+      if (!ParseTyped(k, schema_.scale_of(f), refs[f].payload, refs[f].len,
+                      &typed_bin[f]))
+        return false;
+    }
   }
   write_counter.fetch_add(1, std::memory_order_release);
   for (size_t f = 0; f < fields; f++) {
     std::byte* cell = arena_.get() + strip_offset_[f] +
                       static_cast<size_t>(stride_[f]) * slot;
+    const uint8_t k = has_kinds ? schema_.field_kind[f] : FK_UNTYPED;
+    if (k != FK_UNTYPED && refs[f].len != 0) {
+      const uint16_t len = static_cast<uint16_t>(schema_.field_max_bytes[f]);
+      std::memcpy(cell, &len, sizeof(len));
+      std::memcpy(cell + kCellLenBytes, &typed_bin[f], len);  // low `len` = LE
+      continue;
+    }
+    // UNTYPED, or a typed NULL (len 0): store verbatim (0 => empty == NULL).
     const uint16_t len = static_cast<uint16_t>(refs[f].len);
     std::memcpy(cell, &len, sizeof(len));
     if (len > 0) std::memcpy(cell + kCellLenBytes, refs[f].payload, len);
