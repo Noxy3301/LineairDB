@@ -20,6 +20,8 @@
 
 #include <atomic>
 #include <cassert>
+
+#include "util/logger.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -224,6 +226,18 @@ struct DataBuffer {
       auto* store = pax_store();
       auto [group, slot] = store->AllocateSlot();
       if (group == nullptr) {  // Table full: permanent heap fallback.
+        const uint64_t prior = store->overflow_count();
+        if (prior == 0) {
+          SPDLOG_WARN(
+              "PAX heap fallback engaged for table '{}': no free slot "
+              "(row size {})",
+              store->schema().table_name, s);
+        } else {
+          SPDLOG_DEBUG(
+              "PAX heap fallback (no free slot): table '{}' row size {} "
+              "fallback #{}",
+              store->schema().table_name, s, prior + 1);
+        }
         store->RecordHeapFallback();
         value = nullptr;
         capacity = 0;
@@ -243,7 +257,20 @@ struct DataBuffer {
     // Row does not fit (width overflow / shape mismatch): permanent heap
     // fallback for this row. Hide the abandoned slot and disable strip-direct
     // scans for this table because heap fallback rows are not in strips.
-    pax_group()->store()->RecordHeapFallback();
+    auto* store = pax_group()->store();
+    const uint64_t prior = store->overflow_count();
+    if (prior == 0) {
+      SPDLOG_WARN(
+          "PAX heap fallback engaged for table '{}': row does not fit its "
+          "declared cell widths (row size {})",
+          store->schema().table_name, s);
+    } else {
+      SPDLOG_DEBUG(
+          "PAX heap fallback (width overflow): table '{}' row size {} "
+          "fallback #{}",
+          store->schema().table_name, s, prior + 1);
+    }
+    store->RecordHeapFallback();
     pax_group()->RetireSlot(pax_slot());
     value = nullptr;
     capacity = 0;

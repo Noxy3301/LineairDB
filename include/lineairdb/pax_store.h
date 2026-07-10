@@ -56,6 +56,8 @@ struct TableSchema {
   std::vector<uint8_t> field_kind;
   // Per-field DECIMAL scale for FK_DEC64 (else 0). Same length when present.
   std::vector<int8_t> field_scale;
+  // Table name, carried for diagnostics (heap-fallback logging).
+  std::string table_name;
 
   /**
    * @brief Returns the number of encoded fields in a proxy row payload.

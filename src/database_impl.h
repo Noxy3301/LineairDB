@@ -378,6 +378,7 @@ class Database::Impl {
     auto table = GetTable(table_name);
     if (!table.has_value()) return false;
     Pax::TableSchema schema;
+    schema.table_name = std::string(table_name);
     schema.field_max_bytes = field_max_bytes;
     // Typed cells only when the kinds vector matches the field count; otherwise
     // every field stays UNTYPED (byte-identical to the untyped layout).
