@@ -17,6 +17,7 @@
 #include "table/table.h"
 #include "table/table_dictionary.hpp"
 #include "types/data_item.hpp"
+#include "util/debug_sync.hpp"
 #include "util/epoch_framework.hpp"
 
 namespace LineairDB {
@@ -490,12 +491,20 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
   // Phase 3.1: install row writes/deletes and SI add/remove. Deletes leave
   // tombstones in the tree; physical removal is deferred until a later
   // epoch so same-key reinserts reuse the slot and advance its TID chain.
-  for (auto& write : resolved_writes) {
-    if (write.is_delete) {
-      write.item->Reset(nullptr, 0);
-    } else {
-      write.item->Reset(reinterpret_cast<const std::byte*>(write.value.data()),
-                        write.value.size());
+  {
+    size_t installed = 0;
+    for (auto& write : resolved_writes) {
+      if (installed > 0) {
+        LINEAIRDB_DEBUG_SYNC("stateless_commit.between_row_installs");
+      }
+      if (write.is_delete) {
+        write.item->Reset(nullptr, 0);
+      } else {
+        write.item->Reset(
+            reinterpret_cast<const std::byte*>(write.value.data()),
+            write.value.size());
+      }
+      ++installed;
     }
   }
 
