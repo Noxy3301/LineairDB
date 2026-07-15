@@ -41,6 +41,7 @@
 #include <xmmintrin.h>
 
 #include "callback/callback_manager.h"
+#include "pax/version_store.hpp"
 #include "recovery/checkpoint_manager.hpp"
 #include "concurrency_control/stable_read.hpp"
 #include "index/reaper.h"
@@ -55,6 +56,7 @@
 #include "types/snapshot.hpp"
 #include "types/transaction_id.hpp"
 #include "util/backoff.hpp"
+#include "util/debug_sync.hpp"
 #include "util/epoch_framework.hpp"
 #include "util/logger.hpp"
 
@@ -363,6 +365,81 @@ class Database::Impl {
     auto table = GetTable(table_name);
     if (!table.has_value()) return nullptr;
     return table.value()->GetPaxStore();
+  }
+
+  Database::PaxReadView AcquirePaxReadView(uint32_t fence_timeout_ms) {
+    Database::PaxReadView handle;
+    auto token = Pax::VersionStore::Global().BeginCapture();
+    if (!token.valid) {
+      handle.error =
+          "columnar read view rejected: the active capture generation is "
+          "poisoned";
+      return handle;
+    }
+    // Fence order (do not reorder): arm the capture flag (seq_cst
+    // increment in BeginCapture), then load the cut epoch. An install
+    // whose flag check missed the capture belongs to a commit with epoch
+    // <= cut, and a thread online in epoch e keeps the global epoch at or
+    // below e + 1; once the global epoch reaches cut + 2 those installs
+    // have drained. Refuse when the fence target would cross the
+    // high-water mark, compared without addition to stay exact at the
+    // numeric limit.
+    const EpochNumber cut = epoch_framework_.GetGlobalEpoch();
+    if (cut >= EpochFramework::kEpochHighWater - 2) {
+      Pax::VersionStore::Global().EndCapture(token);
+      handle.error =
+          "columnar read view rejected: epoch space is near its wrap "
+          "high-water mark, restart the server";
+      return handle;
+    }
+    if (!epoch_framework_.WaitGlobalEpochAtLeast(
+            cut + 2, std::chrono::milliseconds(fence_timeout_ms))) {
+      Pax::VersionStore::Global().EndCapture(token);
+      handle.error =
+          "columnar read view fence timed out; a long-running transaction is "
+          "holding the epoch";
+      return handle;
+    }
+    // Test hook: holds the read view open between the fence and the scan.
+    LINEAIRDB_DEBUG_SYNC("pax_read_view.after_fence");
+    // A poison landing during the fence wait must fail the acquisition;
+    // callers treat a valid handle as a serviceable read view.
+    if (Pax::VersionStore::Global().Poisoned(token)) {
+      Pax::VersionStore::Global().EndCapture(token);
+      handle.error = "columnar read view poisoned during the fence wait";
+      return handle;
+    }
+    handle.valid = true;
+    handle.cut_epoch = cut;
+    handle.token = token.id;
+    return handle;
+  }
+
+  void ReleasePaxReadView(const Database::PaxReadView& view) {
+    if (!view.valid) return;
+    Pax::VersionStore::ReadViewToken token;
+    token.id = view.token;
+    token.valid = true;
+    Pax::VersionStore::Global().EndCapture(token);
+  }
+
+  // Read view expiry, half the high-water margin. Enforces the wrap-free
+  // window behind plain epoch comparisons: readers gate every attempt on
+  // PaxReadViewPoisoned, and the cut-to-global distance grows
+  // monotonically over any practical read view lifetime (a full uint32
+  // epoch cycle takes years), keeping accepted results inside the bound.
+  static constexpr EpochNumber kPaxReadViewEpochLifetime = 1u << 19;
+
+  bool PaxReadViewPoisoned(const Database::PaxReadView& view) const {
+    if (!view.valid) return true;
+    if (epoch_framework_.GetGlobalEpoch() - view.cut_epoch >=
+        kPaxReadViewEpochLifetime) {
+      return true;  // expired: comparisons could leave the wrap-free window
+    }
+    Pax::VersionStore::ReadViewToken token;
+    token.id = view.token;
+    token.valid = true;
+    return Pax::VersionStore::Global().Poisoned(token);
   }
 
   bool InstallPaxSchema(const std::string_view table_name,
