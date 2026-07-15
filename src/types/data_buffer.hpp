@@ -33,6 +33,8 @@
 
 #include <lineairdb/pax_store.h>
 
+#include "pax/version_store.hpp"
+
 namespace LineairDB {
 
 /**
@@ -211,6 +213,32 @@ struct DataBuffer {
 
  private:
   /**
+   * @brief Publishes the pre-install row image while a columnar read view
+   * is active.
+   *
+   * @details Must run before the first strip mutation of this install
+   * (ScatterRow or RetireSlot). A zero commit epoch means the install is
+   * outside an epoch-tagged commit (recovery replay); a read view observed
+   * active in that state poisons the generation, fail-closed.
+   */
+  void CaptureBeforeImageForReadView() {
+    auto& version_store = Pax::VersionStore::Global();
+    if (!version_store.CaptureActive()) return;
+    const uint32_t epoch = Pax::CurrentCommitEpoch::Get();
+    if (epoch == 0) {
+      // Fail closed: skipping silently would let cells change with no
+      // entry and no count advance, and the reader's end recheck would
+      // pass on a torn result. The writer proceeds.
+      version_store.PoisonActiveGeneration(
+          "PAX install without a commit epoch while a read view is active");
+      return;
+    }
+    const bool visible = size != 0;
+    version_store.Capture(pax_group(), pax_slot(), epoch, visible,
+                          visible ? toString() : std::string());
+  }
+
+  /**
    * @brief Installs payload bytes into this PAX-mode buffer.
    *
    * @details The caller holds the row's TID lock. If the row does not fit its
@@ -218,7 +246,10 @@ struct DataBuffer {
    */
   void ResetPax(const std::byte* v, const size_t s) {
     if (v == nullptr || s == 0) {
-      if (pax_allocated() && size != 0) pax_group()->RetireSlot(pax_slot());
+      if (pax_allocated() && size != 0) {
+        CaptureBeforeImageForReadView();
+        pax_group()->RetireSlot(pax_slot());
+      }
       size = 0;  // tombstone; keep the slot for the (possible) re-insert
       return;
     }
@@ -249,6 +280,7 @@ struct DataBuffer {
                                            kPaxTag | kPaxAllocated);
       capacity = slot;
     }
+    CaptureBeforeImageForReadView();
     if (pax_group()->ScatterRow(pax_slot(), v, s)) {
       size = s;
       return;

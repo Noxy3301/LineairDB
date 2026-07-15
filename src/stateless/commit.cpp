@@ -12,6 +12,7 @@
 #include "index/concurrent_table.h"
 #include "index/reaper.h"
 #include "index/secondary_index.h"
+#include "pax/version_store.hpp"
 #include "recovery/logger.h"
 #include "stateless/packed_transaction_id.hpp"
 #include "table/table.h"
@@ -492,6 +493,10 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
   // tombstones in the tree; physical removal is deferred until a later
   // epoch so same-key reinserts reuse the slot and advance its TID chain.
   {
+    // Tags the install region with the commit epoch so the PAX
+    // before-image capture can label its entries.
+    Pax::ScopedCommitEpoch commit_epoch_scope(
+        epoch_framework.GetMyThreadLocalEpoch());
     size_t installed = 0;
     for (auto& write : resolved_writes) {
       if (installed > 0) {
