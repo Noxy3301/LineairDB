@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -333,6 +334,65 @@ class PaxStore {
   std::atomic<uint64_t> overflow_count_{0};
   std::mutex grow_mutex_;
 };
+
+// ---------------------------------------------------------------------------
+// Columnar read view surface.
+//
+// While a read view acquired through Database::AcquirePaxReadView is active,
+// every PAX install publishes the replaced row image into a per-group undo
+// map before its first strip mutation, or poisons the active capture
+// generation when it cannot (src/pax/version_store.hpp holds the full
+// contract). A reader with cut epoch E resolves a slot to the before-image
+// of the oldest entry whose writer epoch exceeds E (was_visible == false:
+// the slot held no row) and reads the strip in place when no entry
+// qualifies.
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief One published before-image for a (group, slot).
+ */
+struct UndoEntry {
+  uint32_t writer_epoch;  // commit epoch of the install that published this
+  bool was_visible;       // false: the slot held no visible row before it
+  std::string old_row;    // proxy row payload; empty when !was_visible
+};
+
+/**
+ * @brief Tests whether a writer epoch is after the read view cut.
+ *
+ * @details Plain unsigned comparison on purpose: acquisition refuses near
+ * the epoch high-water mark and read views expire well inside that margin,
+ * so both operands lie in one wrap-free window. A modular comparison would
+ * misread old entries as post-cut once a read view outlives half the range.
+ */
+inline bool EpochAfterCut(uint32_t epoch, uint32_t cut) {
+  return epoch > cut;
+}
+
+/**
+ * @brief Returns the monotonic capture counter of `group`'s undo map.
+ *
+ * @details 0 when nothing captured into the group this generation. The
+ * counter increments after an entry is appended and before the writer's
+ * first strip mutation; an unchanged value across an in-place read means
+ * no concurrent capture.
+ */
+uint64_t UndoGroupCaptureCount(const PaxGroup* group);
+
+/**
+ * @brief Copies every undo entry recorded for `group`, keyed by slot.
+ *
+ * @details Entries per slot are ordered as published, and per-slot install
+ * order is epoch-non-decreasing. The copy is immune to concurrent capture.
+ */
+std::unordered_map<uint32_t, std::vector<UndoEntry>> UndoGroupEntries(
+    const PaxGroup* group);
+
+/**
+ * @brief Copies the undo entries recorded for one (group, slot).
+ */
+std::vector<UndoEntry> UndoSlotEntries(const PaxGroup* group,
+                                       uint32_t slot);
 
 }  // namespace Pax
 }  // namespace LineairDB

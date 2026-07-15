@@ -83,6 +83,19 @@ Pax::PaxStore* Database::GetPaxStore(const std::string_view table_name) {
   return db_pimpl_->GetPaxStore(table_name);
 }
 
+Database::PaxReadView Database::AcquirePaxReadView(
+    uint32_t fence_timeout_ms) {
+  return db_pimpl_->AcquirePaxReadView(fence_timeout_ms);
+}
+
+void Database::ReleasePaxReadView(const PaxReadView& view) {
+  db_pimpl_->ReleasePaxReadView(view);
+}
+
+bool Database::PaxReadViewPoisoned(const PaxReadView& view) const {
+  return db_pimpl_->PaxReadViewPoisoned(view);
+}
+
 bool Database::CreateSecondaryIndex(const std::string_view table_name,
                                     const std::string_view index_name,
                                     const uint index_type) {

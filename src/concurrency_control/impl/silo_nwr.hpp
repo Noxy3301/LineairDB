@@ -27,8 +27,10 @@
 
 #include "concurrency_control/concurrency_control_base.h"
 #include "concurrency_control/pivot_object.hpp"
+#include "pax/version_store.hpp"
 #include "types/data_item.hpp"
 #include "types/definitions.h"
+#include "util/debug_sync.hpp"
 
 namespace LineairDB {
 
@@ -325,7 +327,17 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
     // Deletes install tombstones. Physical removal is deferred to the
     // epoch reaper so same-key reinserts reuse the slot and preserve the
     // slot's monotonic TID chain.
+    //
+    // Tags the install region with the commit epoch so the PAX
+    // before-image capture can label its entries.
+    Pax::ScopedCommitEpoch commit_epoch_scope(
+        tx_ref_.epoch_framework_ref_.GetMyThreadLocalEpoch());
+    size_t installed = 0;
     for (auto& snapshot : tx_ref_.write_set_ref_) {
+      if (installed > 0) {
+        LINEAIRDB_DEBUG_SYNC("silo_commit.between_row_installs");
+      }
+      ++installed;
       if (!snapshot.index_name.empty() &&
           !snapshot.secondary_index_deltas.empty() &&
           !snapshot.index_type.IsUnique()) {

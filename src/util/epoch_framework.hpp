@@ -20,7 +20,9 @@
 #include <assert.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <thread>
 
@@ -110,6 +112,47 @@ class EpochFramework {
     }
   }
 
+  // Margin below the uint32 wrap point. Forced advances and fences refuse
+  // beyond it, and a read view's epoch lifetime is bounded well under the
+  // margin; every read-view epoch comparison therefore stays inside one
+  // wrap-free window where plain unsigned ordering is exact. The
+  // timer-driven advance is not capped.
+  static constexpr EpochNumber kEpochHighWater = UINT32_MAX - (1u << 20);
+
+  // Asks the epoch writer to run its advance check now instead of at the
+  // next tick. The advance condition itself is unchanged. No-op at or
+  // above the high-water mark.
+  void RequestEpochAdvance() {
+    if (global_epoch_.load() >= kEpochHighWater) return;
+    {
+      std::lock_guard<std::mutex> lk(epoch_mtx_);
+      advance_requested_.store(true);
+    }
+    worker_cv_.notify_one();
+  }
+
+  // Blocks the OFFLINE caller until it observes global_epoch >= target.
+  // Already-reached targets succeed even after Stop() or above the
+  // high-water mark; otherwise false on timeout, Stop(), or a target
+  // beyond the mark.
+  bool WaitGlobalEpochAtLeast(EpochNumber target,
+                              std::chrono::milliseconds timeout) {
+    assert(GetMyThreadLocalEpoch() == THREAD_OFFLINE);
+    if (global_epoch_.load() >= target) return true;
+    if (target > kEpochHighWater) return false;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::unique_lock<std::mutex> lk(epoch_mtx_);
+    for (;;) {
+      if (global_epoch_.load() >= target) return true;
+      if (stop_.load()) return false;
+      advance_requested_.store(true);
+      worker_cv_.notify_one();
+      if (epoch_cv_.wait_until(lk, deadline) == std::cv_status::timeout) {
+        return global_epoch_.load() >= target;
+      }
+    }
+  }
+
   void Start() {
     {
       std::lock_guard<std::mutex> lk(epoch_mtx_);
@@ -123,6 +166,7 @@ class EpochFramework {
       stop_.store(true);
     }
     epoch_cv_.notify_all();
+    worker_cv_.notify_all();
     if (epoch_writer_.joinable()) epoch_writer_.join();
   }
 
@@ -147,9 +191,28 @@ class EpochFramework {
     }
 
     for (;;) {
-      std::this_thread::sleep_for(std::chrono::nanoseconds(epoch_duration));
+      bool forced_wake = false;
+      if (stop_.load()) {
+        // Post-stop the predicate below stays true; plain sleep keeps the
+        // cadence while draining still-online threads
+        std::this_thread::sleep_for(std::chrono::nanoseconds(epoch_duration));
+      } else {
+        // Forced requests wake the writer early; the advance condition
+        // below still gates
+        std::unique_lock<std::mutex> lk(epoch_mtx_);
+        forced_wake = worker_cv_.wait_for(
+            lk, std::chrono::nanoseconds(epoch_duration), [&] {
+              return advance_requested_.load() || stop_.load();
+            });
+        advance_requested_.store(false);
+      }
       EpochNumber min_epoch = GetSmallestEpoch();
       EpochNumber old_epoch = global_epoch_;
+      if (forced_wake && !stop_.load() && old_epoch >= kEpochHighWater) {
+        // A racing forced request must not advance past the high-water
+        // margin; timer cadence continues
+        continue;
+      }
       if (min_epoch == THREAD_OFFLINE || min_epoch == old_epoch) {
         {
           // fetch_add is atomic, but we hold epoch_mtx_ here to
@@ -169,9 +232,11 @@ class EpochFramework {
  private:
   std::atomic<bool> start_;
   std::atomic<bool> stop_;
+  std::atomic<bool> advance_requested_{false};
   std::atomic<EpochNumber> global_epoch_;
   std::mutex epoch_mtx_;
   std::condition_variable epoch_cv_;
+  std::condition_variable worker_cv_;
   const std::function<void(EpochNumber)> publish_target_;
   std::thread epoch_writer_;
   ThreadKeyStorage<EpochNumber> tls_;

@@ -228,6 +228,51 @@ class Database {
    */
   Pax::PaxStore* GetPaxStore(const std::string_view table_name);
 
+  /**
+   * @brief Handle for one columnar read view.
+   *
+   * @details `cut_epoch` is the read view's serialization point: commits
+   * with epoch <= cut are visible, later ones resolve to before-images.
+   * `token` must be passed back to ReleasePaxReadView exactly once.
+   */
+  struct PaxReadView {
+    bool valid = false;
+    uint32_t cut_epoch = 0;
+    uint64_t token = 0;
+    std::string error;  // rejection reason when !valid
+  };
+
+  /**
+   * @brief Arms before-image capture and fences the epoch so `cut_epoch`
+   * is a sound serialization point.
+   *
+   * @details On return every commit with epoch <= cut_epoch has finished
+   * installing, and every later commit captures the rows it overwrites or
+   * poisons the read view. The calling thread must not hold an epoch (it
+   * must be outside any transaction). Fails instead of falling back on
+   * fence timeout, near the epoch high-water mark, or when the generation
+   * is poisoned during acquisition.
+   *
+   * @param fence_timeout_ms Upper bound on the fence wait.
+   * @return A valid handle, or an invalid one carrying the reason.
+   */
+  PaxReadView AcquirePaxReadView(uint32_t fence_timeout_ms);
+
+  /**
+   * @brief Releases a read view; the last active release clears the undo
+   * maps. Safe to call with an invalid handle (no-op).
+   */
+  void ReleasePaxReadView(const PaxReadView& view);
+
+  /**
+   * @brief Returns whether this read view's results must be discarded.
+   *
+   * @details True when the capture generation was poisoned or the read view
+   * outlived its epoch-lifetime bound. Callers gate every result on this
+   * before accepting it.
+   */
+  bool PaxReadViewPoisoned(const PaxReadView& view) const;
+
   // ----------------------------------------------------------------------
   // Stateless read / validate-and-commit API.
   //
