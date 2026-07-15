@@ -30,6 +30,7 @@
 #include "pax/version_store.hpp"
 #include "types/data_item.hpp"
 #include "types/definitions.h"
+#include "util/debug_sync.hpp"
 
 namespace LineairDB {
 
@@ -331,7 +332,12 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
     // before-image capture can label its entries.
     Pax::ScopedCommitEpoch commit_epoch_scope(
         tx_ref_.epoch_framework_ref_.GetMyThreadLocalEpoch());
+    size_t installed = 0;
     for (auto& snapshot : tx_ref_.write_set_ref_) {
+      if (installed > 0) {
+        LINEAIRDB_DEBUG_SYNC("silo_commit.between_row_installs");
+      }
+      ++installed;
       if (!snapshot.index_name.empty() &&
           !snapshot.secondary_index_deltas.empty() &&
           !snapshot.index_type.IsUnique()) {
