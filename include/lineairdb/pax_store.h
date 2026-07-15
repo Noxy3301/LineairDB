@@ -91,9 +91,8 @@ class PaxStore;
  * storage class. Callers invoke `ScatterRow()` only while holding the row's
  * existing Silo TID lock. `GatherRow()` is memory-safe under a concurrent
  * scatter to the same slot, and callers reject torn rows with the normal TID
- * re-check. Strip-direct readers can use `IsVisible()` and `write_counter` to
- * read a whole group without materializing rows, then fall back when the group
- * changed during the read.
+ * re-check. Strip-direct readers resolve concurrent writers through the
+ * columnar read view surface below.
  */
 class PaxGroup {
  public:
@@ -236,12 +235,6 @@ class PaxGroup {
    * @brief Returns the table store that owns this group.
    */
   PaxStore* store() const { return store_; }
-
-  // Group-level seqlock-style counter for strip-direct readers. Writers bump
-  // it once before and once after scattering cells. A reader that observes the
-  // same even value before and after scanning saw no completed or in-progress
-  // scatter across that interval.
-  std::atomic<uint64_t> write_counter{0};
 
  private:
   const TableSchema& schema_;  // Owned by PaxStore; outlives all groups.

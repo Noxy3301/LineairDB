@@ -284,7 +284,7 @@ bool PaxGroup::ScatterRow(uint32_t slot, const std::byte* row, size_t size) {
   // Validate every field before any cell write. UNTYPED fields must fit their
   // cell width; typed non-null fields are parsed into a fixed-width LE binary
   // scratch. Any failure takes the per-row heap fallback with the slot
-  // untouched -- the write_counter is only bumped once every field validates.
+  // untouched.
   const bool has_kinds = !schema_.field_kind.empty();
   uint64_t typed_bin[kMaxFields];  // low field_max_bytes[f] bytes = LE payload
   for (size_t f = 0; f < fields; f++) {
@@ -298,7 +298,6 @@ bool PaxGroup::ScatterRow(uint32_t slot, const std::byte* row, size_t size) {
         return false;
     }
   }
-  write_counter.fetch_add(1, std::memory_order_release);
   for (size_t f = 0; f < fields; f++) {
     std::byte* cell = arena_.get() + strip_offset_[f] +
                       static_cast<size_t>(stride_[f]) * slot;
@@ -317,17 +316,14 @@ bool PaxGroup::ScatterRow(uint32_t slot, const std::byte* row, size_t size) {
   // Publish this slot to strip-direct readers after the cells are written.
   visible_[slot >> 6].fetch_or(uint64_t{1} << (slot & 63),
                                std::memory_order_release);
-  write_counter.fetch_add(1, std::memory_order_release);
   return true;
 }
 
 void PaxGroup::RetireSlot(uint32_t slot) {
   assert(slot < kRows);
-  write_counter.fetch_add(1, std::memory_order_release);
   // Hide this slot from strip-direct readers.
   visible_[slot >> 6].fetch_and(~(uint64_t{1} << (slot & 63)),
                                 std::memory_order_release);
-  write_counter.fetch_add(1, std::memory_order_release);
 }
 
 size_t PaxGroup::GatherRow(uint32_t slot, std::byte* dst,
