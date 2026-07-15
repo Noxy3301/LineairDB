@@ -381,9 +381,9 @@ class Database::Impl {
     // whose flag check missed the capture belongs to a commit with epoch
     // <= cut, and a thread online in epoch e keeps the global epoch at or
     // below e + 1; once the global epoch reaches cut + 2 those installs
-    // have drained. Refuse when the fence target would cross the
-    // high-water mark, compared without addition to stay exact at the
-    // numeric limit.
+    // have drained. Refuse when the fence target would reach or cross
+    // the high-water mark, compared without addition to stay exact at
+    // the numeric limit.
     const EpochNumber cut = epoch_framework_.GetGlobalEpoch();
     if (cut >= EpochFramework::kEpochHighWater - 2) {
       Pax::VersionStore::Global().EndCapture(token);
@@ -402,11 +402,11 @@ class Database::Impl {
     }
     // Test hook: holds the read view open between the fence and the scan.
     LINEAIRDB_DEBUG_SYNC("pax_read_view.after_fence");
-    // A poison landing during the fence wait must fail the acquisition;
-    // callers treat a valid handle as a serviceable read view.
+    // A poison landing during acquisition must fail it here; callers
+    // treat a valid handle as a serviceable read view.
     if (Pax::VersionStore::Global().Poisoned(token)) {
       Pax::VersionStore::Global().EndCapture(token);
-      handle.error = "columnar read view poisoned during the fence wait";
+      handle.error = "columnar read view poisoned during acquisition";
       return handle;
     }
     handle.valid = true;
