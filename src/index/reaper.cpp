@@ -78,6 +78,7 @@ bool Reaper::PurgeDeferredPurgeCandidate(
 }
 
 void Reaper::Reap(EpochNumber published_epoch) {
+  PrunePurgeHistory(published_epoch);
   std::vector<DeferredPurgeCandidate> ready;
   size_t pending_before = 0;
   {
@@ -172,6 +173,15 @@ void Reaper::Reap(EpochNumber published_epoch) {
 
     TransactionId retired = candidate.delete_commit_tid;
     retired.tid = (retired.tid + 2u) & ~1u;
+    // Publish the purge evidence BEFORE the physical removal: a validator
+    // that observes the missing slot must already find the history entry.
+    // A failed purge leaves a spurious entry behind, which only over-aborts.
+    const void* index_identity =
+        candidate.kind == DeferredPurgeIndexKind::Primary
+            ? static_cast<const void*>(candidate.primary_index)
+            : static_cast<const void*>(candidate.secondary_index);
+    RecordPurged(index_identity, candidate.key,
+                 candidate.delete_commit_tid.epoch, published_epoch);
     if (PurgeDeferredPurgeCandidate(candidate, retired)) {
       ++reaped;
     } else {
@@ -206,6 +216,69 @@ void Reaper::Reap(EpochNumber published_epoch) {
 
   MasstreeReleaseThreadEpoch();
 }
+
+
+std::string Reaper::PurgeHistoryKey(const void* index_identity,
+                                    std::string_view key) {
+  std::string history_key;
+  history_key.reserve(sizeof(index_identity) + 1 + key.size());
+  history_key.append(reinterpret_cast<const char*>(&index_identity),
+                     sizeof(index_identity));
+  history_key.push_back('\0');
+  history_key.append(key.data(), key.size());
+  return history_key;
+}
+
+void Reaper::RecordPurged(const void* index_identity, std::string_view key,
+                          EpochNumber delete_epoch,
+                          EpochNumber published_epoch) {
+  std::lock_guard<std::mutex> lk(purge_history_mtx_);
+  std::string history_key = PurgeHistoryKey(index_identity, key);
+  auto [it, inserted] = purge_history_.try_emplace(history_key, delete_epoch);
+  if (!inserted && it->second < delete_epoch) it->second = delete_epoch;
+  if (purge_history_buckets_.empty() ||
+      purge_history_buckets_.back().first != published_epoch) {
+    purge_history_buckets_.push_back({published_epoch, {}});
+  }
+  purge_history_buckets_.back().second.emplace_back(std::move(history_key),
+                                                    delete_epoch);
+}
+
+void Reaper::PrunePurgeHistory(EpochNumber published_epoch) {
+  if (published_epoch <= kPurgeHistoryRetentionEpochs) return;
+  const EpochNumber cutoff = published_epoch - kPurgeHistoryRetentionEpochs;
+  std::lock_guard<std::mutex> lk(purge_history_mtx_);
+  while (!purge_history_buckets_.empty() &&
+         purge_history_buckets_.front().first <= cutoff) {
+    for (auto& entry : purge_history_buckets_.front().second) {
+      auto it = purge_history_.find(entry.first);
+      if (it != purge_history_.end() && it->second == entry.second) {
+        purge_history_.erase(it);
+      }
+    }
+    purge_history_buckets_.pop_front();
+  }
+  // A pruned bucket at publishing epoch P held purges of deletes at epochs
+  // <= P - 2, so every delete at cutoff + 1 or later is still retained.
+  if (purge_history_horizon_ < cutoff + 1) {
+    purge_history_horizon_ = cutoff + 1;
+  }
+}
+
+Reaper::AbsentReadCheck Reaper::CheckAbsentRead(const void* index_identity,
+                                                std::string_view key,
+                                                EpochNumber read_epoch) {
+  std::lock_guard<std::mutex> lk(purge_history_mtx_);
+  if (read_epoch < purge_history_horizon_) {
+    return AbsentReadCheck::HistoryExpired;
+  }
+  auto it = purge_history_.find(PurgeHistoryKey(index_identity, key));
+  if (it != purge_history_.end() && it->second >= read_epoch) {
+    return AbsentReadCheck::PurgedAfterRead;
+  }
+  return AbsentReadCheck::Ok;
+}
+
 
 }  // namespace Index
 }  // namespace LineairDB

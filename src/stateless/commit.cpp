@@ -99,7 +99,9 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     for (const auto& read : reads) {
       auto table = tables.GetTable(read.table_name);
       if (!table.has_value()) {
-        if (read.found || read.tid != 0) {
+        // A no-slot miss carries only a read-epoch stamp in the TID's epoch
+        // half; a nonzero TID half is a real witness.
+        if (read.found || (UnpackTransactionId(read.tid).tid != 0)) {
           return abort_before_lock("read_table_missing");
         }
         continue;
@@ -243,6 +245,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
       }
     }
   }
+  LINEAIRDB_DEBUG_SYNC("stateless_commit.after_write_locks");
 
   // Phase 1.2: re-read the global epoch with all locks held — the
   // serialization point: epoch-grouped commit and recovery follow the
@@ -286,15 +289,114 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
         return unlock_and_abort(
             exact_read_reason("exact_read_disappeared", read));
       }
+      if (read.captured_tid.tid != 0) {
+        // The witnessed tombstone was physically purged mid-transaction;
+        // its TID chain is gone, so the observation cannot be certified.
+        return unlock_and_abort(
+            exact_read_reason("exact_read_disappeared", read));
+      }
+      // No slot at read and none at commit. Sound only if no purge could
+      // have erased a post-read insert+delete round trip; the epoch half
+      // of the captured TID carries the read-epoch floor.
+      switch (reaper.CheckAbsentRead(&read.table->GetPrimaryIndex(),
+                                     read.key, read.captured_tid.epoch)) {
+        case Index::Reaper::AbsentReadCheck::PurgedAfterRead:
+          return unlock_and_abort(
+              exact_read_reason("absent_read_purged", read));
+        case Index::Reaper::AbsentReadCheck::HistoryExpired:
+          return unlock_and_abort(
+              exact_read_reason("absent_read_expired", read));
+        case Index::Reaper::AbsentReadCheck::Ok:
+          break;
+      }
       continue;
     }
 
     if (!read.found) {
-      if (!item->IsPrimaryInitialized()) {
+      // Three found=false shapes, told apart by the captured TID: the TID
+      // half is nonzero for a tombstone the read witnessed, zero for a
+      // no-slot miss (whose epoch half carries the read-epoch floor).
+      const TransactionId captured = read.captured_tid;
+      // TID first, then the install check, then the TID again: an install
+      // slips between two loads only by moving the TID, so an unchanged
+      // unlocked TID around the install check proves the slot stayed
+      // uninstalled. This transaction's own lock is stable here.
+      bool own_locked = false;
+      TransactionId own_before_lock;
+      TransactionId own_locked_tid;
+      for (const auto& locked : locked_tids) {
+        if (locked.item == item) {
+          own_locked = true;
+          own_before_lock = locked.before_lock;
+          own_locked_tid = locked.locked;
+          break;
+        }
+      }
+      const TransactionId tid_before = item->transaction_id.load();
+      // A blank locked by another transaction is an inserter between slot
+      // creation and install; if it commits first, the observation "the
+      // key was absent" is no longer valid.
+      if (!own_locked && (tid_before.tid & 1u)) {
+        return unlock_and_abort(
+            exact_read_reason("exact_read_insert_in_flight", read));
+      }
+      if (captured.tid != 0) {
+        // Tombstone witnessed at read: ordinary TID stability. The current
+        // TID must equal the captured one (or our own lock taken over it).
+        TransactionId expected = captured;
+        if (own_locked) {
+          if (own_before_lock.tid != captured.tid ||
+              own_before_lock.epoch != captured.epoch) {
+            return unlock_and_abort(
+                exact_read_reason("exact_read_tid_moved", read));
+          }
+          expected = own_locked_tid;
+        }
+        if (tid_before.tid != expected.tid ||
+            tid_before.epoch != expected.epoch) {
+          return unlock_and_abort(
+              exact_read_reason("exact_read_tid_moved", read));
+        }
+        if (item->IsPrimaryInitialized()) {
+          return unlock_and_abort(
+              exact_read_reason("exact_read_appeared", read));
+        }
+        if (!own_locked) {
+          TransactionId tid_after = item->transaction_id.load();
+          if (tid_after.tid != tid_before.tid ||
+              tid_after.epoch != tid_before.epoch) {
+            return unlock_and_abort(
+                exact_read_reason("exact_read_tid_moved", read));
+          }
+        }
         continue;
       }
-      return unlock_and_abort(
-          exact_read_reason("exact_read_appeared", read));
+      // No slot at read, a slot at commit. Only a virgin blank (TID {0, 0})
+      // certifies absence over the whole validation window; any nonzero TID
+      // means a commit landed on the key after the miss. The same holds for
+      // this transaction's own insert target: a nonzero pre-lock TID under
+      // our own lock is a committed foreign round trip after the miss.
+      if (!own_locked && (tid_before.tid != 0 || tid_before.epoch != 0)) {
+        return unlock_and_abort(
+            exact_read_reason("exact_read_appeared", read));
+      }
+      if (own_locked &&
+          (own_before_lock.tid != 0 || own_before_lock.epoch != 0)) {
+        return unlock_and_abort(
+            exact_read_reason("exact_read_appeared", read));
+      }
+      if (item->IsPrimaryInitialized()) {
+        return unlock_and_abort(
+            exact_read_reason("exact_read_appeared", read));
+      }
+      if (!own_locked) {
+        TransactionId tid_after = item->transaction_id.load();
+        if (tid_after.tid != 0 || tid_after.epoch != 0) {
+          return unlock_and_abort(
+              exact_read_reason("exact_read_insert_in_flight", read));
+        }
+      }
+      continue;
     }
 
     TransactionId expected = read.captured_tid;

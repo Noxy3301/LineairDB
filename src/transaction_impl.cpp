@@ -167,6 +167,13 @@ Transaction::Impl::Impl(Database::Impl* db_pimpl) noexcept
       current_table_(nullptr) {
   current_transaction_context =
       reinterpret_cast<void*>(tx_context_thread_tag | (++tx_context_seq & 0xFFFFFFFF));
+  // Fresh transactions do not pass through Reset(); sample the absent-read
+  // epoch floor here as well, or the first use would carry floor zero and
+  // fail closed once the purge-history horizon has advanced.
+  {
+    const EpochNumber global = db_pimpl_->epoch_framework_.GetGlobalEpoch();
+    begin_epoch_floor_ = global == 0 ? 0 : global - 1;
+  }
 
   auto register_deferred_purge = [this](const Snapshot& snapshot,
                                         TransactionId delete_commit_tid) {
@@ -245,6 +252,11 @@ void Transaction::Impl::Reset(Database::Impl* db_pimpl) {
   write_set_.clear();
   remainingNotNullSkWrites_.clear();
   node_version_set_.clear();
+  absent_read_set_.clear();
+  {
+    const EpochNumber global = db_pimpl_->epoch_framework_.GetGlobalEpoch();
+    begin_epoch_floor_ = global == 0 ? 0 : global - 1;
+  }
 
   auto register_deferred_purge = [this](const Snapshot& snapshot,
                                         TransactionId delete_commit_tid) {
@@ -291,6 +303,9 @@ const std::pair<const std::byte* const, const size_t> Transaction::Impl::Read(
   // key has no slot yet, just report not-found without registering anything.
   auto* index_leaf = current_table_->GetPrimaryIndex().Get(key);
   if (index_leaf == nullptr) {
+    // Register the miss; the serial-point validator re-checks that the key
+    // is still slot-less (or written by this transaction) at commit.
+    absent_read_set_.push_back({current_table_, std::string(key), {}});
     return {nullptr, 0};
   }
   Snapshot snapshot = {
@@ -337,6 +352,9 @@ Transaction::Impl::ReadSecondaryIndex(const std::string_view index_name,
   // Read path: avoid structural insert — see Read() above.
   DataItem* index_leaf = index->Get(key);
   if (index_leaf == nullptr) {
+    // Register the miss for the serial-point re-check, like Read().
+    absent_read_set_.push_back(
+        {current_table_, std::string(key), std::string(index_name)});
     return {};
   }
   Snapshot snapshot = {
@@ -1395,11 +1413,92 @@ bool Transaction::Impl::Precommit() {
   // and lock acquisition; running it here keeps the protocol strict-
   // serializable. PL's ValidatePhantoms is a no-op.
   concurrency_control_->SetPreCommitValidator([this]() {
-    if (node_version_set_.empty()) return true;
-    std::unordered_set<Index::IndexBase*> owners;
-    for (const auto& e : node_version_set_) owners.insert(e.owner);
-    for (auto* owner : owners) {
-      if (!owner->ValidatePhantoms(node_version_set_)) return false;
+    if (!node_version_set_.empty()) {
+      std::unordered_set<Index::IndexBase*> owners;
+      for (const auto& e : node_version_set_) owners.insert(e.owner);
+      for (auto* owner : owners) {
+        if (!owner->ValidatePhantoms(node_version_set_)) return false;
+      }
+    }
+    // Absent-key point reads: a slot that appeared for a missed key means a
+    // concurrent insert began after the read, and "the key was absent" can
+    // no longer be validated. The transaction's own pending write to the
+    // missed key is consistent with the miss only while the slot is still
+    // uninstalled; an installed slot was committed by another transaction
+    // between the miss and this serial point. Get() never inserts, so this
+    // re-check cannot disturb node versions observed by concurrent scans.
+    for (const auto& absent : absent_read_set_) {
+      DataItem* item = nullptr;
+      const void* index_identity = nullptr;
+      if (absent.index_name.empty()) {
+        auto& primary = absent.table->GetPrimaryIndex();
+        index_identity = &primary;
+        item = primary.Get(absent.key);
+      } else {
+        auto* si = absent.table->GetSecondaryIndex(absent.index_name);
+        // MDL excludes index DDL while this transaction is open; the null
+        // guard is defensive only.
+        if (si == nullptr) continue;
+        index_identity = si;
+        item = si->Get(absent.key);
+      }
+      if (item == nullptr) {
+        // The serial-point epoch refresh unpins this thread for an instant,
+        // so a post-read insert+delete may already be physically purged.
+        // The purge history proves whether "no slot" also means "no slot
+        // since the transaction began". MDL excludes DROP/CREATE of the
+        // table itself, so the index identity is stable.
+        switch (db_pimpl_->GetReaper().CheckAbsentRead(
+            index_identity, absent.key, begin_epoch_floor_)) {
+          case Index::Reaper::AbsentReadCheck::PurgedAfterRead:
+          case Index::Reaper::AbsentReadCheck::HistoryExpired:
+            return false;
+          case Index::Reaper::AbsentReadCheck::Ok:
+            break;
+        }
+        continue;
+      }
+      const auto installed = [&]() {
+        return absent.index_name.empty() ? item->IsPrimaryInitialized()
+                                         : item->IsInitialized();
+      };
+      const auto& absent_table_name = absent.table->GetTableName();
+      bool own_write = false;
+      for (const auto& w : write_set_) {
+        if (w.key == absent.key && w.table_name == absent_table_name &&
+            w.index_name == absent.index_name) {
+          own_write = true;
+          break;
+        }
+      }
+      if (own_write) {
+        // Under the Silo protocol this transaction holds the write lock on
+        // its own target here, so the check is stable: an installed slot
+        // under our own lock means a foreign insert committed between the
+        // miss and our lock. The lock only sets the TID's low bit, so the
+        // pre-lock TID is recoverable; a nonzero pre-lock TID is a foreign
+        // committed round trip (insert then delete) after the miss.
+        if (installed()) return false;
+        const TransactionId own_tid = item->transaction_id.load();
+        if (own_tid.epoch != 0 || (own_tid.tid & ~1u) != 0) return false;
+        continue;
+      }
+      // A foreign slot may be a staged, uncommitted write: writers create
+      // slots at execution time. Only a virgin blank (TID {0, 0}) is safe
+      // to accept: its owner has neither locked nor committed, so it
+      // validates under its own locks after our serial point and observes
+      // our locked or installed writes. Any nonzero TID means a commit
+      // landed on the key after the miss (a slot that predated the read
+      // would have been witnessed through the read set instead), and the
+      // absence observation is only instant-certified, so an
+      // installed-then-deleted round trip inside the validation window
+      // must abort. TID before, install check, TID after: an install
+      // slipping between the loads moves the TID.
+      TransactionId tid_before = item->transaction_id.load();
+      if (tid_before.tid != 0 || tid_before.epoch != 0) return false;
+      if (installed()) return false;
+      TransactionId tid_after = item->transaction_id.load();
+      if (tid_after.tid != 0 || tid_after.epoch != 0) return false;
     }
     return true;
   });

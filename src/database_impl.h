@@ -486,13 +486,50 @@ class Database::Impl {
   StatelessReadResult StatelessRead(
       const std::string_view table_name, const std::string_view key,
       const std::vector<uint32_t>* selected_columns = nullptr) {
-    return Stateless::Read(table_dictionary_, schema_mutex_, table_name, key,
-                           selected_columns);
+    const EpochNumber read_epoch_floor = AbsentReadEpochFloor();
+    auto result = Stateless::Read(table_dictionary_, schema_mutex_, table_name,
+                                  key, selected_columns);
+    StampAbsentReadEpoch(&result, read_epoch_floor);
+    return result;
   }
+
+  /**
+   * @brief Stamp a no-slot miss with a read-epoch floor.
+   *
+   * The commit-time absent re-check consults the purge history and needs a
+   * lower bound on the read instant. A delete that commits after this read
+   * carries an epoch of at least the global epoch minus one (thread-local
+   * epochs lag the global epoch by at most one), so pack that floor into the
+   * otherwise unused TID of the miss. The TID half stays zero, which is what
+   * distinguishes a no-slot miss from a witnessed tombstone.
+   */
+  void StampAbsentReadEpoch(StatelessReadResult* result,
+                            EpochNumber read_epoch_floor) {
+    if (result->found || result->tid != 0) return;
+    result->tid = Stateless::PackTransactionId({read_epoch_floor, 0});
+  }
+
+  /**
+   * @brief Epoch floor for a miss, sampled BEFORE the index lookup.
+   *
+   * Sampling after the lookup would let a delete commit and purge between
+   * the lookup and the stamp with an epoch below the stamp.
+   */
+  EpochNumber AbsentReadEpochFloor() {
+    const EpochNumber global = epoch_framework_.GetGlobalEpoch();
+    return global == 0 ? 0 : global - 1;
+  }
+
+  Index::Reaper& GetReaper() { return reaper_; }
 
   std::vector<StatelessReadResult> StatelessBatchRead(
       const std::vector<std::pair<std::string, std::string>>& keys) {
-    return Stateless::BatchRead(table_dictionary_, schema_mutex_, keys);
+    const EpochNumber read_epoch_floor = AbsentReadEpochFloor();
+    auto results = Stateless::BatchRead(table_dictionary_, schema_mutex_, keys);
+    for (auto& result : results) {
+      StampAbsentReadEpoch(&result, read_epoch_floor);
+    }
+    return results;
   }
 
   StatelessRangeScanResult StatelessRangeScan(

@@ -2,9 +2,12 @@
 #define LINEAIRDB_INDEX_REAPER_H
 
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "types/data_item.hpp"
@@ -61,7 +64,35 @@ class Reaper {
    */
   void Reap(EpochNumber published_epoch);
 
+  /** Outcome of an absent-read purge-history check. */
+  enum class AbsentReadCheck { Ok, PurgedAfterRead, HistoryExpired };
+
+  /**
+   * @brief Check whether a primary slot for `key` was physically purged by a
+   * delete that committed at or after `read_epoch`.
+   *
+   * A no-slot observation at validation certifies "the key never existed"
+   * only when no purge could have erased a post-read insert+delete round
+   * trip. `HistoryExpired` means `read_epoch` predates the retained history
+   * and the caller must fail closed.
+   */
+  AbsentReadCheck CheckAbsentRead(const void* index_identity,
+                                  std::string_view key,
+                                  EpochNumber read_epoch);
+
  private:
+  /**
+   * @brief Record one physically purged primary slot in the bounded history.
+   */
+  void RecordPurged(const void* index_identity, std::string_view key,
+                    EpochNumber delete_epoch, EpochNumber published_epoch);
+
+  /** Drop history buckets older than the retention window. */
+  void PrunePurgeHistory(EpochNumber published_epoch);
+
+  static std::string PurgeHistoryKey(const void* index_identity,
+                                     std::string_view key);
+
   /** Which index owns the candidate's slot. */
   enum class DeferredPurgeIndexKind { Primary, Secondary };
 
@@ -74,6 +105,19 @@ class Reaper {
    * deleting commit published on the slot; it acts both as the grace-period
    * clock and as evidence that the slot still holds the deleted version.
    */
+  // Physically purged slots (primary and secondary), retained for a
+  // bounded epoch window.
+  // purge_history_ maps slot identity to the newest purged delete epoch;
+  // buckets are keyed by the publishing epoch for pruning. Reads older than
+  // purge_history_horizon_ cannot be certified and fail closed.
+  static constexpr EpochNumber kPurgeHistoryRetentionEpochs = 1024;
+  std::mutex purge_history_mtx_;
+  std::unordered_map<std::string, EpochNumber> purge_history_;
+  std::deque<std::pair<EpochNumber,
+                       std::vector<std::pair<std::string, EpochNumber>>>>
+      purge_history_buckets_;
+  EpochNumber purge_history_horizon_ = 0;
+
   struct DeferredPurgeCandidate {
     DeferredPurgeIndexKind kind;
     ConcurrentTable* primary_index = nullptr;

@@ -159,6 +159,20 @@ class Transaction::Impl {
   // Deferred phantom-detection snapshots collected from Masstree-backed
   // scans during this transaction. Re-checked at Precommit; empty for PL.
   std::vector<Index::NodeVersionEntry> node_version_set_;
+  // Point reads that found no index slot. "The key was absent" is
+  // re-validated at the serial point: a slot created after the read means
+  // a concurrent insert may serialize before this transaction.
+  struct AbsentRead {
+    Table* table;
+    std::string key;
+    std::string index_name;  // Empty means the primary index.
+  };
+  std::vector<AbsentRead> absent_read_set_;
+  // Epoch floor sampled at Reset(), before any read. The serial-point epoch
+  // refresh momentarily unpins the global epoch, so a post-read delete can
+  // be purged before the validator re-resolves; the purge history is
+  // consulted against this floor.
+  EpochNumber begin_epoch_floor_{0};
   struct NotNullProgress {
     size_t remainingWrites;
     std::unordered_set<std::string> satisfiedIndexNames;
