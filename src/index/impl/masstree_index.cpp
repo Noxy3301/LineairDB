@@ -22,19 +22,14 @@
 // as externs; exactly one translation unit must define them. Types must
 // match kvthread.hh:33-35.
 //
-// Intentionally left at their initial values: this wrapper uses masstree's
-// B+tree structure and nodeversion-based locking for concurrency, but does
-// NOT drive masstree's internal RCU machinery. Matches published Silo+
-// masstree practice — CCBench's masstree_wrapper.hh and Tu Silo's
-// simple_threadinfo stub take the same approach — and has no semantic
-// consequences: masstree's insert/scan/remove correctness relies on
-// nodeversion bits, not these epochs. Tradeoff: every masstree allocation
-// that would otherwise be reclaimed via RCU (overwrite-replaced
-// DataItem*, retired leaves/internodes/ksuffix blocks from internal
-// splits), plus the entire live tree at process exit (destroy() is
-// deliberately not called — see ~Impl()), leaks for the process lifetime.
-// Bounded by bench-scope insert churn; not suitable for long-running
-// service deployment without a real reclamation path.
+// These carry live state rather than staying at their initial values.
+// MasstreeAdvanceEpoch bumps globalepoch and recomputes the reclamation
+// watermark on every host epoch tick, and threads enter and leave their RCU
+// critical sections through ensure_thread_active and
+// MasstreeReleaseThreadEpoch. Retired nodes are therefore reclaimed, and a
+// node address can be handed out again once every thread has left the epoch
+// that retired it: a caller that keeps a raw node pointer across a release
+// point cannot use that pointer as an identity.
 relaxed_atomic<mrcu_epoch_type> globalepoch{1};
 relaxed_atomic<mrcu_epoch_type> active_epoch{1};
 volatile bool recovering = false;

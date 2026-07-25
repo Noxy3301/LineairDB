@@ -74,8 +74,12 @@ StatelessRangeScanResult RangeScan(TableDictionary& tables,
                              PackTransactionId(row.tid), true});
       ++returned_rows;
     }
-    // Tombstones are skipped: Purge erases them at commit, and key-list
-    // validation catches any reuse without needing a per-entry TID.
+    // Tombstones are not returned, so their transaction ids do not reach the
+    // caller.
+    // FIXME: a key inserted and deleted again inside the range leaves the key
+    // list unchanged, and the commit-time key-list comparison therefore
+    // accepts the scan. The native path carries those ids through ReadDirect
+    // and rejects it.
     return row_limit > 0 && returned_rows >= row_limit;
   };
 
