@@ -16,231 +16,185 @@
 
 #include "thread_local_logger.h"
 
-#include <fcntl.h>
-#include <glob.h>
-#include <lineairdb/database.h>
-#include <lineairdb/tx_status.h>
-#include <unistd.h>
+#include <errno.h>
 
-#include <atomic>
 #include <cassert>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
-#include <msgpack.hpp>
+#include <exception>
+#include <iterator>
+#include <utility>
 #include <util/logger.hpp>
 
-#include "recovery/logger.h"
 #include "types/definitions.h"
 
 namespace LineairDB {
 namespace Recovery {
 
-std::atomic<size_t> ThreadLocalLogger::ThreadLocalStorageNode::ThreadIdCounter =
-    {0};
-
-ThreadLocalLogger::ThreadLocalLogger(const Config& config)
-    : WorkingDir(config.work_dir),
-      sync_log_writes_(std::getenv("LINEAIRDB_LOG_FSYNC") != nullptr &&
-                       std::getenv("LINEAIRDB_LOG_FSYNC")[0] != '\0' &&
-                       std::getenv("LINEAIRDB_LOG_FSYNC")[0] != '0') {
+ThreadLocalLogger::ThreadLocalLogger(const Config& config,
+                                     PublishDurable publish_durable,
+                                     PublishFailure publish_failure,
+                                     ReadDurable read_durable, WalIo io)
+    : wal_(config.work_dir, std::move(io)),
+      publish_durable_(std::move(publish_durable)),
+      publish_failure_(std::move(publish_failure)),
+      read_durable_(std::move(read_durable)) {
   LineairDB::Util::SetUpSPDLog();
 }
 
-void ThreadLocalLogger::RememberMe(const EpochNumber epoch) {
-  auto* my_storage = thread_key_storage_.Get();
-  my_storage->durable_epoch.store(epoch);
+ThreadLocalLogger::~ThreadLocalLogger() { StopAndDrainFlusher(); }
+
+bool ThreadLocalLogger::Enqueue(const WriteSetType& ws_ref, EpochNumber epoch) {
+  LogRecord record;
+  record.epoch = epoch;
+
+  for (auto& snapshot : ws_ref) {
+    if (snapshot.index_name.empty()) {
+      LogRecord::KeyValuePair kvp;
+      kvp.key = snapshot.key;
+      kvp.buffer = snapshot.data_item_copy.buffer.toString();
+      kvp.tid = snapshot.data_item_copy.transaction_id.load();
+      kvp.table_name = snapshot.table_name;
+      kvp.index_name = snapshot.index_name;
+      kvp.index_type = snapshot.index_type.Raw();
+      kvp.primary_keys = snapshot.data_item_copy.primary_keys_vector();
+      kvp.secondary_op = static_cast<uint8_t>(SecondaryIndexOp::None);
+      record.key_value_pairs.emplace_back(std::move(kvp));
+      continue;
+    }
+
+    if (snapshot.secondary_index_deltas.empty()) continue;
+    for (const auto& delta : snapshot.secondary_index_deltas) {
+      LogRecord::KeyValuePair kvp;
+      kvp.key = snapshot.key;
+      kvp.buffer = snapshot.data_item_copy.buffer.toString();
+      kvp.tid = snapshot.data_item_copy.transaction_id.load();
+      kvp.table_name = snapshot.table_name;
+      kvp.index_name = snapshot.index_name;
+      kvp.index_type = snapshot.index_type.Raw();
+      kvp.secondary_op = static_cast<uint8_t>(delta.op);
+      kvp.secondary_primary_key = delta.primary_key;
+      record.key_value_pairs.emplace_back(std::move(kvp));
+    }
+  }
+
+  // Decided after building the record, not from the input write set: a write set
+  // of secondary snapshots that carry no delta produces nothing to persist, and
+  // the commit path must not wait for a record that was never buffered.
+  if (record.key_value_pairs.empty()) return false;
+
+  auto* node = nodes_.Get();
+  std::lock_guard<std::mutex> lock(node->log_records_mutex);
+  node->log_records.emplace_back(std::move(record));
+  return true;
 }
 
-void ThreadLocalLogger::Enqueue(const WriteSetType& ws_ref, EpochNumber epoch,
-                                bool entrusting) {
-  if (ws_ref.empty()) return;
+WalScanResult ThreadLocalLogger::ScanAndRepairWal() {
+  return wal_.ScanAndRepair();
+}
 
-  /** Make log record and add it into local buffer  **/
-  Recovery::Logger::LogRecord record;
+void ThreadLocalLogger::StartFlusher() {
+  assert(!flusher_.joinable());
+  flusher_ = std::thread([this]() { FlusherLoop(); });
+}
+
+void ThreadLocalLogger::ScheduleFlush(EpochNumber closed) {
   {
-    record.epoch = epoch;
-
-    for (auto& snapshot : ws_ref) {
-      if (snapshot.index_name.empty()) {
-        Logger::LogRecord::KeyValuePair kvp;
-        kvp.key = snapshot.key;
-        kvp.buffer = snapshot.data_item_copy.buffer.toString();
-        kvp.tid = snapshot.data_item_copy.transaction_id.load();
-        kvp.table_name = snapshot.table_name;
-        kvp.index_name = snapshot.index_name;
-        kvp.index_type = snapshot.index_type.Raw();
-        kvp.primary_keys = snapshot.data_item_copy.primary_keys_vector();
-        kvp.secondary_op = static_cast<uint8_t>(SecondaryIndexOp::None);
-        record.key_value_pairs.emplace_back(std::move(kvp));
-        continue;
-      }
-
-      if (snapshot.secondary_index_deltas.empty()) continue;
-      for (const auto& delta : snapshot.secondary_index_deltas) {
-        Logger::LogRecord::KeyValuePair kvp;
-        kvp.key = snapshot.key;
-        kvp.buffer = snapshot.data_item_copy.buffer.toString();
-        kvp.tid = snapshot.data_item_copy.transaction_id.load();
-        kvp.table_name = snapshot.table_name;
-        kvp.index_name = snapshot.index_name;
-        kvp.index_type = snapshot.index_type.Raw();
-        kvp.secondary_op = static_cast<uint8_t>(delta.op);
-        kvp.secondary_primary_key = delta.primary_key;
-        record.key_value_pairs.emplace_back(std::move(kvp));
-      }
-    }
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (stop_requested_ || failed_) return;
+    if (closed > pending_closed_) pending_closed_ = closed;
   }
-
-  auto* my_storage = thread_key_storage_.Get();
-  std::lock_guard<std::mutex> guard(my_storage->log_records_mutex);
-  if (entrusting) {
-    // A newly buffered record is not durable until a later epoch flush writes it.
-    const EpochNumber durable_before_record = (epoch == 0) ? 0 : epoch - 1;
-    const EpochNumber current_durable = my_storage->durable_epoch.load();
-    if (current_durable == EpochFramework::THREAD_OFFLINE ||
-        current_durable >= epoch) {
-      my_storage->durable_epoch.store(durable_before_record);
-    }
-  }
-  my_storage->log_records.emplace_back(std::move(record));
+  work_cv_.notify_one();
 }
 
-void ThreadLocalLogger::FlushLogs(EpochNumber stable_epoch) {
-  FlushAllLogs(stable_epoch);
+bool ThreadLocalLogger::IsQuiescent() {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  return failed_ || pending_closed_ <= read_durable_();
 }
 
-void ThreadLocalLogger::TruncateLogs(
-    const EpochNumber checkpoint_completed_epoch) {
-  auto* my_storage = thread_key_storage_.Get();
-  std::lock_guard<std::mutex> guard(my_storage->log_records_mutex);
-
-  assert(my_storage->truncated_epoch <= checkpoint_completed_epoch);
-  if (checkpoint_completed_epoch == my_storage->truncated_epoch) return;
-  auto log_filename = GetLogFileName(my_storage->thread_id);
-  std::ifstream old_file(log_filename,
-                         std::ifstream::in | std::ifstream::binary);
-
-  std::string buffer((std::istreambuf_iterator<char>(old_file)),
-                     std::istreambuf_iterator<char>());
-  if (buffer.empty()) {
-    my_storage->truncated_epoch = checkpoint_completed_epoch;
-
-    return;
+void ThreadLocalLogger::StopAndDrainFlusher() {
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    stop_requested_ = true;
   }
-  Logger::LogRecords records;
-  Logger::LogRecords deserialized_records;
-  size_t offset = 0;
+  work_cv_.notify_all();
+  if (flusher_.joinable()) flusher_.join();
+}
+
+void ThreadLocalLogger::FlusherLoop() {
   for (;;) {
-    if (offset == buffer.size()) break;
-    try {
-      auto oh = msgpack::unpack(buffer.data(), buffer.size(), offset);
-      auto obj = oh.get();
-      obj.convert(deserialized_records);
-
-    } catch (const std::bad_cast& e) {
-      SPDLOG_ERROR(
-          "  Stop recovery procedure: msgpack deserialize failure. Some "
-          "records may not be recovered.");
-      exit(EXIT_FAILURE);
-    } catch (...) {
-      SPDLOG_ERROR(
-          "  Stop recovery procedure: msgpack deserialize failure. Some "
-          "records may not be recovered.");
-      exit(EXIT_FAILURE);
-    }
-
-    deserialized_records.erase(
-        remove_if(deserialized_records.begin(), deserialized_records.end(),
-                  [&](auto record) {
-                    return record.epoch < checkpoint_completed_epoch;
-                  }),
-        deserialized_records.end());
-    records.insert(records.end(), deserialized_records.begin(),
-                   deserialized_records.end());
-  }
-
-  std::ofstream new_file(GetWorkingLogFileName(my_storage->thread_id));
-  msgpack::pack(new_file, records);
-  new_file.flush();
-
-  // NOTE POSIX ensures that rename syscall provides atomicity
-  const auto working_log_filename =
-      GetWorkingLogFileName(my_storage->thread_id);
-  if (rename(working_log_filename.c_str(),
-             GetLogFileName(my_storage->thread_id).c_str())) {
-    SPDLOG_ERROR("Durability Error: fail to truncate logfile. errno: {1}",
-                 errno);
-    exit(1);
-  }
-  my_storage->truncated_epoch = checkpoint_completed_epoch;
-  my_storage->log_file = std::fstream(
-      GetLogFileName(my_storage->thread_id),
-      std::fstream::out | std::fstream::binary | std::fstream::ate);
-}
-
-EpochNumber ThreadLocalLogger::GetMinDurableEpochForAllThreads() {
-  EpochNumber min_flushed_epoch = EpochFramework::THREAD_OFFLINE;
-  thread_key_storage_.ForEach(
-      [&](const ThreadLocalStorageNode* thread_local_node) {
-        const EpochNumber epoch = thread_local_node->durable_epoch.load();
-        if (epoch == EpochFramework::THREAD_OFFLINE) return;
-        if (epoch < min_flushed_epoch) min_flushed_epoch = epoch;
+    EpochNumber target = 0;
+    {
+      std::unique_lock<std::mutex> lock(state_mutex_);
+      work_cv_.wait(lock, [this] {
+        return stop_requested_ || failed_ ||
+               pending_closed_ > read_durable_();
       });
-  return min_flushed_epoch;
-}
-
-std::string ThreadLocalLogger::GetLogFileName(size_t thread_id) const {
-  // TODO: think of beautiful path concatation in C++
-  return WorkingDir + "/thread" + std::to_string(thread_id) + ".log";
-}
-
-std::string ThreadLocalLogger::GetWorkingLogFileName(size_t thread_id) const {
-  return WorkingDir + "/thread" + std::to_string(thread_id) + ".working.log";
-}
-
-void ThreadLocalLogger::FlushThreadLogs(ThreadLocalStorageNode* storage,
-                                        EpochNumber stable_epoch) {
-  std::lock_guard<std::mutex> guard(storage->log_records_mutex);
-  if (!storage->log_records.empty()) {
-    if (!storage->log_file.is_open()) {
-      storage->log_file = std::fstream(
-          GetLogFileName(storage->thread_id),
-          std::fstream::out | std::fstream::binary | std::fstream::ate);
+      if (failed_) return;
+      target = pending_closed_;
+      const bool nothing_to_do = target <= read_durable_();
+      // Stop only once everything already closed is on the device, so a clean
+      // shutdown does not drop records the tick had handed over.
+      if (stop_requested_ && nothing_to_do) return;
+      if (nothing_to_do) continue;
     }
-    msgpack::pack(storage->log_file, storage->log_records);
-    storage->log_file.flush();
-    if (sync_log_writes_) {
-      SyncLogFile(GetLogFileName(storage->thread_id));
-    }
-    storage->log_records.clear();
-  }
 
-  if (storage->durable_epoch.load() != EpochFramework::THREAD_OFFLINE) {
-    storage->durable_epoch.store(stable_epoch);
+    // The file and the per-node buffers are touched with no lock held, so a
+    // committing thread never waits behind serialization or fdatasync.
+    WalAppendResult result;
+    try {
+      result = FlushThrough(target);
+    } catch (const std::exception& e) {
+      SPDLOG_CRITICAL("Durability Error: the flusher threw: {0}", e.what());
+      result = {false, EIO};
+    } catch (...) {
+      SPDLOG_CRITICAL("Durability Error: the flusher threw");
+      result = {false, EIO};
+    }
+
+    if (!result.ok) {
+      {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        failed_ = true;
+      }
+      publish_failure_(result.error_number);
+      return;
+    }
+    publish_durable_(target);
   }
 }
 
-void ThreadLocalLogger::FlushAllLogs(EpochNumber stable_epoch) {
-  std::lock_guard<std::mutex> guard(flush_all_mutex_);
-  thread_key_storage_.ForEach([&](ThreadLocalStorageNode* storage) {
-    FlushThreadLogs(storage, stable_epoch);
+WalAppendResult ThreadLocalLogger::FlushThrough(EpochNumber target) {
+  const EpochNumber durable_before = read_durable_();
+
+  nodes_.ForEach([&](ThreadLocalStorageNode* node) {
+    LogRecords swapped;
+    {
+      std::lock_guard<std::mutex> lock(node->log_records_mutex);
+      swapped.swap(node->log_records);
+    }
+    for (auto& record : swapped) {
+      if (record.epoch <= durable_before) {
+        // A producer publishes OFFLINE only after Enqueue returns, so an epoch
+        // the writer has already closed cannot gain a record afterwards.
+        // Reaching here means the closure the durability contract rests on is
+        // broken, and continuing would acknowledge a record that is not on the
+        // device.
+        SPDLOG_CRITICAL(
+            "Durability Error: a record for epoch {0} arrived after {1} was "
+            "reported durable",
+            record.epoch, durable_before);
+        std::abort();
+      }
+      carry_[record.epoch].emplace_back(std::move(record));
+    }
   });
-}
 
-void ThreadLocalLogger::SyncLogFile(const std::string& filename) const {
-  const int fd = open(filename.c_str(), O_RDONLY);
-  if (fd < 0) {
-    SPDLOG_ERROR("Durability Error: fail to open logfile for fsync. errno: {0}",
-                 errno);
-    exit(1);
-  }
-  if (fsync(fd) != 0) {
-    SPDLOG_ERROR("Durability Error: fail to fsync logfile. errno: {0}", errno);
-    close(fd);
-    exit(1);
-  }
-  close(fd);
+  const auto result = wal_.AppendGroup(carry_, target);
+  if (!result.ok) return result;
+  // Buckets above the target stay for the next group; the ones just written are
+  // the only ones dropped.
+  carry_.erase(carry_.begin(), carry_.upper_bound(target));
+  return result;
 }
 
 }  // namespace Recovery

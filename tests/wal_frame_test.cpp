@@ -270,6 +270,24 @@ TEST_F(WalFrameTest, FdatasyncFailurePropagates) {
   EXPECT_EQ(result.error_number, EIO);
 }
 
+TEST_F(WalFrameTest, ScanAcceptsTheMaximumEpoch) {
+  // The scanner does not bound the epoch; the resume-epoch computation is what
+  // has to refuse near the wrap. Recording that division here keeps a later
+  // change from quietly moving the check into the scanner and leaving startup
+  // to add one to UINT32_MAX.
+  const EpochNumber near_wrap = 0xFFFFFFFFu;
+  {
+    Wal wal(work_dir_);
+    std::map<EpochNumber, LogRecords> buckets;
+    buckets[near_wrap] = MakeRecords(near_wrap, "k");
+    ASSERT_TRUE(wal.AppendGroup(buckets, near_wrap).ok);
+  }
+  Wal wal(work_dir_);
+  const auto result = wal.ScanAndRepair();
+  ASSERT_EQ(result.status, WalScanResult::Status::Ok);
+  EXPECT_EQ(result.frontier, near_wrap);
+}
+
 TEST_F(WalFrameTest, EmptyGroupNeitherWritesNorSyncs) {
   LineairDB::Recovery::WalIo io = LineairDB::Recovery::WalIo::Posix();
   bool wrote = false;

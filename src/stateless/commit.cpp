@@ -608,7 +608,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
 
   // Phase 3.5: enqueue the log set, then leave the epoch.
   if (has_log_set) {
-    logger.Enqueue(log_set, current_epoch, true);
+    [[maybe_unused]] const bool logged = logger.Enqueue(log_set, current_epoch);
   }
 
   epoch_framework.MakeMeOffline();

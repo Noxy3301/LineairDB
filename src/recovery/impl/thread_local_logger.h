@@ -16,73 +16,79 @@
 #ifndef LINEAIRDB_RECOVERY_THREAD_LOCAL_LOGGER_H
 #define LINEAIRDB_RECOVERY_THREAD_LOCAL_LOGGER_H
 
-#include <lineairdb/database.h>
-#include <lineairdb/tx_status.h>
-#include <stdio.h>
+#include <lineairdb/config.h>
 
-#include <cstdio>
-#include <fstream>
+#include <condition_variable>
 #include <functional>
-#include <msgpack.hpp>
+#include <map>
 #include <mutex>
-#include <queue>
-#include <sstream>
+#include <thread>
 
-#include "recovery/logger.h"
+#include "recovery/log_record.h"
 #include "recovery/logger_base.h"
+#include "recovery/wal.h"
 #include "types/definitions.h"
-#include "util/epoch_framework.hpp"
 #include "util/thread_key_storage.h"
 
 namespace LineairDB {
 namespace Recovery {
 
+/**
+ * Buffers log records per producing thread and writes them from one dedicated
+ * flusher thread.
+ *
+ * Producers never touch the file: a committing thread appends to its own
+ * thread-local vector under a short lock and leaves. The flusher swaps those
+ * vectors, buckets the records by epoch, and writes one group per fdatasync.
+ *
+ * The flusher gets its own thread rather than a slot in the shared pool because
+ * a pool worker only serves the no-steal queue that carries visibility
+ * callbacks when its work queue is empty; a flusher that always has a group
+ * ready would postpone those callbacks indefinitely, and with them Fence.
+ */
 class ThreadLocalLogger final : public LoggerBase {
  public:
-  ThreadLocalLogger(const Config&);
-  void RememberMe(const EpochNumber) final override;
-  void Enqueue(const WriteSetType& ws_ref_, EpochNumber epoch,
-               bool entrusting) final override;
-  void FlushLogs(EpochNumber stable_epoch) final override;
-  void TruncateLogs(
-      const EpochNumber checkpoint_completed_epoch) final override;
-  EpochNumber GetMinDurableEpochForAllThreads() final override;
-  std::string GetLogFileName(size_t thread_id) const;
-  std::string GetWorkingLogFileName(size_t thread_id) const;
+  using PublishDurable = std::function<void(EpochNumber)>;
+  using PublishFailure = std::function<void(int)>;
+  using ReadDurable = std::function<EpochNumber()>;
+
+  ThreadLocalLogger(const Config&, PublishDurable, PublishFailure, ReadDurable,
+                    WalIo io = WalIo::Posix());
+  ~ThreadLocalLogger() override;
+
+  bool Enqueue(const WriteSetType& ws_ref, EpochNumber epoch) final override;
+  WalScanResult ScanAndRepairWal() final override;
+  void StartFlusher() final override;
+  void ScheduleFlush(EpochNumber closed) final override;
+  void StopAndDrainFlusher() final override;
+  bool IsQuiescent() final override;
 
  private:
-  std::string WorkingDir;
-
   struct ThreadLocalStorageNode {
-   private:
-    static std::atomic<size_t> ThreadIdCounter;
-
-   public:
-    size_t thread_id;
-    std::atomic<EpochNumber> durable_epoch;
-    EpochNumber truncated_epoch;
     std::mutex log_records_mutex;
-    std::fstream log_file;
-    Logger::LogRecords log_records;
-    MSGPACK_DEFINE(log_records);
-
-    ThreadLocalStorageNode()
-        : thread_id(ThreadIdCounter.fetch_add(1)),
-          durable_epoch(EpochFramework::THREAD_OFFLINE),
-          truncated_epoch(0) {}
-    ~ThreadLocalStorageNode() {}
+    LogRecords log_records;
   };
 
- private:
-  void FlushThreadLogs(ThreadLocalStorageNode* storage,
-                       EpochNumber stable_epoch);
-  void FlushAllLogs(EpochNumber stable_epoch);
-  void SyncLogFile(const std::string& filename) const;
+  void FlusherLoop();
+  /** Swaps every node's buffer, buckets by epoch, writes buckets <= target. */
+  WalAppendResult FlushThrough(EpochNumber target);
 
- private:
-  ThreadKeyStorage<ThreadLocalStorageNode> thread_key_storage_;
-  std::mutex flush_all_mutex_;
-  bool sync_log_writes_;
+  ThreadKeyStorage<ThreadLocalStorageNode> nodes_;
+
+  // Owned by the flusher thread alone, between StartFlusher and the join.
+  std::map<EpochNumber, LogRecords> carry_;
+  Wal wal_;
+
+  PublishDurable publish_durable_;
+  PublishFailure publish_failure_;
+  ReadDurable read_durable_;
+
+  std::mutex state_mutex_;
+  std::condition_variable work_cv_;
+  EpochNumber pending_closed_{0};
+  bool stop_requested_{false};
+  bool failed_{false};
+  std::thread flusher_;
 };
 
 }  // namespace Recovery

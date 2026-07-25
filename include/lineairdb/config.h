@@ -133,11 +133,14 @@ struct Config {
    * last the number of seconds specified at checkpoint_period; however, the
    * persistence of the data before that time is guaranteed.
    *
-   * Default: true
+   * Not implemented for the epoch-frame write-ahead log: setting it is a
+   * startup error rather than a silent no-op.
+   *
+   * Default: false
    * @ref [1]:
    * https://www.microsoft.com/en-us/research/uploads/prod/2019/01/cpr-sigmod19.pdf
    */
-  bool enable_checkpointing = true;
+  bool enable_checkpointing = false;
 
   /**
    * @brief

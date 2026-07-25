@@ -68,7 +68,47 @@ class Database::Impl {
   inline static Database::Impl* CurrentDBInstance;
 
  private:
+  /**
+   * The first epoch it is safe to resume at, given a recovered durability
+   * frontier.
+   *
+   * Strictly above the frontier: a transaction that joined the frontier's own
+   * epoch would see that epoch already reported durable and could return a Sync
+   * acknowledgement before its record was written. Refuses near the wrap point,
+   * because an epoch that wraps is no longer ordered against the frontier and
+   * the durability comparison stops meaning anything.
+   *
+   * The bound is on the resumed epoch, not on the frontier: resuming exactly at
+   * the high-water mark passes a frontier test but leaves the epoch writer
+   * nothing to advance into, so the process would come up and then abort on its
+   * first tick. Refusing here turns that into a diagnosable startup failure.
+   *
+   * Compared before the addition rather than after. EpochNumber is uint32, and
+   * the scanner accepts a frontier of UINT32_MAX by design, so `frontier + 1`
+   * would wrap to zero and slip past a test written on the sum -- resuming the
+   * global epoch at zero, which is the value that means "no participant".
+   */
+  static EpochNumber ResumeEpochAbove(EpochNumber frontier) {
+    if (frontier >= EpochFramework::kEpochHighWater - 1) {
+      SPDLOG_CRITICAL(
+          "Startup failed: resuming above the recovered epoch {0} would reach "
+          "the epoch high-water mark {1}",
+          frontier, EpochFramework::kEpochHighWater);
+      exit(EXIT_FAILURE);
+    }
+    return frontier + 1;
+  }
+
   static const Config& ValidateDataItemLayoutConfig(const Config& config) {
+    // The epoch-frame write-ahead log has no truncation path, so a checkpoint
+    // would grow the log instead of bounding it. Refuse the combination rather
+    // than accept it and silently do nothing.
+    if (config.enable_checkpointing) {
+      SPDLOG_ERROR(
+          "Unsupported configuration: checkpointing is not implemented for the "
+          "epoch-frame write-ahead log.");
+      exit(EXIT_FAILURE);
+    }
 #ifndef LINEAIRDB_WITH_2PL_CHECKPOINT_METADATA
     // The slim DataItem layout keeps only shared dummy storage for these paths.
     if (config.enable_checkpointing) {
@@ -131,9 +171,26 @@ class Database::Impl {
       SPDLOG_ERROR("Anonymous table name is not set.");
       exit(EXIT_FAILURE);
     }
+    // Always scan the log, even without recovery: an interrupted tail has to be
+    // removed before the first append lands behind it, and recovery only
+    // controls whether the decoded records are replayed into the database.
     if (config_.enable_recovery) {
       Recovery();
+    } else {
+      auto scanned = logger_.Recover();
+      if (scanned.status != Recovery::Logger::RecoveryStatus::Ok) {
+        SPDLOG_CRITICAL(
+            "Startup failed: the write-ahead log could not be read; refusing to "
+            "start with an unknown durable state");
+        exit(EXIT_FAILURE);
+      }
+      if (scanned.frontier != 0) {
+        // Records exist that this instance will not replay; resuming at or
+        // below their epoch would let a Sync commit inherit their frontier.
+        epoch_framework_.SetGlobalEpoch(ResumeEpochAbove(scanned.frontier));
+      }
     }
+    logger_.StartFlusher();
     epoch_framework_.Start();
   }
 
@@ -143,6 +200,10 @@ class Database::Impl {
     epoch_framework_.Sync();
     checkpoint_manager_.Stop();
     epoch_framework_.Stop();
+    // After the epoch writer has joined no further closed epoch arrives, so the
+    // flusher can drain what it already owns and be joined before the log is
+    // closed.
+    logger_.StopAndDrainFlusher();
     while (!thread_pool_.IsEmpty()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
@@ -184,6 +245,9 @@ class Database::Impl {
           const auto current_epoch = epoch_framework_.GetMyThreadLocalEpoch();
           callback_manager_.Enqueue(std::move(callback), current_epoch);
           if (config_.enable_logging) {
+            // The Sync acknowledgement contract covers EndTransaction and
+            // ValidateAndCommit only; this path runs on a pool worker, where an
+            // inline wait for the flusher would be a self-deadlock.
             logger_.Enqueue(tx.tx_pimpl_->write_set_, current_epoch);
           }
         } else {
@@ -244,19 +308,13 @@ class Database::Impl {
       callback_manager_.Enqueue(std::move(clbk), current_epoch, true);
 
       if (config_.enable_logging) {
-        logger_.Enqueue(tx.tx_pimpl_->write_set_, current_epoch, true);
+        logger_.Enqueue(tx.tx_pimpl_->write_set_, current_epoch);
       }
     } else {
       tx.tx_pimpl_->PostProcessing(TxStatus::Aborted);
       clbk(TxStatus::Aborted);
     }
     epoch_framework_.MakeMeOffline();
-
-    if (config_.enable_checkpointing) {
-      auto checkpoint_completed =
-          checkpoint_manager_.GetCheckpointCompletedEpoch();
-      logger_.TruncateLogs(checkpoint_completed);
-    }
 
     if (!tx.reusable_) delete &tx;
     return committed;
@@ -307,14 +365,12 @@ class Database::Impl {
   // NOTE: Called by a special thread managed by EpochFramework.
   std::function<void(EpochNumber)> EventsOnEpochIsUpdated() {
     return [&](EpochNumber updated_epoch) {
-      // Logging
-      if (config_.enable_logging) {
-        EpochNumber durable_epoch = logger_.FlushDurableEpoch();
-        thread_pool_.EnqueueForAllThreads(
-            [&, updated_epoch]() { logger_.FlushLogs(updated_epoch); });
-        thread_pool_.EnqueueForAllThreads([&, durable_epoch] {
-          callback_manager_.ExecuteCallbacks(durable_epoch);
-        });
+      // Logging. The global epoch advances from U-1 to U while threads may
+      // still be online in U-1, so U-2 is the newest epoch that is certainly
+      // closed and safe to write. Handing the target to the logger's own
+      // flusher keeps the durability fdatasync off this pool.
+      if (config_.enable_logging && updated_epoch >= 3) {
+        logger_.ScheduleFlush(updated_epoch - 2);
       }
 
       // Execute Callbacks
@@ -333,19 +389,18 @@ class Database::Impl {
       // ReleaseMasstreeThreadEpoch; we only move the watermark here.
       reaper_.Reap(updated_epoch);
       Index::MasstreeAdvanceEpoch();
-
-      if (config_.enable_checkpointing) {
-        auto checkpoint_completed =
-            checkpoint_manager_.GetCheckpointCompletedEpoch();
-
-        thread_pool_.EnqueueForAllThreads([&, checkpoint_completed]() {
-          logger_.TruncateLogs(checkpoint_completed);
-        });
-      }
     };
   }
 
   void WaitForCheckpoint() {
+    // Nothing will ever complete a checkpoint under the epoch-frame log, and the
+    // retry helper below never gives up, so waiting would hang rather than fail.
+    if (!config_.enable_checkpointing) {
+      SPDLOG_WARN(
+          "WaitForCheckpoint returns immediately: checkpointing is not "
+          "implemented for the epoch-frame write-ahead log");
+      return;
+    }
     const auto start = checkpoint_manager_.GetCheckpointCompletedEpoch();
     Util::RetryWithExponentialBackoff([&]() {
       const auto current = checkpoint_manager_.GetCheckpointCompletedEpoch();
@@ -839,22 +894,22 @@ class Database::Impl {
 
   void Recovery() {
     SPDLOG_INFO("Start recovery process");
-    // Start recovery from logfiles
-    EpochNumber highest_epoch = 1;
-    const auto durable_epoch = logger_.GetDurableEpochFromLog();
-    SPDLOG_DEBUG("  Durable epoch is resumed from {0}", highest_epoch);
-    logger_.SetDurableEpoch(durable_epoch);
-    [[maybe_unused]] auto enqueued = thread_pool_.EnqueueForAllThreads(
-        [&]() { logger_.RememberMe(durable_epoch); });
-    assert(enqueued);
+    auto recovered = logger_.Recover();
+    if (recovered.status != Recovery::Logger::RecoveryStatus::Ok) {
+      SPDLOG_CRITICAL(
+          "Recovery failed: the write-ahead log could not be read; refusing to "
+          "start with an unknown durable state");
+      exit(EXIT_FAILURE);
+    }
 
-    thread_pool_.WaitForQueuesToBecomeEmpty();
+    const EpochNumber durable_epoch = recovered.frontier;
+    EpochNumber highest_epoch = std::max<EpochNumber>(1, durable_epoch);
+    SPDLOG_DEBUG("  Durable epoch is resumed from {0}", durable_epoch);
 
     epoch_framework_.MakeMeOnline();
     epoch_framework_.SetMyThreadLocalEpochForRecovery(durable_epoch);
 
-    highest_epoch = std::max(highest_epoch, durable_epoch);
-    auto&& recovery_sets = logger_.GetRecoverySetFromLogs(durable_epoch);
+    auto&& recovery_sets = std::move(recovered.recovery_set);
 
     for (auto& recovery_set : recovery_sets) {
       // Skip deleted entries.
@@ -902,8 +957,9 @@ class Database::Impl {
     }
     epoch_framework_.MakeMeOffline();
 
-    SPDLOG_DEBUG("  Global epoch is resumed from {0}", highest_epoch);
-    epoch_framework_.SetGlobalEpoch(highest_epoch);
+    const EpochNumber resumed_epoch = ResumeEpochAbove(highest_epoch);
+    SPDLOG_DEBUG("  Global epoch is resumed from {0}", resumed_epoch);
+    epoch_framework_.SetGlobalEpoch(resumed_epoch);
     SPDLOG_INFO("Finish recovery process");
   }
 
