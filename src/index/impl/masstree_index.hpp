@@ -23,7 +23,8 @@ class MasstreeIndex final : public IndexBase {
 
   void SetPaxStore(Pax::PaxStore* store) override;
 
-  DataItem* Get(std::string_view key) override;
+  DataItem* Get(std::string_view key,
+                std::vector<NodeVersionEntry>* out_versions = nullptr) override;
   bool Put(std::string_view key, DataItem&& rhs,
            NodeVersionUpdate* out_update = nullptr) override;
   bool Insert(std::string_view key,

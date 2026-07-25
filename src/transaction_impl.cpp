@@ -284,12 +284,14 @@ const std::pair<const std::byte* const, const size_t> Transaction::Impl::Read(
     }
   }
 
-  // Read path: never structurally insert. ForcePutBlankEntry would bump the
-  // leaf's vinsert and invalidate any node_version_set_ entry captured by an
-  // earlier Scan in this same transaction (or by a concurrent scanner),
-  // forcing a spurious phantom abort at commit. Use non-mutating Get; if the
-  // key has no slot yet, just report not-found without registering anything.
-  auto* index_leaf = current_table_->GetPrimaryIndex().Get(key);
+  // Never structurally insert on the read path: a placeholder insert bumps the
+  // leaf version and would invalidate node-set entries captured by an earlier
+  // Scan in this transaction, or by a concurrent scanner, aborting one of them
+  // without a real conflict. A lookup that finds no slot records the leaf that
+  // would hold the key instead, which puts "no such key" under the same
+  // commit-time check as a scan.
+  auto* index_leaf =
+      current_table_->GetPrimaryIndex().Get(key, &node_version_set_);
   if (index_leaf == nullptr) {
     return {nullptr, 0};
   }
@@ -334,8 +336,9 @@ Transaction::Impl::ReadSecondaryIndex(const std::string_view index_name,
     }
   }
 
-  // Read path: avoid structural insert — see Read() above.
-  DataItem* index_leaf = index->Get(key);
+  // Same rule as Read(): no structural insert, and a missing key is recorded
+  // through the leaf that would hold it.
+  DataItem* index_leaf = index->Get(key, &node_version_set_);
   if (index_leaf == nullptr) {
     return {};
   }

@@ -43,7 +43,8 @@ class ConcurrentTable {
    */
   void SetPaxStore(Pax::PaxStore* store) { index_->SetPaxStore(store); }
 
-  DataItem* Get(const std::string_view key);
+  DataItem* Get(const std::string_view key,
+                std::vector<NodeVersionEntry>* out_versions = nullptr);
   // GetOrInsert reports a non-null `out_update->valid=true` only when the
   // missing-key path actually structurally inserted a placeholder leaf.
   DataItem* GetOrInsert(const std::string_view key,

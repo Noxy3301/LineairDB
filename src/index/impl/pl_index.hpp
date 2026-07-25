@@ -14,7 +14,13 @@ class PLIndex final : public IndexBase {
  public:
   PLIndex(Config c, EpochFramework& e) : impl_(c, e) {}
 
-  DataItem* Get(std::string_view key) override { return impl_.Get(key); }
+  // PL detects phantoms synchronously during a scan and keeps no node set,
+  // so it reports no leaf versions.
+  DataItem* Get(
+      std::string_view key,
+      std::vector<NodeVersionEntry>* /*out_versions*/ = nullptr) override {
+    return impl_.Get(key);
+  }
 
   bool Put(std::string_view key, DataItem&& rhs,
            NodeVersionUpdate* /*out_update*/ = nullptr) override {

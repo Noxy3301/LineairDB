@@ -19,7 +19,10 @@ class SecondaryIndex {
       : index_type_(index_type),
         secondary_index_(MakeIndex(config, epoch_framework)) {}
 
-  DataItem* Get(std::string_view key) { return secondary_index_->Get(key); }
+  DataItem* Get(std::string_view key,
+                std::vector<NodeVersionEntry>* out_versions = nullptr) {
+    return secondary_index_->Get(key, out_versions);
+  }
 
   DataItem* GetOrInsert(std::string_view key,
                          NodeVersionUpdate* out_update = nullptr) {

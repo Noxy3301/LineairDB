@@ -36,8 +36,9 @@ ConcurrentTable::ConcurrentTable(EpochFramework& epoch_framework, Config config,
   }
 }
 
-DataItem* ConcurrentTable::Get(const std::string_view key) {
-  return index_->Get(key);
+DataItem* ConcurrentTable::Get(const std::string_view key,
+                               std::vector<NodeVersionEntry>* out_versions) {
+  return index_->Get(key, out_versions);
 }
 
 DataItem* ConcurrentTable::GetOrInsert(const std::string_view key,

@@ -248,18 +248,30 @@ struct MasstreeIndex::Impl {
 
   ~Impl() {
     // Do not call table_.destroy(): it schedules RCU free callbacks via
-    // deallocate_rcu, but this wrapper never advances the RCU epoch so the
-    // callbacks would never run. Consequence: at process exit, the entire
-    // live tree (every leaf/internode allocation) and every stored
-    // DataItem* leaks. This differs from PL, whose point-index destructor
-    // frees stored values. Accepted for benchmark-scope runs only; a real
-    // reclamation path is required for long-running service deployment.
+    // deallocate_rcu, and nothing drives the epoch far enough forward after
+    // this point to run them. Consequence: at process exit, the entire live
+    // tree (every leaf/internode allocation) and every stored DataItem*
+    // leaks. This differs from PL, whose point-index destructor frees stored
+    // values.
   }
 
-  DataItem* Get(std::string_view key) {
+  // find_unlocked leaves the cursor on the leaf it examined and restarts on
+  // that leaf whenever its version moved during the descent, so the leaf and
+  // version recorded here are one consistent observation. The version comes
+  // from the unlocked projection because ValidatePhantoms compares against
+  // the same projection; a value read while another writer briefly held the
+  // leaf lock would carry the lock bit and never compare equal.
+  DataItem* Get(std::string_view key, IndexBase* owner,
+                std::vector<NodeVersionEntry>* out_versions) {
     ensure_thread_active();
     unlocked_cursor_type lp(table_, key.data(), key.size());
     if (lp.find_unlocked(*tls_ti)) return lp.value();
+    if (out_versions != nullptr) {
+      out_versions->push_back(
+          {owner, static_cast<const void*>(lp.node()),
+           static_cast<std::uint64_t>(
+               lp.node()->full_unlocked_version_value())});
+    }
     return nullptr;
   }
 
@@ -576,8 +588,9 @@ void MasstreeIndex::SetPaxStore(Pax::PaxStore* store) {
   impl_->pax_store_ = store;
 }
 
-DataItem* MasstreeIndex::Get(std::string_view key) {
-  return impl_->Get(key);
+DataItem* MasstreeIndex::Get(std::string_view key,
+                             std::vector<NodeVersionEntry>* out_versions) {
+  return impl_->Get(key, this, out_versions);
 }
 
 bool MasstreeIndex::Put(std::string_view key, DataItem&& rhs,

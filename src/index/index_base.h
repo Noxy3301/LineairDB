@@ -61,7 +61,16 @@ class IndexBase {
   // entry from old_version to new_version, abort only on a real race).
   // Backends that do not track leaf versions (PL) leave `out_update->valid`
   // false.
-  virtual DataItem* Get(std::string_view key) = 0;
+
+  // When the key has no slot, backends that track leaf versions append the
+  // leaf that would hold it, with that leaf's version, to `out_versions`.
+  // A caller that passes its node set therefore puts a failed lookup under
+  // the same commit-time check as a scan: an insert into that leaf moves its
+  // version, and ValidatePhantoms rejects the entry. A lookup that finds a
+  // slot appends nothing, and so do backends without leaf versions (PL).
+  virtual DataItem* Get(
+      std::string_view key,
+      std::vector<NodeVersionEntry>* out_versions = nullptr) = 0;
   virtual bool Put(std::string_view key, DataItem&& rhs,
                    NodeVersionUpdate* out_update = nullptr) = 0;
   virtual bool Insert(std::string_view key,
