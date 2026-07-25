@@ -276,6 +276,28 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     return out;
   };
 
+  auto own_lock = [&](DataItem* item) -> const LockedTid* {
+    for (const auto& locked : locked_tids) {
+      if (locked.item == item) return &locked;
+    }
+    return nullptr;
+  };
+
+  auto is_own_locked = [&](DataItem* item) {
+    return own_lock(item) != nullptr;
+  };
+
+  // Silo Phase 2 read validation is wait-free: a record locked by another
+  // transaction is treated as dirty and forces abort. Spinning here breaks
+  // the paper's deadlock-freedom invariant — sorted write-lock acquisition
+  // protects only write-to-write edges, not read-to-write edges introduced
+  // by validators.
+  auto locked_by_another = [&](DataItem* item) {
+    TransactionId tid = item->transaction_id.load();
+    if (!(tid.tid & 1u)) return false;
+    return !is_own_locked(item);
+  };
+
   for (const auto& read : validation_entries) {
     DataItem* item = read.table->GetPrimaryIndex().Get(read.key);
     if (item == nullptr) {
@@ -286,15 +308,52 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
         return unlock_and_abort(
             exact_read_reason("exact_read_disappeared", read));
       }
+      // A read that landed on a deleted slot carries that slot's transaction
+      // id, and the id check below is what confirms the key stayed deleted.
+      // The slot has since been purged, so the id can no longer be compared
+      // and absence cannot be confirmed.
+      TransactionId captured = read.captured_tid;
+      if (!captured.IsEmpty()) {
+        return unlock_and_abort(
+            exact_read_reason("exact_read_slot_purged", read));
+      }
       continue;
     }
 
-    if (!read.found) {
-      if (!item->IsPrimaryInitialized()) {
+    if (TransactionId captured = read.captured_tid;
+        !read.found && captured.IsEmpty()) {
+      // The read resolved to no slot, which is the only case that reports an
+      // empty transaction id: a read that lands on a deleted slot reports that
+      // slot's id and is checked for id stability further down.
+      //
+      // A slot exists now. Every commit publishes a nonzero even id (Phase
+      // 3.3), and a lock sets the low bit, so an id that is still empty is
+      // proof that no transaction has ever committed on this key and the read
+      // still holds. A nonzero id proves the opposite, whether or not a row is
+      // installed at this instant: an insert followed by a delete leaves the
+      // slot uninstalled again but keeps the id it published.
+      if (const LockedTid* own = own_lock(item); own != nullptr) {
+        // Our own insert target. The id as it stood before we locked it is the
+        // evidence, because our lock overwrote the current one.
+        TransactionId before_lock = own->before_lock;
+        if (!before_lock.IsEmpty()) {
+          return unlock_and_abort(
+              exact_read_reason("exact_read_appeared", read));
+        }
         continue;
       }
-      return unlock_and_abort(
-          exact_read_reason("exact_read_appeared", read));
+      TransactionId current = item->transaction_id.load();
+      if (current.IsEmpty()) continue;
+      if (current.tid & 1u) {
+        // An insert is in flight and its serialization point may precede ours,
+        // in which case the key is no longer absent for us. Treat the slot as
+        // dirty and abort instead of waiting: waiting would add a
+        // read-to-write edge that the sorted write-lock order does not cover,
+        // which is why Phase 2.2 applies the same rule.
+        return unlock_and_abort(
+            exact_read_reason("exact_read_insert_in_flight", read));
+      }
+      return unlock_and_abort(exact_read_reason("exact_read_appeared", read));
     }
 
     TransactionId expected = read.captured_tid;
@@ -318,6 +377,13 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
       return unlock_and_abort(
           exact_read_reason("exact_read_deleted", read));
     }
+    // The read found a deleted slot. Its TID has been confirmed stable above,
+    // and the slot must still hold no row: a reinstalled row would make the
+    // key present as of the serialization point.
+    if (!read.found && item->IsPrimaryInitialized()) {
+      return unlock_and_abort(
+          exact_read_reason("exact_read_appeared", read));
+    }
   }
 
   // Phase 2.2: replay each range scan and compare the key lists. This is
@@ -325,24 +391,6 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
   // validation), done by value because a stateless caller cannot hold node
   // pointers across the RPC boundary. The comparison is membership only;
   // row TIDs are validated at 2.1.
-  auto is_own_locked = [&](DataItem* item) {
-    for (const auto& locked : locked_tids) {
-      if (locked.item == item) return true;
-    }
-    return false;
-  };
-
-  // Silo Phase 2 read validation is wait-free: a record locked by another
-  // transaction is treated as dirty and forces abort. Spinning here breaks
-  // the paper's deadlock-freedom invariant — sorted write-lock acquisition
-  // protects only write-to-write edges, not read-to-write edges introduced
-  // by validators.
-  auto locked_by_another = [&](DataItem* item) {
-    TransactionId tid = item->transaction_id.load();
-    if (!(tid.tid & 1u)) return false;
-    return !is_own_locked(item);
-  };
-
   auto validate_primary_key_list =
       [&](const ExternalRangeReadEntry& range) {
         auto table = tables.GetTable(range.table_name);
