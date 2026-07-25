@@ -23,6 +23,7 @@
 #include <msgpack.hpp>
 #include <vector>
 
+#include "log_record.h"
 #include "logger_base.h"
 #include "types/data_buffer.hpp"
 #include "types/definitions.h"
@@ -53,28 +54,11 @@ class Logger {
   EpochNumber GetDurableEpochFromLog();
   WriteSetType GetRecoverySetFromLogs(const EpochNumber durable_epoch);
 
-  struct LogRecord {
-    struct KeyValuePair {
-      std::string key;
-      std::string buffer;
-      TransactionId tid;
-      std::string table_name;
-      std::string index_name;
-      uint32_t index_type = 0;
-      std::vector<std::string> primary_keys;
-      uint8_t secondary_op = 0;
-      std::string secondary_primary_key;
-      MSGPACK_DEFINE(key, buffer, tid, table_name, index_name, index_type,
-                     primary_keys, secondary_op, secondary_primary_key);
-    };
-
-    EpochNumber epoch;
-    std::vector<KeyValuePair> key_value_pairs;
-    MSGPACK_DEFINE(epoch, key_value_pairs);
-
-    LogRecord() : epoch(0), key_value_pairs(0) {}
-  };
-  typedef std::vector<LogRecord> LogRecords;
+  // The record itself lives at namespace scope so the WAL codec can name it
+  // without depending on this interface; these aliases keep the nested names
+  // that existing callers use.
+  using LogRecord = Recovery::LogRecord;
+  using LogRecords = Recovery::LogRecords;
 
  private:
   std::unique_ptr<LoggerBase> logger_;
