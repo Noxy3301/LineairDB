@@ -61,6 +61,10 @@ class MasstreeIndex final : public IndexBase {
   bool ValidatePhantoms(
       const std::vector<NodeVersionEntry>& entries) override;
 
+  std::optional<NodeVersionObservation> ReadNodeVersion(
+      std::string_view anchor_key,
+      std::uint32_t layer_prefix_length) override;
+
   bool Purge(std::string_view key, DataItem* expected,
              TransactionId retired_tid = {}) override;
 
@@ -86,6 +90,11 @@ void MasstreeReleaseThreadEpoch();
 // it exits. Heavier than a regular release; intended for connection-close
 // paths only.
 void MasstreeFullyDrainThread();
+
+// Replaces the process-wide allocator state and returns its prior value.
+// This hook is confined to internal tests that exercise counter exhaustion.
+std::uint64_t MasstreeSetNextLeafIncarnationForTesting(
+    std::uint64_t next_incarnation);
 
 }  // namespace Index
 }  // namespace LineairDB

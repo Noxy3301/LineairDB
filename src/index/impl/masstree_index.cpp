@@ -51,6 +51,7 @@ struct table_params : public Masstree::nodeparams<15, 15> {
   using value_type = DataItem*;
   using value_print_type = Masstree::value_print<value_type>;
   using threadinfo_type = threadinfo;
+  static constexpr int debug_level = 1;
   using key_unparse_type = key_unparse_unsigned;
   static constexpr ssize_t print_max_indent_depth = 12;
 };
@@ -58,6 +59,19 @@ struct table_params : public Masstree::nodeparams<15, 15> {
 using table_type = Masstree::basic_table<table_params>;
 using unlocked_cursor_type = Masstree::unlocked_tcursor<table_params>;
 using cursor_type = Masstree::tcursor<table_params>;
+using leaf_type = Masstree::leaf<table_params>;
+using node_type = Masstree::node_base<table_params>;
+using key_type = Masstree::key<table_params::ikey_type>;
+using leafvalue_type = Masstree::leafvalue<table_params>;
+using nodeversion_type = leaf_type::nodeversion_type;
+using permuter_type = leaf_type::permuter_type;
+
+constexpr std::uint64_t kIncarnationDiscriminator = std::uint64_t{1} << 31;
+constexpr std::uint64_t kIncarnationLowMask =
+    kIncarnationDiscriminator - 1;
+constexpr std::uint64_t kMaxLeafIncarnation =
+    (std::uint64_t{1} << 63) - 1;
+std::atomic<std::uint64_t> next_leaf_incarnation{1};
 
 thread_local threadinfo* tls_ti = nullptr;
 // True iff this thread has called rcu_start since its last rcu_stop. Used to
@@ -107,6 +121,161 @@ inline void ensure_thread_active() {
   }
 }
 
+std::optional<std::uint64_t> allocate_leaf_incarnation() {
+  auto next = next_leaf_incarnation.load(std::memory_order_relaxed);
+  while (next != 0 && next <= kMaxLeafIncarnation) {
+    const auto successor = next == kMaxLeafIncarnation ? 0 : next + 1;
+    if (next_leaf_incarnation.compare_exchange_weak(
+            next, successor, std::memory_order_relaxed,
+            std::memory_order_relaxed)) {
+      return next;
+    }
+  }
+  return std::nullopt;
+}
+
+std::uint64_t encode_leaf_incarnation(std::uint64_t incarnation) {
+  return (incarnation & kIncarnationLowMask) |
+         kIncarnationDiscriminator |
+         ((incarnation & ~kIncarnationLowMask) << 1);
+}
+
+std::uint64_t decode_leaf_incarnation(std::uint64_t encoded) {
+  return (encoded & kIncarnationLowMask) |
+         ((encoded >> 1) & ~kIncarnationLowMask);
+}
+
+// The debug timestamp is only an allocation marker for this instantiation.
+// The first observer replaces it with a process-wide id whose discriminator
+// cannot occur in a real Masstree timestamp.
+std::optional<std::uint64_t> leaf_incarnation(leaf_type* leaf) {
+  static_assert(sizeof(leaf->created_at_[0]) == sizeof(std::uint64_t));
+  static_assert(alignof(leaf_type) >= alignof(std::uint64_t));
+
+  auto* word = &leaf->created_at_[0];
+  auto observed = __atomic_load_n(word, __ATOMIC_ACQUIRE);
+  for (;;) {
+    if ((observed & kIncarnationDiscriminator) != 0) {
+      const auto incarnation = decode_leaf_incarnation(observed);
+      return incarnation == 0 ? std::nullopt
+                              : std::optional<std::uint64_t>(incarnation);
+    }
+
+    const auto allocated = allocate_leaf_incarnation();
+    if (!allocated.has_value()) return std::nullopt;
+
+    const auto encoded = encode_leaf_incarnation(*allocated);
+    if (__atomic_compare_exchange_n(word, &observed, encoded, false,
+                                    __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+      return allocated;
+    }
+  }
+}
+
+NodeVersionEntry capture_node_version(
+    IndexBase* owner, leaf_type* leaf, std::uint64_t version,
+    std::string_view anchor_key, std::uint32_t layer_prefix_length) {
+  const auto incarnation = leaf_incarnation(leaf);
+  return {owner,
+          static_cast<const void*>(leaf),
+          version,
+          incarnation.value_or(0),
+          std::string(anchor_key),
+          layer_prefix_length};
+}
+
+struct ResolvedNodeVersion {
+  leaf_type* leaf;
+  std::uint64_t version;
+};
+
+// This is the ordinary unlocked lookup descent with an explicit stopping
+// layer. Each returned leaf and version comes from one stable permutation
+// snapshot, and every retry follows Masstree's split/deletion rules.
+std::optional<ResolvedNodeVersion> resolve_node_at_layer(
+    table_type& table, std::string_view anchor_key,
+    std::uint32_t layer_prefix_length) {
+  key_type key(anchor_key.data(), static_cast<int>(anchor_key.size()));
+  node_type* root = table.fix_root();
+  leaf_type* leaf;
+  nodeversion_type version;
+  permuter_type permutation;
+  leafvalue_type value = leafvalue_type::make_empty();
+
+retry:
+  leaf = root->reach_leaf(key, version, *tls_ti);
+
+forward:
+  if (version.deleted()) goto retry;
+
+  leaf->prefetch();
+  permutation = leaf->permutation();
+  const auto position = leaf_type::bound_type::lower(key, *leaf);
+  int match = 0;
+  if (position.p >= 0) {
+    value = leaf->lv_[position.p];
+    value.prefetch(leaf->keylenx_[position.p]);
+    match = leaf->ksuf_matches(position.p, key);
+  }
+  if (leaf->has_changed(version)) {
+    tls_ti->mark(threadcounter(tc_stable_leaf_insert +
+                               leaf->simple_has_split(version)));
+    leaf = leaf->advance_to_key(key, version, *tls_ti);
+    goto forward;
+  }
+
+  if (key.prefix_length() == static_cast<int>(layer_prefix_length)) {
+    static_assert(
+        int(nodeversion_type::traits_type::top_stable_bits) >=
+        int(permuter_type::size_bits),
+        "not enough bits to add size to version");
+    const auto full_version =
+        (version.version_value() << permuter_type::size_bits) +
+        permutation.size();
+    return ResolvedNodeVersion{leaf,
+                               static_cast<std::uint64_t>(full_version)};
+  }
+  if (match < 0 &&
+      key.prefix_length() - match <=
+          static_cast<int>(layer_prefix_length)) {
+    key.shift_by(-match);
+    root = value.layer();
+    goto retry;
+  }
+  return std::nullopt;
+}
+
+void capture_node_version_update(cursor_type& cursor, std::string_view key,
+                                 NodeVersionUpdate* update) {
+  const auto incarnation = leaf_incarnation(cursor.node());
+  update->node_ptr = static_cast<const void*>(cursor.node());
+  update->old_version =
+      static_cast<std::uint64_t>(cursor.previous_full_version_value());
+  update->new_version =
+      static_cast<std::uint64_t>(cursor.next_full_version_value(1));
+  update->incarnation = incarnation.value_or(0);
+  update->anchor_key.assign(key.data(), key.size());
+  update->layer_prefix_length =
+      static_cast<std::uint32_t>(cursor.prefix_length());
+  update->valid = true;
+}
+
+template <typename SS, typename K>
+std::string scan_anchor_key(const SS& stack, const K& search_key) {
+  const auto permutation = stack.permutation();
+  if (permutation.size() == 0) {
+    const auto full = search_key.full_string();
+    return std::string(full.s, full.len);
+  }
+
+  const auto prefix = search_key.prefix_string();
+  const auto local_key =
+      stack.node()->get_key(permutation[0]).unparse();
+  std::string anchor(prefix.s, prefix.len);
+  anchor.append(local_key.data(), local_key.length());
+  return anchor;
+}
+
 // RCU callback for deferred DataItem deletion. Allocated through
 // threadinfo::allocate so it lives in masstree's accounting pool, and
 // frees itself in operator() after deleting the wrapped DataItem (the
@@ -140,21 +309,27 @@ struct ScanAdapter {
   IndexBase* owner;
   std::vector<NodeVersionEntry>* out_versions;
   size_t count = 0;
+  std::optional<size_t> current_node_entry;
 
   template <typename SS, typename K>
-  void visit_leaf(const SS& stack, const K&, threadinfo&) {
+  void visit_leaf(const SS& stack, const K& key, threadinfo&) {
+    current_node_entry.reset();
     if (out_versions == nullptr) return;
-    // Use the unlocked projection so the recorded version matches what
-    // ValidatePhantoms (and tcursor's next_full_version_value bumping) read
-    // back later. Otherwise a stack snapshot taken while some writer briefly
-    // held the leaf lock would carry the lock_bit and mismatch.
-    out_versions->push_back(
-        {owner, static_cast<const void*>(stack.node()),
-         static_cast<std::uint64_t>(stack.node()->full_unlocked_version_value())});
+    const auto anchor = scan_anchor_key(stack, key);
+    out_versions->push_back(capture_node_version(
+        owner, stack.node(),
+        static_cast<std::uint64_t>(stack.full_version_value()),
+        anchor,
+        static_cast<std::uint32_t>(key.prefix_length())));
+    current_node_entry = out_versions->size() - 1;
   }
 
   // Returns true to keep scanning, false to stop (masstree convention).
   bool visit_value(Masstree::Str key, DataItem* /*val*/, threadinfo&) {
+    if (current_node_entry.has_value()) {
+      auto& entry = (*out_versions)[*current_node_entry];
+      entry.anchor_key.assign(key.s, key.len);
+    }
     if (has_end) {
       const int cmp = std::memcmp(
           end_ptr, key.s,
@@ -179,20 +354,26 @@ struct ScanValueAdapter {
   IndexBase* owner;
   std::vector<NodeVersionEntry>* out_versions;
   size_t count = 0;
+  std::optional<size_t> current_node_entry;
 
   template <typename SS, typename K>
-  void visit_leaf(const SS& stack, const K&, threadinfo&) {
+  void visit_leaf(const SS& stack, const K& key, threadinfo&) {
+    current_node_entry.reset();
     if (out_versions == nullptr) return;
-    // Use the unlocked projection so the recorded version matches what
-    // ValidatePhantoms (and tcursor's next_full_version_value bumping) read
-    // back later. Otherwise a stack snapshot taken while some writer briefly
-    // held the leaf lock would carry the lock_bit and mismatch.
-    out_versions->push_back(
-        {owner, static_cast<const void*>(stack.node()),
-         static_cast<std::uint64_t>(stack.node()->full_unlocked_version_value())});
+    const auto anchor = scan_anchor_key(stack, key);
+    out_versions->push_back(capture_node_version(
+        owner, stack.node(),
+        static_cast<std::uint64_t>(stack.full_version_value()),
+        anchor,
+        static_cast<std::uint32_t>(key.prefix_length())));
+    current_node_entry = out_versions->size() - 1;
   }
 
   bool visit_value(Masstree::Str key, DataItem* val, threadinfo&) {
+    if (current_node_entry.has_value()) {
+      auto& entry = (*out_versions)[*current_node_entry];
+      entry.anchor_key.assign(key.s, key.len);
+    }
     if (has_end) {
       const int cmp = std::memcmp(
           end_ptr, key.s,
@@ -208,8 +389,6 @@ struct ScanValueAdapter {
     return true;
   }
 };
-
-using leaf_type = Masstree::leaf<table_params>;
 
 }  // namespace
 
@@ -262,10 +441,10 @@ struct MasstreeIndex::Impl {
     unlocked_cursor_type lp(table_, key.data(), key.size());
     if (lp.find_unlocked(*tls_ti)) return lp.value();
     if (out_versions != nullptr) {
-      out_versions->push_back(
-          {owner, static_cast<const void*>(lp.node()),
-           static_cast<std::uint64_t>(
-               lp.node()->full_unlocked_version_value())});
+      out_versions->push_back(capture_node_version(
+          owner, lp.node(),
+          static_cast<std::uint64_t>(lp.full_version_value()), key,
+          static_cast<std::uint32_t>(lp.prefix_length())));
     }
     return nullptr;
   }
@@ -299,12 +478,7 @@ struct MasstreeIndex::Impl {
       lp.value() = fresh;
     }
     if (out_update != nullptr && !found) {
-      out_update->node_ptr = static_cast<const void*>(lp.node());
-      out_update->old_version =
-          static_cast<std::uint64_t>(lp.previous_full_version_value());
-      out_update->new_version =
-          static_cast<std::uint64_t>(lp.next_full_version_value(1));
-      out_update->valid = true;
+      capture_node_version_update(lp, key, out_update);
     }
     fence();
     // 1 == structural insert (bumps the leaf's vinsert counter), 0 == in-place
@@ -345,12 +519,7 @@ struct MasstreeIndex::Impl {
       return true;
     }
     if (out_update != nullptr) {
-      out_update->node_ptr = static_cast<const void*>(lp.node());
-      out_update->old_version =
-          static_cast<std::uint64_t>(lp.previous_full_version_value());
-      out_update->new_version =
-          static_cast<std::uint64_t>(lp.next_full_version_value(1));
-      out_update->valid = true;
+      capture_node_version_update(lp, key, out_update);
     }
     lp.value() = NewBlankItem();
     fence();
@@ -414,12 +583,7 @@ struct MasstreeIndex::Impl {
       lp.value() = NewBlankItem();
     }
     if (out_update != nullptr && !found) {
-      out_update->node_ptr = static_cast<const void*>(lp.node());
-      out_update->old_version =
-          static_cast<std::uint64_t>(lp.previous_full_version_value());
-      out_update->new_version =
-          static_cast<std::uint64_t>(lp.next_full_version_value(1));
-      out_update->valid = true;
+      capture_node_version_update(lp, key, out_update);
     }
     fence();
     lp.finish(found ? 0 : 1, *tls_ti);
@@ -444,7 +608,8 @@ struct MasstreeIndex::Impl {
                         std::move(op),
                         owner,
                         out_versions,
-                        0};
+                        0,
+                        std::nullopt};
     Masstree::Str firstkey(begin.data(), begin.size());
     table_.scan(firstkey, /*emit_firstkey=*/true, adapter, *tls_ti);
     return adapter.count;
@@ -462,7 +627,8 @@ struct MasstreeIndex::Impl {
                              std::move(op),
                              owner,
                              out_versions,
-                             0};
+                             0,
+                             std::nullopt};
     Masstree::Str firstkey(begin.data(), begin.size());
     table_.scan(firstkey, /*emit_firstkey=*/true, adapter, *tls_ti);
     return adapter.count;
@@ -492,7 +658,8 @@ struct MasstreeIndex::Impl {
                         std::move(adapter_op),
                         owner,
                         out_versions,
-                        0};
+                        0,
+                        std::nullopt};
     if (end.has_value()) {
       Masstree::Str firstkey(end->data(), end->size());
       table_.rscan(firstkey, /*emit_firstkey=*/false, adapter, *tls_ti);
@@ -529,7 +696,8 @@ struct MasstreeIndex::Impl {
                              std::move(adapter_op),
                              owner,
                              out_versions,
-                             0};
+                             0,
+                             std::nullopt};
     Masstree::Str firstkey(end.data(), end.size());
     table_.rscan(firstkey, /*emit_firstkey=*/false, adapter, *tls_ti);
     return adapter.count;
@@ -538,8 +706,28 @@ struct MasstreeIndex::Impl {
   void ForEach(std::function<bool(std::string_view, DataItem&)> op) {
     ensure_thread_active();
     ScanValueAdapter adapter{nullptr, 0, false, std::move(op),
-                             nullptr, nullptr, 0};
+                             nullptr, nullptr, 0, std::nullopt};
     table_.scan(Masstree::Str(), /*emit_firstkey=*/true, adapter, *tls_ti);
+  }
+
+  std::optional<NodeVersionObservation> ReadNodeVersion(
+      std::string_view anchor_key, std::uint32_t layer_prefix_length) {
+    constexpr auto kSliceSize = sizeof(table_params::ikey_type);
+    if (anchor_key.size() > MASSTREE_MAXKEYLEN ||
+        layer_prefix_length > anchor_key.size() ||
+        layer_prefix_length % kSliceSize != 0 ||
+        (layer_prefix_length != 0 &&
+         layer_prefix_length == anchor_key.size())) {
+      return std::nullopt;
+    }
+
+    ensure_thread_active();
+    const auto resolved =
+        resolve_node_at_layer(table_, anchor_key, layer_prefix_length);
+    if (!resolved.has_value()) return std::nullopt;
+    const auto incarnation = leaf_incarnation(resolved->leaf);
+    if (!incarnation.has_value()) return std::nullopt;
+    return NodeVersionObservation{*incarnation, resolved->version};
   }
 
   bool ValidatePhantoms(const std::vector<NodeVersionEntry>& entries,
@@ -663,6 +851,11 @@ bool MasstreeIndex::ValidatePhantoms(
   return impl_->ValidatePhantoms(entries, this);
 }
 
+std::optional<NodeVersionObservation> MasstreeIndex::ReadNodeVersion(
+    std::string_view anchor_key, std::uint32_t layer_prefix_length) {
+  return impl_->ReadNodeVersion(anchor_key, layer_prefix_length);
+}
+
 bool MasstreeIndex::Purge(std::string_view key, DataItem* expected,
                           TransactionId retired_tid) {
   return impl_->Purge(key, expected, retired_tid);
@@ -744,6 +937,12 @@ void MasstreeFullyDrainThread() {
     MasstreeAdvanceEpoch();
     tls_ti->rcu_stop();
   }
+}
+
+std::uint64_t MasstreeSetNextLeafIncarnationForTesting(
+    std::uint64_t next_incarnation) {
+  return next_leaf_incarnation.exchange(next_incarnation,
+                                        std::memory_order_relaxed);
 }
 
 }  // namespace Index

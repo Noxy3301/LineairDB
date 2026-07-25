@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -16,15 +17,28 @@ namespace Index {
 
 class IndexBase;
 
+// A stable observation of one tree node resolved from a by-value locator.
+// Incarnation distinguishes different allocations that occupied the same
+// address, while version detects changes within one allocation's lifetime.
+struct NodeVersionObservation {
+  std::uint64_t incarnation;
+  std::uint64_t version;
+};
+
 // Opaque token for deferred phantom detection in tree-structured indexes
 // (Masstree). Each entry pairs a backend-private node handle with the
 // version observed at scan time; the owning IndexBase re-reads and compares
-// at Precommit. PL ignores these entries because it detects phantoms
-// synchronously at scan time.
+// at Precommit. The locator fields are a by-value route to the same leaf for
+// stateless validation; native validation continues to use node_ptr while its
+// RCU epoch remains active. PL ignores these entries because it detects
+// phantoms synchronously at scan time.
 struct NodeVersionEntry {
   IndexBase* owner;
   const void* node_ptr;
   std::uint64_t version;
+  std::uint64_t incarnation;
+  std::string anchor_key;
+  std::uint32_t layer_prefix_length;
 };
 
 // Reports what an Insert/Put/ForcePutBlankEntry actually did at the leaf
@@ -39,6 +53,9 @@ struct NodeVersionUpdate {
   const void* node_ptr = nullptr;
   std::uint64_t old_version = 0;
   std::uint64_t new_version = 0;
+  std::uint64_t incarnation = 0;
+  std::string anchor_key;
+  std::uint32_t layer_prefix_length = 0;
   bool valid = false;
 };
 
@@ -120,6 +137,15 @@ class IndexBase {
   // caller can validate many indexes in one pass).
   virtual bool ValidatePhantoms(
       const std::vector<NodeVersionEntry>& entries) = 0;
+
+  // Resolve a by-value node locator without dereferencing a read-time pointer.
+  // Backends without durable node identities return std::nullopt so callers
+  // cannot mistake unsupported validation for an unchanged node.
+  virtual std::optional<NodeVersionObservation> ReadNodeVersion(
+      std::string_view /*anchor_key*/,
+      std::uint32_t /*layer_prefix_length*/) {
+    return std::nullopt;
+  }
 
   // Structurally remove a committed tombstone from the index. Called by the
   // deferred purge reaper only, after it has locked `expected`, verified the
