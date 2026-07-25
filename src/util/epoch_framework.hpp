@@ -67,25 +67,72 @@ class EpochFramework {
   void SetGlobalEpoch(const EpochNumber epoch) { global_epoch_.store(epoch); }
 
   EpochNumber GetGlobalEpoch() const { return global_epoch_.load(); }
-  EpochNumber& GetMyThreadLocalEpoch() {
-    EpochNumber* my_epoch =
+
+  /**
+   * Returns the epoch this thread currently participates in, or
+   * #THREAD_OFFLINE when it participates in none. The slot itself is never
+   * exposed: every read and write of it happens inside this class so that the
+   * publication order relied on by #GetSmallestEpoch stays under one
+   * sequentially consistent total order.
+   */
+  EpochNumber GetMyThreadLocalEpoch() {
+    std::atomic<EpochNumber>* my_epoch =
         tls_.Get<EpochNumber>([]() { return THREAD_OFFLINE; });
-    return *my_epoch;
+    return my_epoch->load(std::memory_order_seq_cst);
   }
 
-  EpochNumber MakeMeOnline() {
-    EpochNumber* my_epoch =
+  /**
+   * Overwrites the calling thread's epoch with a replayed one. Valid only
+   * before #Start(), where the epoch writer has not begun scanning slots and
+   * the caller is the only participant; ordinary transactions must reach their
+   * epoch through #MakeMeOnline so that the closure property below holds.
+   */
+  void SetMyThreadLocalEpochForRecovery(const EpochNumber epoch) {
+    assert(!start_.load(std::memory_order_seq_cst));
+    assert(epoch != THREAD_OFFLINE);
+    std::atomic<EpochNumber>* my_epoch =
         tls_.Get<EpochNumber>([]() { return THREAD_OFFLINE; });
-    assert(*my_epoch == THREAD_OFFLINE);
-    *my_epoch = GetGlobalEpoch();
-    return *my_epoch;
+    assert(my_epoch->load(std::memory_order_seq_cst) != THREAD_OFFLINE);
+    my_epoch->store(epoch, std::memory_order_seq_cst);
+  }
+
+  /**
+   * Joins the current epoch and returns it.
+   *
+   * Publication is stabilized: the loop republishes until the global epoch
+   * reloaded after the store still equals what was stored. This establishes
+   * the closure property the durability path depends on -- once the global
+   * epoch reaches U, no thread remains online in an epoch at or below U-2.
+   * A single store cannot establish it: an epoch writer that read the slot as
+   * #THREAD_OFFLINE just before the store may advance the global epoch twice
+   * while the thread is online in the epoch it published.
+   *
+   * The caller must not begin its transaction, and in particular must not
+   * enqueue log records, before this function returns.
+   */
+  EpochNumber MakeMeOnline() {
+    std::atomic<EpochNumber>* my_epoch =
+        tls_.Get<EpochNumber>([]() { return THREAD_OFFLINE; });
+    assert(my_epoch->load(std::memory_order_seq_cst) == THREAD_OFFLINE);
+
+    EpochNumber published = global_epoch_.load(std::memory_order_seq_cst);
+    for (;;) {
+      my_epoch->store(published, std::memory_order_seq_cst);
+      const EpochNumber reloaded =
+          global_epoch_.load(std::memory_order_seq_cst);
+      if (reloaded == published) return published;
+      // The writer advanced between the store and the reload; the slot
+      // currently holds a stale epoch. Republish the observed value. Each
+      // retry consumes one real advance, so the writer never spins here.
+      published = reloaded;
+    }
   }
 
   void MakeMeOffline() {
-    EpochNumber* my_epoch =
+    std::atomic<EpochNumber>* my_epoch =
         tls_.Get<EpochNumber>([]() { return THREAD_OFFLINE; });
-    assert(*my_epoch != THREAD_OFFLINE);
-    *my_epoch = THREAD_OFFLINE;
+    assert(my_epoch->load(std::memory_order_seq_cst) != THREAD_OFFLINE);
+    my_epoch->store(THREAD_OFFLINE, std::memory_order_seq_cst);
   }
 
   EpochNumber Sync() {
@@ -173,8 +220,8 @@ class EpochFramework {
  public:
   uint32_t GetSmallestEpoch() {
     uint32_t min_epoch = THREAD_OFFLINE;
-    tls_.ForEach([&](const EpochNumber* local_epoch) {
-      const EpochNumber e = *local_epoch;
+    tls_.ForEach([&](const std::atomic<EpochNumber>* local_epoch) {
+      const EpochNumber e = local_epoch->load(std::memory_order_seq_cst);
       if (0 < e && e < min_epoch) {
         min_epoch = e;
       }
@@ -239,7 +286,7 @@ class EpochFramework {
   std::condition_variable worker_cv_;
   const std::function<void(EpochNumber)> publish_target_;
   std::thread epoch_writer_;
-  ThreadKeyStorage<EpochNumber> tls_;
+  ThreadKeyStorage<std::atomic<EpochNumber>> tls_;
 };
 
 }  // namespace LineairDB
