@@ -5,9 +5,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <msgpack.hpp>
 #include <system_error>
 #include <utility>
@@ -75,7 +78,37 @@ WalIo WalIo::Posix() {
   io.write = [](int fd, const void* data, size_t size) {
     return ::write(fd, data, size);
   };
-  io.fdatasync = [](int fd) { return ::fdatasync(fd); };
+
+  // A durability contract's failure behaviour can only be observed from outside
+  // the process, and a real EIO cannot be arranged without privileges the test
+  // does not have. The injection is armed from the environment, like the debug
+  // sync points, so the binary under test is the binary that serves traffic;
+  // with the variable unset, fdatasync is the bare syscall.
+  const char* raw = std::getenv("LINEAIRDB_WAL_FDATASYNC_FAIL_AFTER");
+  if (raw == nullptr) {
+    io.fdatasync = [](int fd) { return ::fdatasync(fd); };
+    return io;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const long successes = std::strtol(raw, &end, 10);
+  // A value that saturates rather than parses would arm the injection at a count
+  // no run reaches, which reads as "the failure never happened".
+  if (end == raw || *end != '\0' || errno == ERANGE || successes < 0) {
+    SPDLOG_CRITICAL(
+        "Invalid LINEAIRDB_WAL_FDATASYNC_FAIL_AFTER='{0}': expected a "
+        "non-negative count of calls to let through",
+        raw);
+    exit(EXIT_FAILURE);
+  }
+  auto remaining = std::make_shared<std::atomic<long>>(successes);
+  io.fdatasync = [remaining](int fd) -> int {
+    if (remaining->fetch_sub(1) <= 0) {
+      errno = EIO;
+      return -1;
+    }
+    return ::fdatasync(fd);
+  };
   return io;
 }
 
