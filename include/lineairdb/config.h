@@ -144,6 +144,43 @@ struct Config {
 
   /**
    * @brief
+   * How much of the write-ahead log is made writable in place at a time.
+   *
+   * The log file is written out with zeroes to this size before any record lands
+   * in it, and records are then written in place. A log that grows past it is
+   * extended by the same amount again, so this is a granularity rather than a
+   * limit; the space is occupied from startup either way.
+   *
+   * The point is what a commit's fdatasync has to persist. Writing past the end
+   * of a file changes its size and its block allocation as well, and persisting
+   * that is a filesystem journal commit on top of the device cache flush the data
+   * alone needs. Measured on ext4 over NVMe, a group flush costs 6.15ms when the
+   * file grows against 1.79ms for the same bytes written in place. Under the Sync
+   * contract that difference sits in front of every commit.
+   *
+   * Larger is better while the log fits, because extending is synchronous and
+   * writes out the whole new region. Against that, startup reads the reserved
+   * region once to find where the log ends, so the cost of a start grows with it
+   * too. Zero disables reservation altogether and lets the file grow as it is
+   * written, which is what a Volatile database is given: it never writes a record,
+   * and reserving would occupy the space for nothing.
+   *
+   * Assumes a filesystem that does not let a file's size outlive the data below it
+   * across a crash. data=ordered and barriers are ext4 defaults; the data mode can
+   * be changed and barriers can be disabled, and the storage stack below has to
+   * honour a flush.
+   *
+   * A log left by a build that did not reserve is readable here, since it simply
+   * ends where the file does. The other direction does not hold: a build without
+   * reservation reads the zeroes past the log as a frame whose magic is wrong, and
+   * refuses to start.
+   *
+   * Default: 64 MiB
+   */
+  uint64_t wal_initial_capacity_bytes = 64ull * 1024ull * 1024ull;
+
+  /**
+   * @brief
    * True while LineairDB performs logging for recovery.
    *
    * @deprecated Derived from commit_durability, which is the setting that

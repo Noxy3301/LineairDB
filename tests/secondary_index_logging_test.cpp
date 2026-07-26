@@ -353,6 +353,11 @@ TEST_F(SecondaryIndexLoggingTest, SecondaryIndexAddTimingRecorded) {
   config.enable_checkpointing = false;
   config.enable_recovery = false;
   config.max_thread = 1;
+  // What this test reports per transaction is how many bytes of log one
+  // secondary-index write costs, and it reads that from the file's size. A
+  // preallocated log holds its size constant, which would report zero for every
+  // transaction, so this one log grows as it is written.
+  config.wal_initial_capacity_bytes = 0;
 
   db_.reset(nullptr);
   std::filesystem::remove_all(config.work_dir);
