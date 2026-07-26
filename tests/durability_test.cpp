@@ -38,7 +38,7 @@ class DurabilityTest : public ::testing::Test {
   virtual void SetUp() {
     std::filesystem::remove_all("lineairdb_logs");
     config_.max_thread = 4;
-    config_.enable_logging = true;
+    config_.commit_durability = LineairDB::Config::CommitDurability::Async;
     config_.enable_recovery = true;
     // The epoch-frame write-ahead log has no checkpoint path; the tests that
     // exercised checkpointing are disabled below.
@@ -331,7 +331,7 @@ TEST_F(DurabilityTest, DISABLED_CPRConsistency) {  // a.k.a., checkpointing
    */
 
   LineairDB::Config config = db_->GetConfig();
-  config.enable_logging = false;
+  config.commit_durability = LineairDB::Config::CommitDurability::Volatile;
   config.checkpoint_period = 5;  // 5sec
   ASSERT_TRUE(config.enable_checkpointing);
   db_.reset(nullptr);
@@ -370,7 +370,7 @@ TEST_F(DurabilityTest, DISABLED_CPRConsistency) {  // a.k.a., checkpointing
 TEST_F(DurabilityTest,
        DISABLED_CPRConsistencyOnHandlerInterface) {  // a.k.a., checkpointing
   LineairDB::Config config = db_->GetConfig();
-  config.enable_logging = false;
+  config.commit_durability = LineairDB::Config::CommitDurability::Volatile;
   config.checkpoint_period = 5;  // 5sec
   ASSERT_TRUE(config.enable_checkpointing);
   db_.reset(nullptr);

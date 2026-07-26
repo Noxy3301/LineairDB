@@ -62,7 +62,7 @@ int main() {
     LineairDB::Config config;
     config.concurrency_control_protocol =
         LineairDB::Config::ConcurrencyControl::Silo;
-    config.enable_logging = false;
+    config.commit_durability = LineairDB::Config::CommitDurability::Volatile;
     config.enable_recovery = false;
     config.max_thread = 1;
 

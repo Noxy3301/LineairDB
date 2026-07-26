@@ -38,7 +38,7 @@ class SecondaryIndexRecoveryTest : public ::testing::Test {
   virtual void SetUp() {
     std::filesystem::remove_all("lineairdb_logs");
     config_.max_thread = 4;
-    config_.enable_logging = true;
+    config_.commit_durability = LineairDB::Config::CommitDurability::Async;
     config_.enable_recovery = true;
     config_.enable_checkpointing = true;
     config_.checkpoint_period = 1;
