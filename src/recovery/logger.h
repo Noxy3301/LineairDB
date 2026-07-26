@@ -103,6 +103,23 @@ class Logger {
    */
   WaitResult WaitUntilDurable(EpochNumber commit_epoch, Deadline deadline);
 
+  /**
+   * Returns once the transaction that committed in `commit_epoch` may be
+   * acknowledged under the configured durability contract: at once unless the
+   * contract is Sync and this transaction enqueued a record, and after
+   * `commit_epoch` is durable when it did. The caller must have left its epoch,
+   * as WaitUntilDurable requires.
+   *
+   * `log_enqueued` is the result of this transaction's Enqueue rather than
+   * "the transaction wrote something": a write that the concurrency control
+   * omitted leaves no record, and its epoch may never be written at all.
+   *
+   * A Sync commit whose record cannot be made durable stops the process. It has
+   * already passed its serialization point, so reporting an abort would be a
+   * lie, and acknowledging it would be the lie the contract exists to prevent.
+   */
+  void AwaitCommitDurability(EpochNumber commit_epoch, bool log_enqueued);
+
   /** True while nothing is waiting to be written. */
   bool IsQuiescent();
 
@@ -115,6 +132,7 @@ class Logger {
   void PublishStopped();
 
   const std::string work_dir_;
+  const Config::CommitDurability durability_;
   std::atomic<EpochNumber> durable_epoch_{0};
 
   enum class State { Running, Stopped, Failed };

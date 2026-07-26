@@ -201,7 +201,8 @@ WriteSetType BuildRecoverySet(const LogRecords& records) {
 
 }  // namespace
 
-Logger::Logger(const Config& config, WalIo io) : work_dir_(config.work_dir) {
+Logger::Logger(const Config& config, WalIo io)
+    : work_dir_(config.work_dir), durability_(config.commit_durability) {
   LineairDB::Util::SetUpSPDLog();
   logger_ = std::make_unique<ThreadLocalLogger>(
       config, [this](EpochNumber frontier) { PublishDurable(frontier); },
@@ -313,6 +314,23 @@ Logger::WaitResult Logger::WaitUntilDurable(EpochNumber commit_epoch,
     return WaitResult::Durable;
   }
   return state_ == State::Stopped ? WaitResult::Stopped : WaitResult::Failed;
+}
+
+void Logger::AwaitCommitDurability(EpochNumber commit_epoch,
+                                   bool log_enqueued) {
+  if (durability_ != Config::CommitDurability::Sync) return;
+  if (!log_enqueued) return;
+
+  // TimedOut cannot arrive from an infinite deadline; treating it as a failure
+  // keeps a later finite deadline from turning into a silent acknowledgement.
+  const auto result = WaitUntilDurable(commit_epoch, Deadline::max());
+  if (result == WaitResult::Durable) return;
+
+  SPDLOG_CRITICAL(
+      "Durability Error: the log for epoch {0} did not become durable, and the "
+      "transaction that committed in it cannot be acknowledged",
+      commit_epoch);
+  std::abort();
 }
 
 }  // namespace Recovery

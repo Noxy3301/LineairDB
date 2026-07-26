@@ -257,8 +257,8 @@ class Database::Impl {
           callback_manager_.Enqueue(std::move(callback), current_epoch);
           if (config_.enable_logging) {
             // The Sync acknowledgement contract covers EndTransaction and
-            // ValidateAndCommit only; this path runs on a pool worker, where an
-            // inline wait for the flusher would be a self-deadlock.
+            // ValidateAndCommit only. Waiting here would deadlock outright:
+            // this thread is still online in the epoch the wait needs closed.
             logger_.Enqueue(tx.tx_pimpl_->write_set_, current_epoch);
           }
         } else {
@@ -310,22 +310,40 @@ class Database::Impl {
       return false;
     }
 
+    EpochNumber commit_epoch = 0;
+    bool log_enqueued = false;
+    bool callback_awaits_durability = false;
     bool committed = tx.Precommit();
     if (committed) {
       tx.tx_pimpl_->PostProcessing(TxStatus::Committed);
 
       tx.tx_pimpl_->current_status_ = TxStatus::Committed;
-      const auto current_epoch = epoch_framework_.GetMyThreadLocalEpoch();
-      callback_manager_.Enqueue(std::move(clbk), current_epoch, true);
-
+      commit_epoch = epoch_framework_.GetMyThreadLocalEpoch();
       if (config_.enable_logging) {
-        logger_.Enqueue(tx.tx_pimpl_->write_set_, current_epoch);
+        log_enqueued = logger_.Enqueue(tx.tx_pimpl_->write_set_, commit_epoch);
+      }
+
+      // The commit callback is an acknowledgement, so under Sync it cannot be
+      // handed out before the record is durable. The callback manager releases
+      // a callback once the stable epoch reaches the commit epoch, which
+      // happens one epoch before the flusher writes that epoch, so a Sync
+      // commit registers its callback after its own wait instead.
+      callback_awaits_durability =
+          log_enqueued &&
+          config_.commit_durability == Config::CommitDurability::Sync;
+      if (!callback_awaits_durability) {
+        callback_manager_.Enqueue(std::move(clbk), commit_epoch, true);
       }
     } else {
       tx.tx_pimpl_->PostProcessing(TxStatus::Aborted);
       clbk(TxStatus::Aborted);
     }
     epoch_framework_.MakeMeOffline();
+
+    logger_.AwaitCommitDurability(commit_epoch, log_enqueued);
+    if (callback_awaits_durability) {
+      callback_manager_.Enqueue(std::move(clbk), commit_epoch, true);
+    }
 
     if (!tx.reusable_) delete &tx;
     return committed;

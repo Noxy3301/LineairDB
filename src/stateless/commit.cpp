@@ -542,9 +542,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
   // Phase 3.2: build the log snapshot before unlock so a later transaction
   // cannot overwrite the values we just logged.
   WriteSetType log_set;
-  bool has_log_set = false;
   if (config.enable_logging) {
-    has_log_set = true;
     log_set.reserve(resolved_writes.size() + resolved_si_ops.size());
 
     for (const auto& write : resolved_writes) {
@@ -607,11 +605,14 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
   }
 
   // Phase 3.5: enqueue the log set, then leave the epoch.
-  if (has_log_set) {
-    [[maybe_unused]] const bool logged = logger.Enqueue(log_set, current_epoch);
+  bool log_enqueued = false;
+  if (!log_set.empty()) {
+    log_enqueued = logger.Enqueue(log_set, current_epoch);
   }
 
   epoch_framework.MakeMeOffline();
+
+  logger.AwaitCommitDurability(current_epoch, log_enqueued);
   return true;
 }
 

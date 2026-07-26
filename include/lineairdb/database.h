@@ -84,6 +84,10 @@ class Database {
    * is aborted, it is guaranteed that the other  transactions, that are
    executed
    * after checking the pre-commit of the transaction, will abort.
+   * @note CommitDurability::Sync's durable-acknowledgement contract covers
+   * EndTransaction() and ValidateAndCommit() only. This interface does not wait
+   * for the log to become durable, and neither of its callbacks is a Sync
+   * acknowledgement.
    */
   void ExecuteTransaction(
       ProcedureType proc, CallbackType commit_clbk,
@@ -113,12 +117,17 @@ class Database {
    * @post The first argument `tx` might have been deleted.
    * @param[in] tx A transaction wants to terminate.
    * @param[out] clbk A callback function accepts a result (Committed or
+   * Aborted).
    * @return true if the LineairDB's concurrency control protocol **decides** to
-   * commit the given `tx`. Note that it does not mean that `tx has been
-   * committed`; `tx` will be committed if it goes without crash, disaster, or
-   * something accident, however, the commit cannot be determined until
-   * recoverability is guaranteed by persistent logs. Use clbk to find out
-   * whether you have really committed or not.
+   * commit the given `tx`. What that decision is worth depends on
+   * Config::commit_durability:
+   * under Sync this method returns, and clbk is released, only after the
+   * transaction's log is on the device, so a true return is an acknowledgement
+   * that survives a crash;
+   * under Async the decision is final for concurrency control but the log is
+   * written behind the caller, so a crash can lose a transaction that returned
+   * true, and clbk says nothing about durability either;
+   * under Volatile nothing is written and nothing survives a restart.
    * @return false if the LineairDB's concurrency control protocol decides to
    * abort the given `tx`. In contrast with the true case, this result will not
    * be overturned.
@@ -143,9 +152,10 @@ class Database {
    * Waits for the completion of the next checkpoint.
    * Note that this method may take longer than the time specified in
    * `LineairDB::Config.checkpoint_period (default value: 30 seconds)` in the
-   * worst cases. When the WAL (logging) is disabled and durability is
-   * guaranteed by only checkpointing, this interface is preferable; it ensures
-   *that the currently active transactions are durable.
+   * worst cases.
+   * Checkpointing is not implemented for the epoch-frame write-ahead log:
+   * enabling it stops startup, so this method returns immediately and durability
+   * comes from Config::commit_durability alone.
    */
   void WaitForCheckpoint() const noexcept;
 
