@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "crc32c.h"
+#include "util/debug_sync.hpp"
 #include "util/logger.hpp"
 
 namespace LineairDB {
@@ -341,6 +342,11 @@ WalAppendResult Wal::AppendGroup(
   if (!WriteAll(group.data(), group.size(), &error)) {
     return {false, error};
   }
+  // The records are in the page cache and not yet on the device: a Sync commit
+  // waiting on this group must not have been acknowledged when this point is
+  // reached.
+  LINEAIRDB_DEBUG_SYNC("wal.before_fdatasync");
+
   int rc;
   do {
     rc = io_.fdatasync(fd_);
