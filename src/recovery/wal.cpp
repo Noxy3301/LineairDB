@@ -656,25 +656,29 @@ WalScanResult Wal::ScanAndRepair() {
 
 WalAppendResult Wal::AppendGroup(
     const std::map<EpochNumber, LogRecords>& buckets, EpochNumber target) {
-  // Where the log ends is what a successful scan establishes, and a group whose
-  // own outcome is unknown unsettles it again. Checked before the group is even
-  // encoded, so that the rule holds for a caller that passes nothing eligible.
-  if (state_ != State::Ready) {
-    SPDLOG_CRITICAL(
-        "Durability Error: a group was written to {0} while the end of the log "
-        "was not established",
-        path_);
-    std::abort();
-  }
+  WalEncodedGroup encoded;
+  const auto encode_result = EncodeGroup(buckets, target, &encoded);
+  if (!encode_result.ok) return encode_result;
+  return AppendEncodedGroup(&encoded);
+}
+
+WalAppendResult Wal::EncodeGroup(
+    const std::map<EpochNumber, LogRecords>& buckets, EpochNumber target,
+    WalEncodedGroup* encoded) const {
+  assert(encoded != nullptr);
+  *encoded = WalEncodedGroup{};
 
   auto& trace                = FlushTrace::Instance();
   const bool traced          = trace.Enabled();
-  const int64_t encode_begin = traced ? FlushTrace::Now() : 0;
-  uint32_t encoded_epochs    = 0;
-  std::vector<uint8_t> group;
+  encoded->encode_begin      = traced ? FlushTrace::Now() : 0;
+  auto& group                = encoded->bytes;
+  // Where the log ends is what a successful scan establishes, and a group whose
+  // own outcome is unknown unsettles it again. AppendEncodedGroup checks this
+  // before touching the file. Encoding is deliberately independent of that
+  // mutable state so it can overlap the previous group's I/O.
   for (const auto& [epoch, records] : buckets) {
     if (epoch > target) break;
-    ++encoded_epochs;
+    ++encoded->epoch_count;
     // An empty bucket would produce a frame that recovery rejects; the caller
     // must never create one.
     assert(!records.empty());
@@ -705,13 +709,28 @@ WalAppendResult Wal::AppendGroup(
     PutLe32(frame + 16, crc.Finish());
   }
 
-  if (traced) {
-    trace.GroupEncode(encode_begin, FlushTrace::Now(), group.size(),
-                      encoded_epochs);
+  encoded->encode_end = traced ? FlushTrace::Now() : 0;
+  return {true, 0};
+}
+
+WalAppendResult Wal::AppendEncodedGroup(WalEncodedGroup* encoded) {
+  assert(encoded != nullptr);
+  // Where the log ends is what a successful scan establishes, and a group whose
+  // own outcome is unknown unsettles it again. This also covers an empty group:
+  // no target may be published from an unscanned or failed WAL.
+  if (state_ != State::Ready) {
+    SPDLOG_CRITICAL(
+        "Durability Error: a group was written to {0} while the end of the log "
+        "was not established",
+        path_);
+    std::abort();
   }
 
+  auto& group = encoded->bytes;
   if (group.empty()) return {true, 0};
 
+  auto& trace       = FlushTrace::Instance();
+  const bool traced = trace.Enabled();
   int error = 0;
   const off_t initialised_before = initialised_size_;
   if (!EnsureCapacityFor(write_offset_, group.size(), &error)) {
@@ -724,18 +743,18 @@ WalAppendResult Wal::AppendGroup(
                 static_cast<long long>(initialised_size_), extension_count_);
   }
 
-  const int64_t write_begin = traced ? FlushTrace::Now() : 0;
+  encoded->write_begin = traced ? FlushTrace::Now() : 0;
   if (!WriteAllAt(group.data(), group.size(), write_offset_, &error)) {
     state_ = State::Failed;
     return {false, error};
   }
-  if (traced) trace.GroupWrite(write_begin, FlushTrace::Now());
+  encoded->write_end = traced ? FlushTrace::Now() : 0;
   // The records are in the page cache and not yet on the device: a Sync commit
   // waiting on this group must not have been acknowledged when this point is
   // reached.
   LINEAIRDB_DEBUG_SYNC("wal.before_fdatasync");
 
-  const int64_t sync_begin = traced ? FlushTrace::Now() : 0;
+  encoded->sync_begin = traced ? FlushTrace::Now() : 0;
   int rc;
   do {
     rc = io_.fdatasync(fd_);
@@ -745,7 +764,7 @@ WalAppendResult Wal::AppendGroup(
     state_ = State::Failed;
     return {false, failure};
   }
-  if (traced) trace.GroupSync(sync_begin, FlushTrace::Now());
+  encoded->sync_end = traced ? FlushTrace::Now() : 0;
 
   write_offset_ += static_cast<off_t>(group.size());
   // Without preallocation the group carried the file's size with it.

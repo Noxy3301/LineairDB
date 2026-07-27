@@ -135,52 +135,30 @@ class FlushTrace {
         .count();
   }
 
-  // --- Group census. Called by the flusher thread only. ---
+  // --- Group census. Begin is called by the preparation stage and Publish by
+  // the I/O stage. The row itself crosses the bounded stage queue, so preparing
+  // group N+1 cannot overwrite group N's in-flight timings. ---
 
-  void GroupCollectBegin(EpochNumber durable_before) {
-    if (!enabled_) return;
-    current_                = GroupRow{};
-    current_.seq            = next_seq_++;
-    current_.durable_before = durable_before;
-    current_.collect_begin  = Now();
+  GroupRow GroupBegin(EpochNumber durable_before) {
+    GroupRow row{};
+    if (!enabled_) return row;
+    row.seq            = next_seq_++;
+    row.durable_before = durable_before;
+    row.collect_begin  = Now();
+    return row;
   }
 
-  void GroupCollectEnd() {
+  void GroupPublish(GroupRow row, EpochNumber target, int64_t enter,
+                    int64_t exit) {
     if (!enabled_) return;
-    current_.collect_end = Now();
-  }
-
-  void GroupEncode(int64_t begin, int64_t end, uint64_t bytes,
-                   uint32_t epochs) {
-    if (!enabled_) return;
-    current_.encode_begin  = begin;
-    current_.encode_end    = end;
-    current_.encoded_bytes = bytes;
-    current_.epoch_count   = epochs;
-  }
-
-  void GroupWrite(int64_t begin, int64_t end) {
-    if (!enabled_) return;
-    current_.write_begin = begin;
-    current_.write_end   = end;
-  }
-
-  void GroupSync(int64_t begin, int64_t end) {
-    if (!enabled_) return;
-    current_.sync_begin = begin;
-    current_.sync_end   = end;
-  }
-
-  void GroupPublish(EpochNumber target, int64_t enter, int64_t exit) {
-    if (!enabled_) return;
-    current_.target        = target;
-    current_.publish_enter = enter;
-    current_.publish_exit  = exit;
+    row.target        = target;
+    row.publish_enter = enter;
+    row.publish_exit  = exit;
     // Storage is sized once and never grows, so a reader can take the count and
     // walk the rows below it while this thread writes above it.
     const uint64_t index = group_count_.load(std::memory_order_relaxed);
     if (index < kGroupCapacity) {
-      groups_[index] = current_;
+      groups_[index] = row;
       group_count_.store(index + 1, std::memory_order_release);
     } else {
       group_drops_.fetch_add(1, std::memory_order_relaxed);
@@ -355,7 +333,8 @@ class FlushTrace {
   bool enabled_{false};
   std::string prefix_;
 
-  GroupRow current_{};
+  // GroupBegin has one caller (the preparer), and GroupPublish has one caller
+  // (the ordered I/O stage), so neither counter needs a contended increment.
   uint64_t next_seq_{0};
   std::vector<GroupRow> groups_;
   std::atomic<uint64_t> group_count_{0};

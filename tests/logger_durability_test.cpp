@@ -31,6 +31,13 @@ constexpr auto kTestTimeout = std::chrono::seconds(5);
 // in the epoch framework and the thread pool.
 class LoggerDurabilityTest : public ::testing::Test {
  protected:
+  static void SetUpTestSuite() {
+    // Debug-sync's process-wide enabled bit is cached on first use. Keep the
+    // facility enabled so an individual test can arm wal.after_encode after an
+    // earlier group has already passed it.
+    ::setenv("LINEAIRDB_DEBUG_SYNC_KEEPS_THE_FACILITY_ARMED", "sleep:0", 1);
+  }
+
   void SetUp() override {
     std::string pattern =
         (std::filesystem::temp_directory_path() / "lineairdb_logger_XXXXXX")
@@ -48,6 +55,7 @@ class LoggerDurabilityTest : public ::testing::Test {
   }
 
   void TearDown() override {
+    ::unsetenv("LINEAIRDB_DEBUG_SYNC_WAL_AFTER_ENCODE");
     std::error_code ec;
     std::filesystem::remove_all(root_, ec);
   }
@@ -178,6 +186,96 @@ TEST_F(LoggerDurabilityTest, SyncAcknowledgementFollowsTheFdatasync) {
   committer.get();
   EXPECT_EQ(logger.GetDurableEpoch(), 3u);
   logger.StopAndDrainFlusher();
+}
+
+TEST_F(LoggerDurabilityTest, NextGroupIsEncodedWhilePreviousFdatasyncWaits) {
+  std::mutex mutex;
+  std::condition_variable held;
+  bool first_inside_fdatasync = false;
+  bool release_first          = false;
+  size_t sync_calls           = 0;
+
+  WalIo io                 = WalIo::Posix();
+  auto posix_fdatasync     = io.fdatasync;
+  io.fdatasync = [&](int fd) {
+    {
+      std::unique_lock<std::mutex> lock(mutex);
+      ++sync_calls;
+      if (sync_calls == 1) {
+        first_inside_fdatasync = true;
+        held.notify_all();
+        held.wait(lock, [&] { return release_first; });
+      }
+    }
+    return posix_fdatasync(fd);
+  };
+
+  int encoded_arrived[2];
+  int release_encode[2];
+  ASSERT_EQ(::pipe(encoded_arrived), 0);
+  ASSERT_EQ(::pipe(release_encode), 0);
+
+  Logger logger(config_, io);
+  ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::Ok);
+  logger.StartFlusher();
+  ASSERT_TRUE(logger.Enqueue(MakeWriteSet("first"), 3));
+  logger.ScheduleFlush(3);
+
+  bool first_was_held = false;
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    first_was_held = held.wait_for(
+        lock, kTestTimeout, [&] { return first_inside_fdatasync; });
+  }
+  if (!first_was_held) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      release_first = true;
+    }
+    held.notify_all();
+    logger.StopAndDrainFlusher();
+    FAIL() << "the first group never entered fdatasync";
+  }
+
+  const std::string action =
+      "arrive_and_wait:" + std::to_string(encoded_arrived[1]) + ":" +
+      std::to_string(release_encode[0]);
+  ASSERT_EQ(::setenv("LINEAIRDB_DEBUG_SYNC_WAL_AFTER_ENCODE", action.c_str(), 1),
+            0);
+
+  auto saw_second_encode = std::async(std::launch::async, [&] {
+    char byte = 0;
+    return ::read(encoded_arrived[0], &byte, 1);
+  });
+  ASSERT_TRUE(logger.Enqueue(MakeWriteSet("second"), 4));
+  logger.ScheduleFlush(4);
+
+  // This is the property under test: group 4 reaches the end of encode while
+  // group 3 is still held inside fdatasync.
+  const bool overlapped =
+      saw_second_encode.wait_for(kTestTimeout) == std::future_status::ready;
+
+  // Release both stages even when the assertion is going to fail, so a broken
+  // pipeline reports a test failure rather than hanging the fixture destructor.
+  EXPECT_EQ(::write(release_encode[1], "r", 1), 1);
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    release_first = true;
+  }
+  held.notify_all();
+
+  ASSERT_EQ(saw_second_encode.wait_for(kTestTimeout),
+            std::future_status::ready);
+  EXPECT_EQ(saw_second_encode.get(), 1);
+  EXPECT_TRUE(overlapped);
+  EXPECT_EQ(logger.WaitUntilDurable(4, Logger::Deadline::max()),
+            Logger::WaitResult::Durable);
+  logger.StopAndDrainFlusher();
+
+  for (int fd : {encoded_arrived[0], encoded_arrived[1], release_encode[0],
+                 release_encode[1]}) {
+    ::close(fd);
+  }
 }
 
 // Only Sync pays for the wait, and only for a transaction that left a record.

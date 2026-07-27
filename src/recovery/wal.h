@@ -7,6 +7,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <vector>
 
 #include "log_record.h"
 #include "types/definitions.h"
@@ -54,6 +55,22 @@ struct WalScanResult {
 struct WalAppendResult {
   bool ok{true};
   int error_number{0};
+};
+
+/**
+ * An immutable group between the CPU preparation stage and the ordered I/O
+ * stage. The timing fields travel with the bytes so the two stages can overlap
+ * without sharing a mutable trace row.
+ */
+struct WalEncodedGroup {
+  std::vector<uint8_t> bytes;
+  uint32_t epoch_count{0};
+  int64_t encode_begin{0};
+  int64_t encode_end{0};
+  int64_t write_begin{0};
+  int64_t write_end{0};
+  int64_t sync_begin{0};
+  int64_t sync_end{0};
 };
 
 /**
@@ -142,6 +159,21 @@ class Wal {
    */
   WalAppendResult AppendGroup(const std::map<EpochNumber, LogRecords>& buckets,
                              EpochNumber target);
+
+  /**
+   * Serialises the eligible buckets without touching the file. The resulting
+   * bytes own all state needed by AppendEncodedGroup, so this work may run while
+   * the previous group is waiting in fdatasync.
+   */
+  WalAppendResult EncodeGroup(
+      const std::map<EpochNumber, LogRecords>& buckets, EpochNumber target,
+      WalEncodedGroup* encoded) const;
+
+  /**
+   * Writes and synchronises one previously encoded group. Calls are ordered and
+   * made by one I/O thread; an empty group succeeds without issuing I/O.
+   */
+  WalAppendResult AppendEncodedGroup(WalEncodedGroup* encoded);
 
   const std::string& path() const { return path_; }
 

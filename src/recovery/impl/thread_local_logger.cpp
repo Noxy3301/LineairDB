@@ -27,6 +27,7 @@
 
 #include "recovery/flush_trace.h"
 #include "types/definitions.h"
+#include "util/debug_sync.hpp"
 
 namespace LineairDB {
 namespace Recovery {
@@ -97,8 +98,14 @@ WalScanResult ThreadLocalLogger::ScanAndRepairWal() {
 }
 
 void ThreadLocalLogger::StartFlusher() {
+  assert(!preparer_.joinable());
   assert(!flusher_.joinable());
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    prepared_through_ = read_durable_();
+  }
   flusher_ = std::thread([this]() { FlusherLoop(); });
+  preparer_ = std::thread([this]() { PreparerLoop(); });
 }
 
 void ThreadLocalLogger::ScheduleFlush(EpochNumber closed) {
@@ -113,7 +120,10 @@ void ThreadLocalLogger::ScheduleFlush(EpochNumber closed) {
   // The hand-over is timed before the flusher is woken and recorded after, so
   // the census never sits between the state change and the notification.
   const int64_t close_exit = traced ? FlushTrace::Now() : 0;
-  work_cv_.notify_one();
+  // The preparer and the I/O stage share this condition variable. A closed
+  // target is work only for the preparer, so notify_one could wake the I/O
+  // waiter, have it reject the predicate, and leave the preparer asleep.
+  work_cv_.notify_all();
   if (traced) trace.EpochClosed(closed, close_enter, close_exit);
 }
 
@@ -128,59 +138,136 @@ void ThreadLocalLogger::StopAndDrainFlusher() {
     stop_requested_ = true;
   }
   work_cv_.notify_all();
+  if (preparer_.joinable()) preparer_.join();
   if (flusher_.joinable()) flusher_.join();
 }
 
-void ThreadLocalLogger::FlusherLoop() {
+void ThreadLocalLogger::Fail(int error_number) {
+  bool first_failure = false;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (!failed_) {
+      failed_       = true;
+      first_failure = true;
+    }
+  }
+  work_cv_.notify_all();
+  if (first_failure) publish_failure_(error_number);
+}
+
+void ThreadLocalLogger::PreparerLoop() {
   for (;;) {
     EpochNumber target = 0;
+    EpochNumber prepared_before = 0;
     {
       std::unique_lock<std::mutex> lock(state_mutex_);
       work_cv_.wait(lock, [this] {
-        return stop_requested_ || failed_ ||
-               pending_closed_ > read_durable_();
+        return failed_ ||
+               (!prepared_.has_value() &&
+                pending_closed_ > prepared_through_) ||
+               (stop_requested_ && pending_closed_ <= prepared_through_);
       });
       if (failed_) return;
-      target = pending_closed_;
-      const bool nothing_to_do = target <= read_durable_();
-      // Stop only once everything already closed is on the device, so a clean
-      // shutdown does not drop records the tick had handed over.
-      if (stop_requested_ && nothing_to_do) return;
-      if (nothing_to_do) continue;
+      if (stop_requested_ && pending_closed_ <= prepared_through_) {
+        preparer_done_ = true;
+        lock.unlock();
+        work_cv_.notify_all();
+        return;
+      }
+      assert(!prepared_.has_value());
+      target          = pending_closed_;
+      prepared_before = prepared_through_;
     }
 
-    // The file and the per-node buffers are touched with no lock held, so a
-    // committing thread never waits behind serialization or fdatasync.
+    PreparedFlush prepared;
     WalAppendResult result;
     try {
-      result = FlushThrough(target);
+      result = PrepareThrough(target, prepared_before, &prepared);
     } catch (const std::exception& e) {
-      SPDLOG_CRITICAL("Durability Error: the flusher threw: {0}", e.what());
+      SPDLOG_CRITICAL("Durability Error: the WAL preparer threw: {0}", e.what());
       result = {false, EIO};
     } catch (...) {
-      SPDLOG_CRITICAL("Durability Error: the flusher threw");
+      SPDLOG_CRITICAL("Durability Error: the WAL preparer threw");
       result = {false, EIO};
     }
 
     if (!result.ok) {
-      {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        failed_ = true;
-      }
-      publish_failure_(result.error_number);
+      Fail(result.error_number);
       return;
     }
-    auto& trace                 = FlushTrace::Instance();
-    const bool traced           = trace.Enabled();
-    const int64_t publish_enter = traced ? FlushTrace::Now() : 0;
-    publish_durable_(target);
-    if (traced) trace.GroupPublish(target, publish_enter, FlushTrace::Now());
+
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (failed_) return;
+      assert(!prepared_.has_value());
+      prepared_         = std::move(prepared);
+      prepared_through_ = target;
+    }
+    work_cv_.notify_all();
   }
 }
 
-WalAppendResult ThreadLocalLogger::FlushThrough(EpochNumber target) {
+void ThreadLocalLogger::FlusherLoop() {
+  for (;;) {
+    PreparedFlush prepared;
+    {
+      std::unique_lock<std::mutex> lock(state_mutex_);
+      work_cv_.wait(lock, [this] {
+        return failed_ || prepared_.has_value() || preparer_done_;
+      });
+      if (failed_) return;
+      if (!prepared_.has_value()) {
+        assert(preparer_done_);
+        return;
+      }
+      prepared = std::move(*prepared_);
+      prepared_.reset();
+    }
+    // The queue slot is free before I/O starts. This is the overlap: the
+    // preparer may now collect and encode the next closed target while this
+    // thread remains blocked in fdatasync.
+    work_cv_.notify_all();
+
+    WalAppendResult result;
+    try {
+      result = wal_.AppendEncodedGroup(&prepared.encoded);
+    } catch (const std::exception& e) {
+      SPDLOG_CRITICAL("Durability Error: the WAL I/O stage threw: {0}", e.what());
+      result = {false, EIO};
+    } catch (...) {
+      SPDLOG_CRITICAL("Durability Error: the WAL I/O stage threw");
+      result = {false, EIO};
+    }
+    if (!result.ok) {
+      Fail(result.error_number);
+      return;
+    }
+
+    auto& trace = FlushTrace::Instance();
+    if (trace.Enabled()) {
+      prepared.trace.write_begin = prepared.encoded.write_begin;
+      prepared.trace.write_end   = prepared.encoded.write_end;
+      prepared.trace.sync_begin  = prepared.encoded.sync_begin;
+      prepared.trace.sync_end    = prepared.encoded.sync_end;
+    }
+    const bool traced           = trace.Enabled();
+    const int64_t publish_enter = traced ? FlushTrace::Now() : 0;
+    publish_durable_(prepared.target);
+    if (traced) {
+      trace.GroupPublish(std::move(prepared.trace), prepared.target,
+                         publish_enter, FlushTrace::Now());
+    }
+  }
+}
+
+WalAppendResult ThreadLocalLogger::PrepareThrough(
+    EpochNumber target, EpochNumber prepared_before,
+    PreparedFlush* prepared) {
+  assert(prepared != nullptr);
   const EpochNumber durable_before = read_durable_();
-  FlushTrace::Instance().GroupCollectBegin(durable_before);
+  auto& trace                       = FlushTrace::Instance();
+  prepared->target                  = target;
+  prepared->trace                   = trace.GroupBegin(durable_before);
 
   nodes_.ForEach([&](ThreadLocalStorageNode* node) {
     LogRecords swapped;
@@ -189,28 +276,34 @@ WalAppendResult ThreadLocalLogger::FlushThrough(EpochNumber target) {
       swapped.swap(node->log_records);
     }
     for (auto& record : swapped) {
-      if (record.epoch <= durable_before) {
+      if (record.epoch <= prepared_before) {
         // A producer publishes OFFLINE only after Enqueue returns, so an epoch
-        // the writer has already closed cannot gain a record afterwards.
-        // Reaching here means the closure the durability contract rests on is
-        // broken, and continuing would acknowledge a record that is not on the
-        // device.
+        // already handed to the I/O stage cannot gain a record afterwards. In
+        // the pipelined design that target may not be durable yet, which is why
+        // this check uses the prepared frontier rather than the published one.
         SPDLOG_CRITICAL(
             "Durability Error: a record for epoch {0} arrived after {1} was "
-            "reported durable",
-            record.epoch, durable_before);
+            "prepared for WAL I/O",
+            record.epoch, prepared_before);
         std::abort();
       }
       carry_[record.epoch].emplace_back(std::move(record));
     }
   });
 
-  FlushTrace::Instance().GroupCollectEnd();
+  if (trace.Enabled()) prepared->trace.collect_end = FlushTrace::Now();
 
-  const auto result = wal_.AppendGroup(carry_, target);
+  const auto result = wal_.EncodeGroup(carry_, target, &prepared->encoded);
   if (!result.ok) return result;
-  // Buckets above the target stay for the next group; the ones just written are
-  // the only ones dropped.
+  if (trace.Enabled()) {
+    prepared->trace.encode_begin  = prepared->encoded.encode_begin;
+    prepared->trace.encode_end    = prepared->encoded.encode_end;
+    prepared->trace.encoded_bytes = prepared->encoded.bytes.size();
+    prepared->trace.epoch_count   = prepared->encoded.epoch_count;
+  }
+  LINEAIRDB_DEBUG_SYNC("wal.after_encode");
+  // Buckets above the target stay for the next group; the encoded bytes now own
+  // everything removed here until the I/O stage either syncs them or fail-stops.
   carry_.erase(carry_.begin(), carry_.upper_bound(target));
   return result;
 }

@@ -22,8 +22,10 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <thread>
 
+#include "recovery/flush_trace.h"
 #include "recovery/log_record.h"
 #include "recovery/logger_base.h"
 #include "recovery/wal.h"
@@ -34,14 +36,16 @@ namespace LineairDB {
 namespace Recovery {
 
 /**
- * Buffers log records per producing thread and writes them from one dedicated
- * flusher thread.
+ * Buffers log records per producing thread and drains them through two ordered
+ * stages: one preparer and one WAL I/O thread.
  *
  * Producers never touch the file: a committing thread appends to its own
- * thread-local vector under a short lock and leaves. The flusher swaps those
- * vectors, buckets the records by epoch, and writes one group per fdatasync.
+ * thread-local vector under a short lock and leaves. The preparer swaps those
+ * vectors, buckets and encodes the records by epoch, then hands immutable bytes
+ * to the I/O stage. The queue has depth one: group N+1 can be prepared while
+ * group N waits in fdatasync, but writes and publication remain strictly ordered.
  *
- * The flusher gets its own thread rather than a slot in the shared pool because
+ * The stages get their own threads rather than slots in the shared pool because
  * a pool worker only serves the no-steal queue that carries visibility
  * callbacks when its work queue is empty; a flusher that always has a group
  * ready would postpone those callbacks indefinitely, and with them Fence.
@@ -69,13 +73,23 @@ class ThreadLocalLogger final : public LoggerBase {
     LogRecords log_records;
   };
 
+  struct PreparedFlush {
+    EpochNumber target{0};
+    WalEncodedGroup encoded;
+    FlushTrace::GroupRow trace;
+  };
+
+  void PreparerLoop();
   void FlusherLoop();
-  /** Swaps every node's buffer, buckets by epoch, writes buckets <= target. */
-  WalAppendResult FlushThrough(EpochNumber target);
+  /** Swaps every node's buffer, buckets by epoch, and encodes buckets <= target. */
+  WalAppendResult PrepareThrough(EpochNumber target,
+                                 EpochNumber prepared_before,
+                                 PreparedFlush* prepared);
+  void Fail(int error_number);
 
   ThreadKeyStorage<ThreadLocalStorageNode> nodes_;
 
-  // Owned by the flusher thread alone, between StartFlusher and the join.
+  // Owned by the preparer thread alone, between StartFlusher and the join.
   std::map<EpochNumber, LogRecords> carry_;
   Wal wal_;
 
@@ -86,8 +100,12 @@ class ThreadLocalLogger final : public LoggerBase {
   std::mutex state_mutex_;
   std::condition_variable work_cv_;
   EpochNumber pending_closed_{0};
+  EpochNumber prepared_through_{0};
   bool stop_requested_{false};
   bool failed_{false};
+  bool preparer_done_{false};
+  std::optional<PreparedFlush> prepared_;
+  std::thread preparer_;
   std::thread flusher_;
 };
 
