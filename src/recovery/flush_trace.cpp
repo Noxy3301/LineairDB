@@ -153,7 +153,7 @@ void FlushTrace::Dump() {
     if (std::fprintf(file,
                      "seq,durable_before,target,encoded_bytes,epoch_count,"
                      "collect_begin,collect_end,encode_begin,encode_end,"
-                     "write_begin,write_end,sync_begin,sync_end,"
+                     "io_begin,write_begin,write_end,sync_begin,sync_end,"
                      "publish_enter,publish_exit\n") < 0) {
       return false;
     }
@@ -162,12 +162,14 @@ void FlushTrace::Dump() {
       if (std::fprintf(file,
                        "%" PRIu64 ",%u,%u,%" PRIu64 ",%u,%" PRId64 ",%" PRId64
                        ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64
-                       ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "\n",
+                       ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64
+                       ",%" PRId64 "\n",
                        row.seq, row.durable_before, row.target,
                        row.encoded_bytes, row.epoch_count, row.collect_begin,
                        row.collect_end, row.encode_begin, row.encode_end,
-                       row.write_begin, row.write_end, row.sync_begin,
-                       row.sync_end, row.publish_enter, row.publish_exit) < 0) {
+                       row.io_begin, row.write_begin, row.write_end,
+                       row.sync_begin, row.sync_end, row.publish_enter,
+                       row.publish_exit) < 0) {
         return false;
       }
     }

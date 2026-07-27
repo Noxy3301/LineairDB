@@ -228,6 +228,8 @@ void ThreadLocalLogger::FlusherLoop() {
     // thread remains blocked in fdatasync.
     work_cv_.notify_all();
 
+    auto& trace = FlushTrace::Instance();
+    if (trace.Enabled()) prepared.trace.io_begin = FlushTrace::Now();
     WalAppendResult result;
     try {
       result = wal_.AppendEncodedGroup(&prepared.encoded);
@@ -243,7 +245,6 @@ void ThreadLocalLogger::FlusherLoop() {
       return;
     }
 
-    auto& trace = FlushTrace::Instance();
     if (trace.Enabled()) {
       prepared.trace.write_begin = prepared.encoded.write_begin;
       prepared.trace.write_end   = prepared.encoded.write_end;

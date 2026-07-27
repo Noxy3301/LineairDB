@@ -75,10 +75,11 @@ class FlushTrace {
    * because the flusher still publishes the target it was given; an analysis
    * that reads write or sync durations has to drop those rows.
    *
-   * The interval between `encode_end` and `write_begin` holds the capacity
-   * check, which extends and initialises the log when it is outgrown; that work
-   * is deliberately outside every named phase so that `write` means the group's
-   * own write and nothing else.
+   * `encode_end` to `io_begin` is time in the bounded stage queue. The interval
+   * between `io_begin` and `write_begin` holds the capacity check, which extends
+   * and initialises the log when it is outgrown; that work is deliberately
+   * outside every named phase so that `write` means the group's own write and
+   * nothing else.
    */
   struct GroupRow {
     uint64_t seq;
@@ -90,6 +91,7 @@ class FlushTrace {
     int64_t collect_end;
     int64_t encode_begin;
     int64_t encode_end;
+    int64_t io_begin;
     int64_t write_begin;
     int64_t write_end;
     int64_t sync_begin;
