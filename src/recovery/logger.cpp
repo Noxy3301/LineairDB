@@ -100,9 +100,31 @@ WriteSetType BuildRecoverySet(const LogRecords& records) {
     std::vector<std::string> primary_keys;
   };
 
+  struct PrimaryKey {
+    std::string table_name;
+    std::string index_name;
+    std::string key;
+    bool operator==(const PrimaryKey& rhs) const {
+      return table_name == rhs.table_name && index_name == rhs.index_name &&
+             key == rhs.key;
+    }
+  };
+  struct PrimaryKeyHash {
+    size_t operator()(const PrimaryKey& key) const {
+      const std::hash<std::string> hasher;
+      size_t seed = hasher(key.table_name);
+      seed ^= hasher(key.index_name) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+      seed ^= hasher(key.key) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+      return seed;
+    }
+  };
+
   std::unordered_map<SecondaryOpKey, SecondaryOpState, SecondaryOpKeyHash>
       secondary_latest;
   WriteSetType recovery_set;
+  // Where each key already sits in the set. A search of the set per record
+  // would cost the size of the database for every record in the log.
+  std::unordered_map<PrimaryKey, size_t, PrimaryKeyHash> placed;
 
   for (const auto& log_record : records) {
     for (const auto& kvp : log_record.key_value_pairs) {
@@ -136,33 +158,30 @@ WriteSetType BuildRecoverySet(const LogRecords& records) {
           kvp.buffer.empty()
               ? nullptr
               : reinterpret_cast<const std::byte*>(kvp.buffer.data());
-      bool not_found = true;
-      for (auto& item : recovery_set) {
-        if (item.key == kvp.key && item.table_name == kvp.table_name &&
-            item.index_name == kvp.index_name) {
-          not_found = false;
-          if (item.data_item_copy.transaction_id.load() < kvp.tid) {
-            item.data_item_copy.Reset(value_ptr, kvp.buffer.size(), kvp.tid);
-            item.table_name = kvp.table_name;
-            item.index_name = kvp.index_name;
-            item.index_type =
-                Index::SecondaryIndexType::FromRaw(kvp.index_type);
-          }
+      PrimaryKey place{kvp.table_name, kvp.index_name, kvp.key};
+      auto placed_it = placed.find(place);
+      if (placed_it != placed.end()) {
+        auto& item = recovery_set[placed_it->second];
+        if (item.data_item_copy.transaction_id.load() < kvp.tid) {
+          item.data_item_copy.Reset(value_ptr, kvp.buffer.size(), kvp.tid);
+          item.table_name = kvp.table_name;
+          item.index_name = kvp.index_name;
+          item.index_type = Index::SecondaryIndexType::FromRaw(kvp.index_type);
         }
+        continue;
       }
-      if (not_found) {
-        Snapshot snapshot = {
-            kvp.key,
-            reinterpret_cast<const std::byte*>(kvp.buffer.data()),
-            kvp.buffer.size(),
-            nullptr,
-            kvp.table_name,
-            kvp.index_name,
-            kvp.tid,
-            Index::SecondaryIndexType::FromRaw(kvp.index_type),
-        };
-        recovery_set.emplace_back(std::move(snapshot));
-      }
+      Snapshot snapshot = {
+          kvp.key,
+          reinterpret_cast<const std::byte*>(kvp.buffer.data()),
+          kvp.buffer.size(),
+          nullptr,
+          kvp.table_name,
+          kvp.index_name,
+          kvp.tid,
+          Index::SecondaryIndexType::FromRaw(kvp.index_type),
+      };
+      recovery_set.emplace_back(std::move(snapshot));
+      placed.emplace(std::move(place), recovery_set.size() - 1);
     }
   }
 
