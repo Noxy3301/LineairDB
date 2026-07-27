@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <cinttypes>
 #include <functional>
 
@@ -128,7 +129,16 @@ void FlushTrace::Dump() {
   // because the counts are read one after another.  Storage never grows, so rows
   // below a count are settled even while the threads that own them keep writing
   // above it.
-  const uint64_t groups = group_count_.load(std::memory_order_acquire);
+  const uint64_t group_reservations = std::min<uint64_t>(
+      next_group_seq_.load(std::memory_order_acquire), kGroupCapacity);
+  std::vector<uint64_t> group_indices;
+  group_indices.reserve(group_reservations);
+  for (uint64_t i = 0; i < group_reservations; ++i) {
+    if (group_ready_[i].load(std::memory_order_acquire)) {
+      group_indices.emplace_back(i);
+    }
+  }
+  const uint64_t groups = group_indices.size();
   const uint64_t closes = close_count_.load(std::memory_order_acquire);
   std::vector<uint64_t> commit_counts(kMaxSlots);
   uint64_t commit_rows = 0;
@@ -151,19 +161,19 @@ void FlushTrace::Dump() {
 
   complete &= WriteFile(stem + "_groups.csv", [&](FILE* file) {
     if (std::fprintf(file,
-                     "seq,durable_before,target,encoded_bytes,epoch_count,"
+                     "seq,lane,durable_before,target,encoded_bytes,epoch_count,"
                      "collect_begin,collect_end,encode_begin,encode_end,"
                      "write_begin,write_end,sync_begin,sync_end,"
                      "publish_enter,publish_exit\n") < 0) {
       return false;
     }
-    for (uint64_t i = 0; i < groups; ++i) {
+    for (const uint64_t i : group_indices) {
       const GroupRow& row = groups_[i];
       if (std::fprintf(file,
-                       "%" PRIu64 ",%u,%u,%" PRIu64 ",%u,%" PRId64 ",%" PRId64
+                       "%" PRIu64 ",%u,%u,%u,%" PRIu64 ",%u,%" PRId64 ",%" PRId64
                        ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64
                        ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "\n",
-                       row.seq, row.durable_before, row.target,
+                       row.seq, row.lane, row.durable_before, row.target,
                        row.encoded_bytes, row.epoch_count, row.collect_begin,
                        row.collect_end, row.encode_begin, row.encode_end,
                        row.write_begin, row.write_end, row.sync_begin,

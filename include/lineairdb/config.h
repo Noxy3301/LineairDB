@@ -146,10 +146,11 @@ struct Config {
    * @brief
    * How much of the write-ahead log is made writable in place at a time.
    *
-   * The log file is written out with zeroes to this size before any record lands
-   * in it, and records are then written in place. A log that grows past it is
-   * extended by the same amount again, so this is a granularity rather than a
-   * limit.
+   * With one WAL lane, the log file is written out with zeroes to this size
+   * before any record lands in it, and records are then written in place. With
+   * several lanes this is an aggregate budget divided evenly across their files.
+   * A lane that grows past its share is extended by that share again, so this is
+   * a granularity rather than a limit.
    *
    * The point is what a commit's fdatasync has to persist. Writing past the end
    * of a file can add size, allocation, or extent-state metadata to the group
@@ -177,6 +178,18 @@ struct Config {
    * Default: 64 MiB
    */
   uint64_t wal_initial_capacity_bytes = 64ull * 1024ull * 1024ull;
+
+  /**
+   * @brief
+   * Number of independent WAL files and flusher threads.
+   *
+   * A producer thread is assigned to one lane. Each lane batches and syncs its
+   * own file, while the acknowledgement frontier is the minimum epoch processed
+   * by every lane. One preserves the ordinary single-WAL layout.
+   *
+   * Default: 1
+   */
+  size_t wal_lane_count = 1;
 
   /**
    * @brief

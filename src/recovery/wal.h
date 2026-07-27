@@ -112,9 +112,13 @@ class Wal {
    * `kNoPreallocation` leaves the file to grow as it is written, which is what the
    * Volatile contract is given: it writes no record at all, so reserving would
    * occupy the space for nothing.
+   *
+   * `file_name` selects this WAL instance's file within `work_dir`. It must be
+   * one path component; the default keeps the original `wal.log` layout.
    */
   Wal(const std::string& work_dir, WalIo io = WalIo::Posix(),
-      uint64_t initial_capacity_bytes = kDefaultCapacityBytes);
+      uint64_t initial_capacity_bytes = kDefaultCapacityBytes,
+      const std::string& file_name = "wal.log");
   ~Wal();
 
   Wal(const Wal&) = delete;

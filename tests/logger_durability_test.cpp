@@ -2,6 +2,8 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -178,6 +180,116 @@ TEST_F(LoggerDurabilityTest, SyncAcknowledgementFollowsTheFdatasync) {
   committer.get();
   EXPECT_EQ(logger.GetDurableEpoch(), 3u);
   logger.StopAndDrainFlusher();
+}
+
+TEST_F(LoggerDurabilityTest, WalLanesSyncInParallelBeforePublishingTheMinimum) {
+  config_.commit_durability = LineairDB::Config::CommitDurability::Sync;
+  config_.wal_lane_count = 2;
+
+  std::atomic<int> active{0};
+  std::atomic<int> maximum_active{0};
+  std::atomic<int> entered{0};
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+
+  WalIo io = WalIo::Posix();
+  auto posix_fdatasync = io.fdatasync;
+  io.fdatasync = [&](int fd) {
+    const int now = active.fetch_add(1) + 1;
+    int previous = maximum_active.load();
+    while (previous < now &&
+           !maximum_active.compare_exchange_weak(previous, now)) {
+    }
+    const int arrivals = entered.fetch_add(1) + 1;
+    {
+      std::unique_lock<std::mutex> lock(gate_mutex);
+      if (arrivals == 2) gate_cv.notify_all();
+      if (!gate_cv.wait_for(lock, kTestTimeout,
+                            [&] { return entered.load() >= 2; })) {
+        active.fetch_sub(1);
+        errno = ETIMEDOUT;
+        return -1;
+      }
+    }
+    const int result = posix_fdatasync(fd);
+    active.fetch_sub(1);
+    return result;
+  };
+
+  {
+    Logger logger(config_, io);
+    ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::Ok);
+    logger.StartFlusher();
+
+    bool first_enqueued = false;
+    bool second_enqueued = false;
+    std::thread first([&] {
+      first_enqueued = logger.Enqueue(MakeWriteSet("alice"), 3);
+    });
+    std::thread second([&] {
+      second_enqueued = logger.Enqueue(MakeWriteSet("bob"), 3);
+    });
+    first.join();
+    second.join();
+    ASSERT_TRUE(first_enqueued);
+    ASSERT_TRUE(second_enqueued);
+
+    logger.ScheduleFlush(3);
+    EXPECT_EQ(logger.WaitUntilDurable(3, Logger::Deadline::max()),
+              Logger::WaitResult::Durable);
+    EXPECT_EQ(logger.GetDurableEpoch(), 3u);
+    EXPECT_EQ(entered.load(), 2);
+    EXPECT_EQ(maximum_active.load(), 2);
+    logger.StopAndDrainFlusher();
+  }
+
+  EXPECT_TRUE(std::filesystem::exists(config_.work_dir + "/wal.log"));
+  EXPECT_TRUE(std::filesystem::exists(config_.work_dir + "/wal.1.log"));
+
+  Logger reopened(config_);
+  const auto recovered = reopened.Recover();
+  ASSERT_EQ(recovered.status, Logger::RecoveryStatus::Ok);
+  EXPECT_EQ(recovered.frontier, 3u);
+  ASSERT_EQ(recovered.recovery_set.size(), 2u);
+  std::vector<std::string> keys;
+  for (const auto& snapshot : recovered.recovery_set) {
+    keys.emplace_back(snapshot.key);
+  }
+  std::sort(keys.begin(), keys.end());
+  EXPECT_EQ(keys, (std::vector<std::string>{"alice", "bob"}));
+}
+
+TEST_F(LoggerDurabilityTest, AnEmptyLaneAdvancesWithoutAnotherFdatasync) {
+  config_.wal_lane_count = 2;
+  std::atomic<int> sync_calls{0};
+  WalIo io = WalIo::Posix();
+  auto posix_fdatasync = io.fdatasync;
+  io.fdatasync = [&](int fd) {
+    sync_calls.fetch_add(1);
+    return posix_fdatasync(fd);
+  };
+
+  Logger logger(config_, io);
+  ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::Ok);
+  logger.StartFlusher();
+  ASSERT_TRUE(logger.Enqueue(MakeWriteSet("alice"), 5));
+  logger.ScheduleFlush(5);
+  EXPECT_EQ(logger.WaitUntilDurable(5, Logger::Deadline::max()),
+            Logger::WaitResult::Durable);
+  EXPECT_EQ(sync_calls.load(), 1);
+  logger.StopAndDrainFlusher();
+}
+
+TEST_F(LoggerDurabilityTest, ShrinkingTheLaneCountRefusesToIgnoreAFile) {
+  config_.wal_lane_count = 2;
+  {
+    Logger logger(config_);
+    ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::Ok);
+  }
+  ASSERT_TRUE(std::filesystem::exists(config_.work_dir + "/wal.1.log"));
+
+  config_.wal_lane_count = 1;
+  EXPECT_THROW(Logger ignored(config_), std::runtime_error);
 }
 
 // Only Sync pays for the wait, and only for a transaction that left a record.

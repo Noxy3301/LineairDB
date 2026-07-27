@@ -18,11 +18,16 @@
 
 #include <lineairdb/config.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include "recovery/log_record.h"
 #include "recovery/logger_base.h"
@@ -34,17 +39,22 @@ namespace LineairDB {
 namespace Recovery {
 
 /**
- * Buffers log records per producing thread and writes them from one dedicated
- * flusher thread.
+ * Buffers log records per producing thread and writes them through one or more
+ * independent WAL lanes.
  *
  * Producers never touch the file: a committing thread appends to its own
- * thread-local vector under a short lock and leaves. The flusher swaps those
- * vectors, buckets the records by epoch, and writes one group per fdatasync.
+ * thread-local vector under a short lock and leaves. Each producer is assigned
+ * to one lane for its lifetime. A lane's flusher swaps only those vectors,
+ * buckets the records by epoch, and writes one group per fdatasync.
  *
- * The flusher gets its own thread rather than a slot in the shared pool because
+ * Flushers get their own threads rather than slots in the shared pool because
  * a pool worker only serves the no-steal queue that carries visibility
  * callbacks when its work queue is empty; a flusher that always has a group
  * ready would postpone those callbacks indefinitely, and with them Fence.
+ *
+ * A closed epoch becomes globally durable only after every lane has processed
+ * it. An empty lane advances without I/O; an active lane advances only after
+ * its own fdatasync.
  */
 class ThreadLocalLogger final : public LoggerBase {
  public:
@@ -64,31 +74,46 @@ class ThreadLocalLogger final : public LoggerBase {
   bool IsQuiescent() final override;
 
  private:
+  static constexpr size_t kUnassignedLane = std::numeric_limits<size_t>::max();
+
   struct ThreadLocalStorageNode {
+    std::atomic<size_t> lane_id{kUnassignedLane};
     std::mutex log_records_mutex;
     LogRecords log_records;
   };
 
-  void FlusherLoop();
-  /** Swaps every node's buffer, buckets by epoch, writes buckets <= target. */
-  WalAppendResult FlushThrough(EpochNumber target);
+  struct Lane {
+    Lane(const std::string& work_dir, WalIo io, uint64_t capacity,
+         const std::string& file_name)
+        : wal(work_dir, std::move(io), capacity, file_name) {}
+
+    std::map<EpochNumber, LogRecords> carry;
+    Wal wal;
+    std::atomic<EpochNumber> durable{0};
+    std::thread flusher;
+  };
+
+  void FlusherLoop(size_t lane_id);
+  /** Swaps this lane's node buffers, buckets by epoch, and writes through target. */
+  WalAppendResult FlushThrough(size_t lane_id, Lane& lane, EpochNumber target);
+  EpochNumber MinimumDurable() const;
+  void PublishMinimum();
 
   ThreadKeyStorage<ThreadLocalStorageNode> nodes_;
-
-  // Owned by the flusher thread alone, between StartFlusher and the join.
-  std::map<EpochNumber, LogRecords> carry_;
-  Wal wal_;
+  std::atomic<size_t> next_lane_{0};
+  std::vector<std::unique_ptr<Lane>> lanes_;
 
   PublishDurable publish_durable_;
   PublishFailure publish_failure_;
-  ReadDurable read_durable_;
+
+  std::mutex publish_mutex_;
+  EpochNumber published_durable_{0};
 
   std::mutex state_mutex_;
   std::condition_variable work_cv_;
   EpochNumber pending_closed_{0};
   bool stop_requested_{false};
   bool failed_{false};
-  std::thread flusher_;
 };
 
 }  // namespace Recovery

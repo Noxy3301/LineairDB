@@ -82,6 +82,7 @@ class FlushTrace {
    */
   struct GroupRow {
     uint64_t seq;
+    uint32_t lane;
     EpochNumber durable_before;
     EpochNumber target;
     uint64_t encoded_bytes;
@@ -135,53 +136,60 @@ class FlushTrace {
         .count();
   }
 
-  // --- Group census. Called by the flusher thread only. ---
+  // --- Group census. Called by one or more WAL flusher threads. ---
 
-  void GroupCollectBegin(EpochNumber durable_before) {
+  void GroupCollectBegin(EpochNumber durable_before, uint32_t lane = 0) {
     if (!enabled_) return;
-    current_                = GroupRow{};
-    current_.seq            = next_seq_++;
-    current_.durable_before = durable_before;
-    current_.collect_begin  = Now();
+    auto& current          = CurrentGroup();
+    current                = GroupRow{};
+    current.seq =
+        next_group_seq_.fetch_add(1, std::memory_order_relaxed);
+    current.lane           = lane;
+    current.durable_before = durable_before;
+    current.collect_begin  = Now();
   }
 
   void GroupCollectEnd() {
     if (!enabled_) return;
-    current_.collect_end = Now();
+    CurrentGroup().collect_end = Now();
   }
 
   void GroupEncode(int64_t begin, int64_t end, uint64_t bytes,
                    uint32_t epochs) {
     if (!enabled_) return;
-    current_.encode_begin  = begin;
-    current_.encode_end    = end;
-    current_.encoded_bytes = bytes;
-    current_.epoch_count   = epochs;
+    auto& current         = CurrentGroup();
+    current.encode_begin  = begin;
+    current.encode_end    = end;
+    current.encoded_bytes = bytes;
+    current.epoch_count   = epochs;
   }
 
   void GroupWrite(int64_t begin, int64_t end) {
     if (!enabled_) return;
-    current_.write_begin = begin;
-    current_.write_end   = end;
+    auto& current       = CurrentGroup();
+    current.write_begin = begin;
+    current.write_end   = end;
   }
 
   void GroupSync(int64_t begin, int64_t end) {
     if (!enabled_) return;
-    current_.sync_begin = begin;
-    current_.sync_end   = end;
+    auto& current      = CurrentGroup();
+    current.sync_begin = begin;
+    current.sync_end   = end;
   }
 
   void GroupPublish(EpochNumber target, int64_t enter, int64_t exit) {
     if (!enabled_) return;
-    current_.target        = target;
-    current_.publish_enter = enter;
-    current_.publish_exit  = exit;
-    // Storage is sized once and never grows, so a reader can take the count and
-    // walk the rows below it while this thread writes above it.
-    const uint64_t index = group_count_.load(std::memory_order_relaxed);
-    if (index < kGroupCapacity) {
-      groups_[index] = current_;
-      group_count_.store(index + 1, std::memory_order_release);
+    auto& current        = CurrentGroup();
+    current.target        = target;
+    current.publish_enter = enter;
+    current.publish_exit  = exit;
+    // The sequence reserves one immutable slot at collect time. Publication
+    // marks it ready only after every field is written, so concurrent flushers
+    // never share a row and a dump can skip groups still in flight.
+    if (current.seq < kGroupCapacity) {
+      groups_[current.seq] = current;
+      group_ready_[current.seq].store(true, std::memory_order_release);
     } else {
       group_drops_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -296,6 +304,10 @@ class FlushTrace {
       return;
     }
     groups_.resize(kGroupCapacity);
+    group_ready_.reset(new std::atomic<bool>[kGroupCapacity]);
+    for (size_t i = 0; i < kGroupCapacity; ++i) {
+      group_ready_[i].store(false, std::memory_order_relaxed);
+    }
     closes_.resize(kCloseCapacity);
     slots_.reset(new Slot[kMaxSlots]);
     for (size_t i = 0; i < kMaxSlots; ++i) slots_[i].rows.resize(kCommitCapacity);
@@ -332,6 +344,11 @@ class FlushTrace {
    */
   static uint64_t FirstFreeGeneration(const std::string& prefix, bool* usable);
 
+  static GroupRow& CurrentGroup() {
+    static thread_local GroupRow current{};
+    return current;
+  }
+
   uint64_t& ThreadState() {
     // Seeded from this thread's own storage, which is distinct per thread and
     // costs no slot. Zero marks "not yet seeded" and is a value xorshift cannot
@@ -355,10 +372,9 @@ class FlushTrace {
   bool enabled_{false};
   std::string prefix_;
 
-  GroupRow current_{};
-  uint64_t next_seq_{0};
+  std::atomic<uint64_t> next_group_seq_{0};
   std::vector<GroupRow> groups_;
-  std::atomic<uint64_t> group_count_{0};
+  std::unique_ptr<std::atomic<bool>[]> group_ready_;
   std::atomic<uint64_t> group_drops_{0};
 
   std::vector<CloseRow> closes_;

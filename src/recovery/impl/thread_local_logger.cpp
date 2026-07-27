@@ -18,10 +18,15 @@
 
 #include <errno.h>
 
+#include <algorithm>
 #include <cassert>
+#include <charconv>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <iterator>
+#include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <util/logger.hpp>
 
@@ -31,17 +36,82 @@
 namespace LineairDB {
 namespace Recovery {
 
+namespace {
+
+std::string LaneFileName(size_t lane_id) {
+  return lane_id == 0 ? "wal.log"
+                      : "wal." + std::to_string(lane_id) + ".log";
+}
+
+/**
+ * Refuses a configuration that would silently ignore an existing lane.
+ *
+ * Growing the lane count is safe: every old file is scanned and new lanes start
+ * empty at the recovered frontier. Shrinking is not, because records in a file
+ * beyond the new count would disappear from recovery.
+ */
+void RejectExcludedLaneFiles(const std::string& work_dir, size_t lane_count) {
+  const std::filesystem::path directory(work_dir);
+  if (!std::filesystem::exists(directory)) return;
+
+  constexpr std::string_view prefix = "wal.";
+  constexpr std::string_view suffix = ".log";
+  for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+    if (!entry.is_regular_file()) continue;
+    const std::string name = entry.path().filename().string();
+    if (name.size() <= prefix.size() + suffix.size() ||
+        name.compare(0, prefix.size(), prefix) != 0 ||
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+      continue;
+    }
+    const std::string_view number(
+        name.data() + prefix.size(),
+        name.size() - prefix.size() - suffix.size());
+    size_t lane_id = 0;
+    const auto [end, error] =
+        std::from_chars(number.data(), number.data() + number.size(), lane_id);
+    if (error != std::errc{} || end != number.data() + number.size() ||
+        lane_id == 0) {
+      throw std::runtime_error("unrecognised WAL lane file " +
+                               entry.path().string());
+    }
+    if (lane_id >= lane_count) {
+      throw std::runtime_error(
+          "WAL lane count " + std::to_string(lane_count) +
+          " would ignore existing " + entry.path().string());
+    }
+  }
+}
+
+}  // namespace
+
 ThreadLocalLogger::ThreadLocalLogger(const Config& config,
                                      PublishDurable publish_durable,
                                      PublishFailure publish_failure,
                                      ReadDurable read_durable, WalIo io)
-    : wal_(config.work_dir, std::move(io),
-           config.commit_durability == Config::CommitDurability::Volatile
-               ? Wal::kNoPreallocation
-               : config.wal_initial_capacity_bytes),
-      publish_durable_(std::move(publish_durable)),
-      publish_failure_(std::move(publish_failure)),
-      read_durable_(std::move(read_durable)) {
+    : publish_durable_(std::move(publish_durable)),
+      publish_failure_(std::move(publish_failure)) {
+  if (config.wal_lane_count == 0) {
+    throw std::invalid_argument("WAL lane count must be at least one");
+  }
+  RejectExcludedLaneFiles(config.work_dir, config.wal_lane_count);
+  const uint64_t total_capacity =
+      config.commit_durability == Config::CommitDurability::Volatile
+          ? Wal::kNoPreallocation
+          : config.wal_initial_capacity_bytes;
+  const uint64_t lane_capacity =
+      total_capacity == 0
+          ? 0
+          : total_capacity / config.wal_lane_count +
+                (total_capacity % config.wal_lane_count != 0 ? 1 : 0);
+  lanes_.reserve(config.wal_lane_count);
+  for (size_t lane_id = 0; lane_id < config.wal_lane_count; ++lane_id) {
+    lanes_.emplace_back(std::make_unique<Lane>(
+        config.work_dir, io, lane_capacity, LaneFileName(lane_id)));
+  }
+  // Kept in the constructor signature for LoggerBase compatibility. Lane-local
+  // frontiers, rather than the outer logger's minimum, govern late records.
+  (void)read_durable;
   LineairDB::Util::SetUpSPDLog();
 }
 
@@ -87,18 +157,58 @@ bool ThreadLocalLogger::Enqueue(const WriteSetType& ws_ref, EpochNumber epoch) {
   if (record.key_value_pairs.empty()) return false;
 
   auto* node = nodes_.Get();
+  size_t lane_id = node->lane_id.load(std::memory_order_acquire);
+  if (lane_id == kUnassignedLane) {
+    const size_t proposed =
+        next_lane_.fetch_add(1, std::memory_order_relaxed) % lanes_.size();
+    size_t expected = kUnassignedLane;
+    if (node->lane_id.compare_exchange_strong(
+            expected, proposed, std::memory_order_release,
+            std::memory_order_acquire)) {
+      lane_id = proposed;
+    } else {
+      lane_id = expected;
+    }
+  }
+  assert(lane_id < lanes_.size());
   std::lock_guard<std::mutex> lock(node->log_records_mutex);
   node->log_records.emplace_back(std::move(record));
   return true;
 }
 
 WalScanResult ThreadLocalLogger::ScanAndRepairWal() {
-  return wal_.ScanAndRepair();
+  WalScanResult combined;
+  for (auto& lane : lanes_) {
+    auto scanned = lane->wal.ScanAndRepair();
+    if (scanned.status != WalScanResult::Status::Ok) return scanned;
+    combined.frontier = std::max(combined.frontier, scanned.frontier);
+    combined.tail_truncated =
+        combined.tail_truncated || scanned.tail_truncated;
+    combined.records.insert(
+        combined.records.end(),
+        std::make_move_iterator(scanned.records.begin()),
+        std::make_move_iterator(scanned.records.end()));
+  }
+  std::stable_sort(combined.records.begin(), combined.records.end(),
+                   [](const LogRecord& lhs, const LogRecord& rhs) {
+                     return lhs.epoch < rhs.epoch;
+                   });
+  // Startup has now proved that every lane contains no further complete record.
+  // New epochs resume above the highest recovered one, so an old lane whose last
+  // actual frame was earlier can safely join at the common recovered frontier.
+  for (auto& lane : lanes_) {
+    lane->durable.store(combined.frontier, std::memory_order_seq_cst);
+  }
+  published_durable_ = combined.frontier;
+  return combined;
 }
 
 void ThreadLocalLogger::StartFlusher() {
-  assert(!flusher_.joinable());
-  flusher_ = std::thread([this]() { FlusherLoop(); });
+  for (size_t lane_id = 0; lane_id < lanes_.size(); ++lane_id) {
+    assert(!lanes_[lane_id]->flusher.joinable());
+    lanes_[lane_id]->flusher =
+        std::thread([this, lane_id]() { FlusherLoop(lane_id); });
+  }
 }
 
 void ThreadLocalLogger::ScheduleFlush(EpochNumber closed) {
@@ -113,13 +223,13 @@ void ThreadLocalLogger::ScheduleFlush(EpochNumber closed) {
   // The hand-over is timed before the flusher is woken and recorded after, so
   // the census never sits between the state change and the notification.
   const int64_t close_exit = traced ? FlushTrace::Now() : 0;
-  work_cv_.notify_one();
+  work_cv_.notify_all();
   if (traced) trace.EpochClosed(closed, close_enter, close_exit);
 }
 
 bool ThreadLocalLogger::IsQuiescent() {
   std::lock_guard<std::mutex> lock(state_mutex_);
-  return failed_ || pending_closed_ <= read_durable_();
+  return failed_ || pending_closed_ <= MinimumDurable();
 }
 
 void ThreadLocalLogger::StopAndDrainFlusher() {
@@ -128,21 +238,43 @@ void ThreadLocalLogger::StopAndDrainFlusher() {
     stop_requested_ = true;
   }
   work_cv_.notify_all();
-  if (flusher_.joinable()) flusher_.join();
+  for (auto& lane : lanes_) {
+    if (lane->flusher.joinable()) lane->flusher.join();
+  }
 }
 
-void ThreadLocalLogger::FlusherLoop() {
+EpochNumber ThreadLocalLogger::MinimumDurable() const {
+  EpochNumber minimum = std::numeric_limits<EpochNumber>::max();
+  for (const auto& lane : lanes_) {
+    minimum = std::min(
+        minimum, lane->durable.load(std::memory_order_seq_cst));
+  }
+  return minimum;
+}
+
+void ThreadLocalLogger::PublishMinimum() {
+  std::lock_guard<std::mutex> lock(publish_mutex_);
+  const EpochNumber minimum = MinimumDurable();
+  if (minimum <= published_durable_) return;
+  published_durable_ = minimum;
+  publish_durable_(minimum);
+}
+
+void ThreadLocalLogger::FlusherLoop(size_t lane_id) {
+  Lane& lane = *lanes_[lane_id];
   for (;;) {
     EpochNumber target = 0;
     {
       std::unique_lock<std::mutex> lock(state_mutex_);
-      work_cv_.wait(lock, [this] {
+      work_cv_.wait(lock, [this, &lane] {
         return stop_requested_ || failed_ ||
-               pending_closed_ > read_durable_();
+               pending_closed_ >
+                   lane.durable.load(std::memory_order_seq_cst);
       });
       if (failed_) return;
       target = pending_closed_;
-      const bool nothing_to_do = target <= read_durable_();
+      const bool nothing_to_do =
+          target <= lane.durable.load(std::memory_order_seq_cst);
       // Stop only once everything already closed is on the device, so a clean
       // shutdown does not drop records the tick had handed over.
       if (stop_requested_ && nothing_to_do) return;
@@ -153,7 +285,7 @@ void ThreadLocalLogger::FlusherLoop() {
     // committing thread never waits behind serialization or fdatasync.
     WalAppendResult result;
     try {
-      result = FlushThrough(target);
+      result = FlushThrough(lane_id, lane, target);
     } catch (const std::exception& e) {
       SPDLOG_CRITICAL("Durability Error: the flusher threw: {0}", e.what());
       result = {false, EIO};
@@ -163,26 +295,36 @@ void ThreadLocalLogger::FlusherLoop() {
     }
 
     if (!result.ok) {
+      bool first_failure = false;
       {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        failed_ = true;
+        if (!failed_) {
+          failed_ = true;
+          first_failure = true;
+        }
       }
-      publish_failure_(result.error_number);
+      work_cv_.notify_all();
+      if (first_failure) publish_failure_(result.error_number);
       return;
     }
     auto& trace                 = FlushTrace::Instance();
     const bool traced           = trace.Enabled();
     const int64_t publish_enter = traced ? FlushTrace::Now() : 0;
-    publish_durable_(target);
+    lane.durable.store(target, std::memory_order_seq_cst);
+    PublishMinimum();
     if (traced) trace.GroupPublish(target, publish_enter, FlushTrace::Now());
   }
 }
 
-WalAppendResult ThreadLocalLogger::FlushThrough(EpochNumber target) {
-  const EpochNumber durable_before = read_durable_();
-  FlushTrace::Instance().GroupCollectBegin(durable_before);
+WalAppendResult ThreadLocalLogger::FlushThrough(size_t lane_id, Lane& lane,
+                                                EpochNumber target) {
+  const EpochNumber durable_before =
+      lane.durable.load(std::memory_order_seq_cst);
+  FlushTrace::Instance().GroupCollectBegin(
+      durable_before, static_cast<uint32_t>(lane_id));
 
-  nodes_.ForEach([&](ThreadLocalStorageNode* node) {
+  nodes_.ForEach([&, lane_id](ThreadLocalStorageNode* node) {
+    if (node->lane_id.load(std::memory_order_acquire) != lane_id) return;
     LogRecords swapped;
     {
       std::lock_guard<std::mutex> lock(node->log_records_mutex);
@@ -201,17 +343,17 @@ WalAppendResult ThreadLocalLogger::FlushThrough(EpochNumber target) {
             record.epoch, durable_before);
         std::abort();
       }
-      carry_[record.epoch].emplace_back(std::move(record));
+      lane.carry[record.epoch].emplace_back(std::move(record));
     }
   });
 
   FlushTrace::Instance().GroupCollectEnd();
 
-  const auto result = wal_.AppendGroup(carry_, target);
+  const auto result = lane.wal.AppendGroup(lane.carry, target);
   if (!result.ok) return result;
   // Buckets above the target stay for the next group; the ones just written are
   // the only ones dropped.
-  carry_.erase(carry_.begin(), carry_.upper_bound(target));
+  lane.carry.erase(lane.carry.begin(), lane.carry.upper_bound(target));
   return result;
 }
 

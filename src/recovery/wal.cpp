@@ -16,6 +16,7 @@
 #include <limits>
 #include <memory>
 #include <msgpack.hpp>
+#include <stdexcept>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -150,10 +151,15 @@ WalIo WalIo::Posix() {
   return io;
 }
 
-Wal::Wal(const std::string& work_dir, WalIo io, uint64_t initial_capacity_bytes)
+Wal::Wal(const std::string& work_dir, WalIo io, uint64_t initial_capacity_bytes,
+         const std::string& file_name)
     : io_(std::move(io)), initial_capacity_bytes_(initial_capacity_bytes) {
   const std::filesystem::path directory(work_dir);
-  path_ = (directory / "wal.log").string();
+  if (file_name.empty() ||
+      std::filesystem::path(file_name).filename() != file_name) {
+    throw std::invalid_argument("WAL file name must be one non-empty component");
+  }
+  path_ = (directory / file_name).string();
 
   std::error_code ec;
   std::filesystem::create_directory(directory, ec);
