@@ -579,6 +579,16 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     unlocked_tids.emplace(item, unlocked);
   }
 
+  // The log snapshots were copied while the items were locked, so they carry
+  // the odd TID and, when the epoch moved under the lock, an epoch older than
+  // the commit's. Recovery installs a record's TID verbatim, so publish the
+  // value the live item now holds, as the native commit path does.
+  for (auto& snapshot : log_set) {
+    auto tid_it = unlocked_tids.find(snapshot.index_cache);
+    if (tid_it == unlocked_tids.end()) continue;
+    snapshot.data_item_copy.transaction_id.store(tid_it->second);
+  }
+
   // Phase 3.4: register slots left empty by this transaction for deferred
   // physical purge, keyed by the published unlocked TID; immediate removal
   // could free memory still visible to concurrent readers.
