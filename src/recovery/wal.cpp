@@ -16,6 +16,7 @@
 #include <limits>
 #include <memory>
 #include <msgpack.hpp>
+#include <stdexcept>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -150,8 +151,14 @@ WalIo WalIo::Posix() {
   return io;
 }
 
-Wal::Wal(const std::string& work_dir, WalIo io, uint64_t initial_capacity_bytes)
-    : io_(std::move(io)), initial_capacity_bytes_(initial_capacity_bytes) {
+Wal::Wal(const std::string& work_dir, WalIo io, uint64_t initial_capacity_bytes,
+         size_t writer_threads)
+    : io_(std::move(io)),
+      initial_capacity_bytes_(initial_capacity_bytes),
+      writer_threads_(writer_threads) {
+  if (writer_threads_ == 0) {
+    throw std::invalid_argument("WAL writer thread count must be at least one");
+  }
   const std::filesystem::path directory(work_dir);
   path_ = (directory / "wal.log").string();
 
@@ -227,9 +234,21 @@ Wal::Wal(const std::string& work_dir, WalIo io, uint64_t initial_capacity_bytes)
   // Capacity is not extended here: the region to initialise begins where the log
   // ends, and that is what ScanAndRepair establishes.
   initialised_size_ = file_stat.st_size;
+
+  try {
+    for (size_t index = 1; index < writer_threads_; ++index) {
+      writer_pool_.emplace_back([this, index] { WriterLoop(index); });
+    }
+  } catch (...) {
+    StopWriters();
+    ::close(fd_);
+    fd_ = -1;
+    throw;
+  }
 }
 
 Wal::~Wal() {
+  StopWriters();
   if (fd_ >= 0) ::close(fd_);
 }
 
@@ -266,6 +285,89 @@ bool Wal::WriteAllAt(const uint8_t* data, size_t size, off_t offset,
     return false;
   }
   return true;
+}
+
+void Wal::WriterLoop(size_t writer_index) {
+  uint64_t observed_generation = 0;
+  for (;;) {
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    off_t offset = 0;
+    {
+      std::unique_lock<std::mutex> lock(writer_mutex_);
+      writer_work_cv_.wait(lock, [&] {
+        return writer_stop_ || writer_generation_ != observed_generation;
+      });
+      if (writer_stop_) return;
+      observed_generation = writer_generation_;
+
+      // Divide without multiplying size by the index: WAL groups are bounded,
+      // but avoiding that product keeps this correct for every size_t value.
+      const size_t base = writer_size_ / writer_threads_;
+      const size_t extra = writer_size_ % writer_threads_;
+      const size_t begin =
+          base * writer_index + std::min(writer_index, extra);
+      size = base + (writer_index < extra ? 1 : 0);
+      data = writer_data_ + begin;
+      offset = writer_offset_ + static_cast<off_t>(begin);
+    }
+
+    int error = 0;
+    const bool ok = WriteAllAt(data, size, offset, &error);
+    {
+      std::lock_guard<std::mutex> lock(writer_mutex_);
+      if (!ok && writer_error_ == 0) writer_error_ = error;
+      ++writers_completed_;
+    }
+    writer_done_cv_.notify_one();
+  }
+}
+
+bool Wal::WriteGroupAt(const uint8_t* data, size_t size, off_t offset,
+                       int* error) {
+  if (writer_pool_.empty()) return WriteAllAt(data, size, offset, error);
+
+  size_t coordinator_size = 0;
+  {
+    std::lock_guard<std::mutex> lock(writer_mutex_);
+    writer_data_ = data;
+    writer_size_ = size;
+    writer_offset_ = offset;
+    writers_completed_ = 0;
+    writer_error_ = 0;
+    ++writer_generation_;
+
+    const size_t base = size / writer_threads_;
+    const size_t extra = size % writer_threads_;
+    coordinator_size = base + (extra != 0 ? 1 : 0);
+  }
+  writer_work_cv_.notify_all();
+
+  int coordinator_error = 0;
+  const bool coordinator_ok =
+      WriteAllAt(data, coordinator_size, offset, &coordinator_error);
+
+  std::unique_lock<std::mutex> lock(writer_mutex_);
+  if (!coordinator_ok && writer_error_ == 0) {
+    writer_error_ = coordinator_error;
+  }
+  writer_done_cv_.wait(
+      lock, [this] { return writers_completed_ == writer_pool_.size(); });
+  if (writer_error_ == 0) return true;
+  *error = writer_error_;
+  return false;
+}
+
+void Wal::StopWriters() {
+  {
+    std::lock_guard<std::mutex> lock(writer_mutex_);
+    writer_stop_ = true;
+  }
+  writer_work_cv_.notify_all();
+  for (auto& writer : writer_pool_) {
+    if (writer.joinable()) writer.join();
+  }
+  writer_pool_.clear();
 }
 
 bool Wal::PreadAll(uint8_t* out, size_t size, off_t offset, int* error) const {
@@ -725,7 +827,7 @@ WalAppendResult Wal::AppendGroup(
   }
 
   const int64_t write_begin = traced ? FlushTrace::Now() : 0;
-  if (!WriteAllAt(group.data(), group.size(), write_offset_, &error)) {
+  if (!WriteGroupAt(group.data(), group.size(), write_offset_, &error)) {
     state_ = State::Failed;
     return {false, error};
   }

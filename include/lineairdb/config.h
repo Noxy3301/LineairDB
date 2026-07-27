@@ -180,6 +180,19 @@ struct Config {
 
   /**
    * @brief
+   * Number of threads that write disjoint byte ranges of one WAL group.
+   *
+   * The group still belongs to one ordered coordinator and is followed by
+   * exactly one fdatasync. This setting therefore explores host-side pwrite
+   * parallelism without creating extra WAL streams or extra durability
+   * barriers. One preserves the ordinary single-writer path.
+   *
+   * Default: 1
+   */
+  size_t wal_writer_threads = 1;
+
+  /**
+   * @brief
    * True while LineairDB performs logging for recovery.
    *
    * @deprecated Derived from commit_durability, which is the setting that

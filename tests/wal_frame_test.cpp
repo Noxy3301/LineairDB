@@ -4,10 +4,13 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <mutex>
 #include <string>
 #include <system_error>
 
@@ -22,6 +25,7 @@ using LineairDB::Recovery::ComputeCrc32c;
 using LineairDB::Recovery::LogRecord;
 using LineairDB::Recovery::LogRecords;
 using LineairDB::Recovery::Wal;
+using LineairDB::Recovery::WalIo;
 using LineairDB::Recovery::WalScanResult;
 
 LogRecords MakeRecords(EpochNumber epoch, const std::string& key) {
@@ -203,6 +207,85 @@ TEST_F(WalFrameTest, GroupSkipsBucketsAboveTheTarget) {
   ASSERT_EQ(result.status, WalScanResult::Status::Ok);
   EXPECT_EQ(result.frontier, 2u);
   EXPECT_EQ(result.records.size(), 2u);
+}
+
+TEST_F(WalFrameTest, ParallelWritersMeetBeforeTheSingleFdatasync) {
+  constexpr int kWriters = 4;
+  std::atomic<int> active{0};
+  std::atomic<int> maximum_active{0};
+  std::atomic<int> entered{0};
+  std::atomic<int> sync_calls{0};
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+
+  WalIo io = WalIo::Posix();
+  io.pwrite = [&](int fd, const void* data, size_t size, off_t offset) {
+    const int now = active.fetch_add(1) + 1;
+    int previous = maximum_active.load();
+    while (previous < now &&
+           !maximum_active.compare_exchange_weak(previous, now)) {
+    }
+
+    const int arrivals = entered.fetch_add(1) + 1;
+    {
+      std::unique_lock<std::mutex> lock(gate_mutex);
+      if (arrivals == kWriters) gate_cv.notify_all();
+      gate_cv.wait(lock, [&] { return entered.load() == kWriters; });
+    }
+    const ssize_t result = ::pwrite(fd, data, size, offset);
+    active.fetch_sub(1);
+    return result;
+  };
+  io.fdatasync = [&](int fd) {
+    EXPECT_EQ(active.load(), 0);
+    sync_calls.fetch_add(1);
+    return ::fdatasync(fd);
+  };
+
+  {
+    Wal wal(work_dir_, std::move(io), kCapacity, kWriters);
+    ASSERT_EQ(wal.ScanAndRepair().status, WalScanResult::Status::Ok);
+    std::map<EpochNumber, LogRecords> buckets;
+    buckets[1] = MakeRecords(1, std::string(4096, 'k'));
+    ASSERT_TRUE(wal.AppendGroup(buckets, 1).ok);
+  }
+
+  EXPECT_EQ(entered.load(), kWriters);
+  EXPECT_EQ(maximum_active.load(), kWriters);
+  EXPECT_EQ(sync_calls.load(), 1);
+
+  Wal recovered(work_dir_, WalIo::Posix(), kCapacity);
+  const auto scan = recovered.ScanAndRepair();
+  ASSERT_EQ(scan.status, WalScanResult::Status::Ok) << scan.detail;
+  ASSERT_EQ(scan.records.size(), 1u);
+  EXPECT_EQ(scan.records[0].key_value_pairs[0].key, std::string(4096, 'k'));
+}
+
+TEST_F(WalFrameTest, AParallelWriteFailurePreventsTheGroupFdatasync) {
+  std::atomic<int> write_calls{0};
+  std::atomic<int> sync_calls{0};
+  WalIo io = WalIo::Posix();
+  io.pwrite = [&](int fd, const void* data, size_t size, off_t offset) {
+    if (write_calls.fetch_add(1) == 1) {
+      errno = EIO;
+      return static_cast<ssize_t>(-1);
+    }
+    return ::pwrite(fd, data, size, offset);
+  };
+  io.fdatasync = [&](int fd) {
+    sync_calls.fetch_add(1);
+    return ::fdatasync(fd);
+  };
+
+  Wal wal(work_dir_, std::move(io), kCapacity, 4);
+  ASSERT_EQ(wal.ScanAndRepair().status, WalScanResult::Status::Ok);
+  std::map<EpochNumber, LogRecords> buckets;
+  buckets[1] = MakeRecords(1, std::string(4096, 'k'));
+  const auto append = wal.AppendGroup(buckets, 1);
+  EXPECT_FALSE(append.ok);
+  EXPECT_EQ(append.error_number, EIO);
+  EXPECT_EQ(write_calls.load(), 4);
+  EXPECT_EQ(sync_calls.load(), 0);
 }
 
 TEST_F(WalFrameTest, TailCorruptionIsRepairedAndLaterGroupsRecover) {

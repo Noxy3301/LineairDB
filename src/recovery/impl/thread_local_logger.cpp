@@ -38,7 +38,8 @@ ThreadLocalLogger::ThreadLocalLogger(const Config& config,
     : wal_(config.work_dir, std::move(io),
            config.commit_durability == Config::CommitDurability::Volatile
                ? Wal::kNoPreallocation
-               : config.wal_initial_capacity_bytes),
+               : config.wal_initial_capacity_bytes,
+           config.wal_writer_threads),
       publish_durable_(std::move(publish_durable)),
       publish_failure_(std::move(publish_failure)),
       read_durable_(std::move(read_durable)) {

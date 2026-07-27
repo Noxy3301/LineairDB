@@ -4,9 +4,13 @@
 #include <sys/types.h>
 
 #include <cstdint>
+#include <condition_variable>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "log_record.h"
 #include "types/definitions.h"
@@ -74,7 +78,7 @@ struct WalIo {
 };
 
 /**
- * The single write-ahead log: one file of epoch frames, written by one flusher.
+ * The single write-ahead log: one file of epoch frames, ordered by one flusher.
  *
  * Frames are written in place, at an offset the instance tracks, into a region
  * whose blocks were already allocated and written out with zeroes. Letting the
@@ -114,7 +118,8 @@ class Wal {
    * occupy the space for nothing.
    */
   Wal(const std::string& work_dir, WalIo io = WalIo::Posix(),
-      uint64_t initial_capacity_bytes = kDefaultCapacityBytes);
+      uint64_t initial_capacity_bytes = kDefaultCapacityBytes,
+      size_t writer_threads = 1);
   ~Wal();
 
   Wal(const Wal&) = delete;
@@ -183,6 +188,9 @@ class Wal {
   bool EnsureCapacityFor(off_t end_of_log, size_t group_size, int* error);
   bool WriteZeroesAndSync(off_t from, off_t to, int* error);
   bool WriteAllAt(const uint8_t* data, size_t size, off_t offset, int* error);
+  bool WriteGroupAt(const uint8_t* data, size_t size, off_t offset, int* error);
+  void WriterLoop(size_t writer_index);
+  void StopWriters();
   bool PreadAll(uint8_t* out, size_t size, off_t offset, int* error) const;
 
   std::string path_;
@@ -197,6 +205,22 @@ class Wal {
    */
   off_t initialised_size_{0};
   size_t extension_count_{0};
+
+  // One is the coordinator itself. Values above one add persistent helper
+  // threads; every participant writes one disjoint range, then the coordinator
+  // issues the group's sole fdatasync after the helpers have joined the barrier.
+  size_t writer_threads_{1};
+  std::vector<std::thread> writer_pool_;
+  std::mutex writer_mutex_;
+  std::condition_variable writer_work_cv_;
+  std::condition_variable writer_done_cv_;
+  bool writer_stop_{false};
+  uint64_t writer_generation_{0};
+  const uint8_t* writer_data_{nullptr};
+  size_t writer_size_{0};
+  off_t writer_offset_{0};
+  size_t writers_completed_{0};
+  int writer_error_{0};
 };
 
 }  // namespace Recovery
