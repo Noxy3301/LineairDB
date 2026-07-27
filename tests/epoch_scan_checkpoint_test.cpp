@@ -1,0 +1,417 @@
+#include <gtest/gtest.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <future>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "lineairdb/config.h"
+#include "lineairdb/database.h"
+#include "lineairdb/stateless.h"
+#include "recovery/epoch_scan_checkpoint.h"
+#include "recovery/wal.h"
+
+namespace {
+
+constexpr const char* kTable = "__anonymous_table";
+constexpr const char* kIndex = "idx";
+constexpr auto kTestTimeout = std::chrono::seconds(10);
+
+using LineairDB::Recovery::EpochScanCheckpoint;
+using LineairDB::Recovery::Wal;
+using LineairDB::Recovery::WalScanResult;
+
+class EpochScanCheckpointTest : public ::testing::Test {
+ protected:
+  // The sync facility decides once per process whether anything is armed, so
+  // one variable stays set for every test in this binary.
+  static void SetUpTestSuite() {
+    ::setenv("LINEAIRDB_DEBUG_SYNC_KEEPS_THE_FACILITY_ARMED", "sleep:0", 1);
+  }
+
+  void SetUp() override {
+    std::string pattern =
+        (std::filesystem::temp_directory_path() / "lineairdb_ckpt_XXXXXX")
+            .string();
+    std::vector<char> buffer(pattern.begin(), pattern.end());
+    buffer.push_back('\0');
+    ASSERT_NE(::mkdtemp(buffer.data()), nullptr);
+    root_ = buffer.data();
+    work_dir_ = root_ + "/logs";
+  }
+
+  void TearDown() override {
+    for (const auto& variable : armed_) ::unsetenv(variable.c_str());
+    armed_.clear();
+    std::error_code ec;
+    std::filesystem::remove_all(root_, ec);
+  }
+
+  void Arm(const std::string& variable, const std::string& action) {
+    ::setenv(variable.c_str(), action.c_str(), 1);
+    armed_.push_back(variable);
+  }
+
+  LineairDB::Config MakeConfig(bool enable_recovery) const {
+    LineairDB::Config config;
+    config.max_thread = 1;
+    config.epoch_duration_ms = 10;
+    config.concurrency_control_protocol =
+        LineairDB::Config::ConcurrencyControl::Silo;
+    config.index_structure = LineairDB::Config::IndexStructure::Masstree;
+    config.commit_durability = LineairDB::Config::CommitDurability::Sync;
+    config.enable_checkpointing = false;
+    config.enable_recovery = enable_recovery;
+    config.work_dir = work_dir_;
+    config.wal_initial_capacity_bytes = 1ull << 20;
+    return config;
+  }
+
+  static bool CommitWrite(LineairDB::Database& db, const std::string& key,
+                          const std::string& value) {
+    const bool committed =
+        db.ValidateAndCommit({}, {{kTable, key, value, false}}, {}, {});
+    db.ReleaseMasstreeThreadEpoch();
+    return committed;
+  }
+
+  static bool CommitDelete(LineairDB::Database& db, const std::string& key) {
+    const bool committed =
+        db.ValidateAndCommit({}, {{kTable, key, "", true}}, {}, {});
+    db.ReleaseMasstreeThreadEpoch();
+    return committed;
+  }
+
+  static bool CommitIndexedWrite(LineairDB::Database& db,
+                                 const std::string& key,
+                                 const std::string& value,
+                                 const std::string& secondary_key) {
+    const bool committed = db.ValidateAndCommit(
+        {}, {{kTable, key, value, false}},
+        {{kTable, kIndex, secondary_key, key, false}}, {});
+    db.ReleaseMasstreeThreadEpoch();
+    return committed;
+  }
+
+  static LineairDB::StatelessReadResult Read(LineairDB::Database& db,
+                                             const std::string& key) {
+    auto result = db.StatelessRead(kTable, key);
+    db.ReleaseMasstreeThreadEpoch();
+    return result;
+  }
+
+  /** Every key's value, in key order, as the database currently holds it. */
+  static std::vector<std::string> ReadAll(LineairDB::Database& db) {
+    std::vector<std::string> rows;
+    for (const char* key : {"alice", "bob", "carol"}) {
+      const auto row = Read(db, key);
+      rows.emplace_back(std::string(key) + "=" + (row.found ? row.value : ""));
+    }
+    return rows;
+  }
+
+  /** The row value the image holds for `key`, if it holds one. */
+  static std::optional<std::string> RowInImage(
+      const EpochScanCheckpoint::Image& image, const std::string& key) {
+    for (const auto& record : image.records) {
+      for (const auto& kvp : record.key_value_pairs) {
+        if (!kvp.index_name.empty() || kvp.key != key) continue;
+        return kvp.buffer;
+      }
+    }
+    return std::nullopt;
+  }
+
+  /** The primary keys the image lists under a secondary key. */
+  static std::vector<std::string> IndexEntryInImage(
+      const EpochScanCheckpoint::Image& image, const std::string& key) {
+    for (const auto& record : image.records) {
+      for (const auto& kvp : record.key_value_pairs) {
+        if (kvp.index_name != kIndex || kvp.key != key) continue;
+        return kvp.primary_keys;
+      }
+    }
+    return {};
+  }
+
+  std::string image_path() const {
+    return (std::filesystem::path(work_dir_) /
+            EpochScanCheckpoint::ImageFileName())
+        .string();
+  }
+
+  std::string working_path() const {
+    return (std::filesystem::path(work_dir_) /
+            EpochScanCheckpoint::WorkingFileName())
+        .string();
+  }
+
+  std::string root_;
+  std::string work_dir_;
+  LineairDB::EpochNumber frontier_ = 0;
+
+ private:
+  std::vector<std::string> armed_;
+};
+
+TEST_F(EpochScanCheckpointTest, AnImageHoldsWhatTheScanFound) {
+  {
+    auto config = MakeConfig(false);
+    LineairDB::Database db(config);
+    ASSERT_TRUE(db.CreateSecondaryIndex(kTable, kIndex, 0));
+    ASSERT_TRUE(CommitIndexedWrite(db, "alice", "one", "s"));
+    ASSERT_TRUE(CommitIndexedWrite(db, "bob", "two", "s"));
+    ASSERT_TRUE(db.WriteCheckpointImage());
+  }
+
+  auto image = EpochScanCheckpoint::Load(work_dir_);
+  ASSERT_EQ(image.status, EpochScanCheckpoint::Image::Status::Ok);
+  EXPECT_EQ(RowInImage(image, "alice"), "one");
+  EXPECT_EQ(RowInImage(image, "bob"), "two");
+  auto primary_keys = IndexEntryInImage(image, "s");
+  std::sort(primary_keys.begin(), primary_keys.end());
+  EXPECT_EQ(primary_keys, (std::vector<std::string>{"alice", "bob"}));
+  EXPECT_NE(image.cut_epoch, 0u);
+  EXPECT_GE(image.end_epoch, image.cut_epoch);
+  // The working file is renamed rather than left behind.
+  EXPECT_FALSE(std::filesystem::exists(working_path()));
+}
+
+TEST_F(EpochScanCheckpointTest, ADeletedRowLeavesNoEntry) {
+  {
+    auto config = MakeConfig(false);
+    LineairDB::Database db(config);
+    ASSERT_TRUE(CommitWrite(db, "alice", "one"));
+    ASSERT_TRUE(CommitWrite(db, "bob", "two"));
+    ASSERT_TRUE(CommitDelete(db, "alice"));
+    ASSERT_TRUE(db.WriteCheckpointImage());
+  }
+
+  auto image = EpochScanCheckpoint::Load(work_dir_);
+  ASSERT_EQ(image.status, EpochScanCheckpoint::Image::Status::Ok);
+  EXPECT_EQ(RowInImage(image, "alice"), std::nullopt);
+  EXPECT_EQ(RowInImage(image, "bob"), "two");
+}
+
+TEST_F(EpochScanCheckpointTest, AnAbsentImageIsNotAFailure) {
+  auto image = EpochScanCheckpoint::Load(work_dir_ + "/nowhere");
+  EXPECT_EQ(image.status, EpochScanCheckpoint::Image::Status::Absent);
+}
+
+TEST_F(EpochScanCheckpointTest, ADamagedImageIsRefused) {
+  {
+    auto config = MakeConfig(false);
+    LineairDB::Database db(config);
+    ASSERT_TRUE(CommitWrite(db, "alice", "one"));
+    ASSERT_TRUE(db.WriteCheckpointImage());
+  }
+
+  // One byte inside the payload, which the checksum covers.
+  {
+    std::fstream file(image_path(),
+                      std::ios::in | std::ios::out | std::ios::binary);
+    ASSERT_TRUE(file.is_open());
+    file.seekp(static_cast<std::streamoff>(EpochScanCheckpoint::kHeaderSize));
+    char flipped = 0x7f;
+    file.write(&flipped, 1);
+  }
+
+  auto image = EpochScanCheckpoint::Load(work_dir_);
+  EXPECT_EQ(image.status, EpochScanCheckpoint::Image::Status::Unusable);
+  EXPECT_TRUE(image.records.empty());
+}
+
+TEST_F(EpochScanCheckpointTest, TheLogTailWinsOverTheImage) {
+  {
+    auto config = MakeConfig(false);
+    LineairDB::Database db(config);
+    ASSERT_TRUE(CommitWrite(db, "alice", "one"));
+    ASSERT_TRUE(CommitWrite(db, "bob", "one"));
+    ASSERT_TRUE(CommitWrite(db, "carol", "one"));
+    ASSERT_TRUE(db.WriteCheckpointImage());
+    // Written after the cut: the image holds the old version of alice and no
+    // version of dave, and the tail has to supply both.
+    ASSERT_TRUE(CommitWrite(db, "alice", "two"));
+    ASSERT_TRUE(CommitDelete(db, "carol"));
+    ASSERT_TRUE(CommitWrite(db, "dave", "two"));
+  }
+
+  auto config = MakeConfig(true);
+  LineairDB::Database db(config);
+  EXPECT_EQ(Read(db, "alice").value, "two");
+  // Only the image holds this one: its record is in a frame the replay skips.
+  EXPECT_EQ(Read(db, "bob").value, "one");
+  EXPECT_FALSE(Read(db, "carol").found);
+  EXPECT_EQ(Read(db, "dave").value, "two");
+}
+
+TEST_F(EpochScanCheckpointTest, RecoveryWithTheImageMatchesRecoveryWithout) {
+  {
+    auto config = MakeConfig(false);
+    LineairDB::Database db(config);
+    ASSERT_TRUE(db.CreateSecondaryIndex(kTable, kIndex, 0));
+    ASSERT_TRUE(CommitIndexedWrite(db, "alice", "one", "s"));
+    ASSERT_TRUE(CommitIndexedWrite(db, "bob", "one", "t"));
+    ASSERT_TRUE(db.WriteCheckpointImage());
+    ASSERT_TRUE(CommitWrite(db, "alice", "two"));
+    ASSERT_TRUE(CommitDelete(db, "bob"));
+    ASSERT_TRUE(CommitIndexedWrite(db, "carol", "two", "s"));
+  }
+
+  const auto image = EpochScanCheckpoint::Load(work_dir_);
+  ASSERT_EQ(image.status, EpochScanCheckpoint::Image::Status::Ok);
+
+  // What the replay leaves out, and that it leaves out something at all.
+  {
+    Wal wal(work_dir_, LineairDB::Recovery::WalIo::Posix(), 1ull << 20);
+    auto full = wal.ScanAndRepair(0);
+    ASSERT_EQ(full.status, WalScanResult::Status::Ok);
+    EXPECT_EQ(full.frames_skipped, 0u);
+    frontier_ = full.frontier;
+  }
+  {
+    Wal wal(work_dir_, LineairDB::Recovery::WalIo::Posix(), 1ull << 20);
+    auto filtered = wal.ScanAndRepair(image.cut_epoch);
+    ASSERT_EQ(filtered.status, WalScanResult::Status::Ok);
+    EXPECT_GT(filtered.frames_skipped, 0u);
+    EXPECT_GT(filtered.bytes_skipped, 0u);
+    // The end of the log and how far it is durable come from every frame.
+    EXPECT_EQ(filtered.frontier, frontier_);
+    for (const auto& record : filtered.records) {
+      EXPECT_GT(record.epoch, image.cut_epoch);
+    }
+  }
+
+  std::vector<std::string> with_image;
+  {
+    auto config = MakeConfig(true);
+    LineairDB::Database db(config);
+    with_image = ReadAll(db);
+  }
+
+  std::filesystem::remove(image_path());
+  std::vector<std::string> without_image;
+  {
+    auto config = MakeConfig(true);
+    LineairDB::Database db(config);
+    without_image = ReadAll(db);
+  }
+
+  EXPECT_EQ(with_image, without_image);
+  EXPECT_EQ(with_image,
+            (std::vector<std::string>{"alice=two", "bob=", "carol=two"}));
+}
+
+TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
+  int scan_arrived[2];
+  int scan_release[2];
+  int write_arrived[2];
+  int write_release[2];
+  ASSERT_EQ(::pipe(scan_arrived), 0);
+  ASSERT_EQ(::pipe(scan_release), 0);
+  ASSERT_EQ(::pipe(write_arrived), 0);
+  ASSERT_EQ(::pipe(write_release), 0);
+
+  auto config = MakeConfig(false);
+  LineairDB::Database db(config);
+  ASSERT_TRUE(CommitWrite(db, "alice", std::string(64, 'a')));
+  ASSERT_TRUE(CommitWrite(db, "bob", std::string(64, 'a')));
+
+  Arm("LINEAIRDB_DEBUG_SYNC_CHECKPOINT_BEFORE_ROW_COPY",
+      "arrive_and_wait:" + std::to_string(scan_arrived[1]) + ":" +
+          std::to_string(scan_release[0]));
+  Arm("LINEAIRDB_DEBUG_SYNC_STATELESS_COMMIT_BETWEEN_ROW_INSTALLS",
+      "arrive_and_wait:" + std::to_string(write_arrived[1]) + ":" +
+          std::to_string(write_release[0]));
+
+  auto scan = std::async(std::launch::async,
+                         [&db] { return db.WriteCheckpointImage(); });
+
+  // The scan has loaded a version and is about to copy the bytes it belongs
+  // to; nothing has locked that row yet.
+  char announcement = 0;
+  ASSERT_EQ(::read(scan_arrived[0], &announcement, 1), 1);
+
+  auto writer = std::async(std::launch::async, [&db] {
+    const bool committed = db.ValidateAndCommit(
+        {},
+        {{kTable, "alice", std::string(64, 'b'), false},
+         {kTable, "bob", std::string(64, 'b'), false}},
+        {}, {});
+    db.ReleaseMasstreeThreadEpoch();
+    return committed;
+  });
+
+  // The writer holds both rows: one is installed, the other is not.
+  ASSERT_EQ(::read(write_arrived[0], &announcement, 1), 1);
+  // Releasing the scan here makes it copy bytes the writer is changing, which
+  // its second version read has to reject.
+  ASSERT_EQ(::write(scan_release[1], "r", 1), 1);
+
+  // From here the scan may reach the point again on any retry, so arrivals are
+  // answered by a thread of their own.
+  auto releaser = std::async(std::launch::async, [&] {
+    for (;;) {
+      char arrived = 0;
+      if (::read(scan_arrived[0], &arrived, 1) != 1) return;
+      if (::write(scan_release[1], "r", 1) != 1) return;
+    }
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  ASSERT_EQ(::write(write_release[1], "r", 1), 1);
+  ASSERT_EQ(writer.wait_for(kTestTimeout), std::future_status::ready);
+  EXPECT_TRUE(writer.get());
+
+  ASSERT_EQ(scan.wait_for(kTestTimeout), std::future_status::ready);
+  EXPECT_TRUE(scan.get());
+  ::close(scan_arrived[1]);
+  ASSERT_EQ(releaser.wait_for(kTestTimeout), std::future_status::ready);
+  releaser.get();
+
+  auto image = EpochScanCheckpoint::Load(work_dir_);
+  ASSERT_EQ(image.status, EpochScanCheckpoint::Image::Status::Ok);
+  // Either version is a correct answer for a scan that runs alongside a
+  // writer. A mixture of the two is not.
+  for (const char* key : {"alice", "bob"}) {
+    const auto value = RowInImage(image, key);
+    ASSERT_TRUE(value.has_value()) << key;
+    EXPECT_TRUE(*value == std::string(64, 'a') ||
+                *value == std::string(64, 'b'))
+        << key << " holds " << *value;
+  }
+
+  for (int fd : {scan_arrived[0], scan_release[0], scan_release[1],
+                 write_arrived[0], write_arrived[1], write_release[0],
+                 write_release[1]}) {
+    ::close(fd);
+  }
+}
+
+TEST_F(EpochScanCheckpointTest, ALeftoverWorkingFileIsNotRead) {
+  {
+    auto config = MakeConfig(false);
+    LineairDB::Database db(config);
+    ASSERT_TRUE(CommitWrite(db, "alice", "one"));
+    ASSERT_TRUE(db.WriteCheckpointImage());
+  }
+
+  // What a crash between the write and the rename leaves behind.
+  {
+    std::ofstream file(working_path(), std::ios::binary);
+    ASSERT_TRUE(file.is_open());
+    file << "half of an image";
+  }
+
+  auto image = EpochScanCheckpoint::Load(work_dir_);
+  ASSERT_EQ(image.status, EpochScanCheckpoint::Image::Status::Ok);
+  EXPECT_EQ(RowInImage(image, "alice"), "one");
+}
+
+}  // namespace
