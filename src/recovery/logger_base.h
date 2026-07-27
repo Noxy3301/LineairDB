@@ -38,7 +38,7 @@ class LoggerBase {
   virtual bool Enqueue(const WriteSetType& ws_ref, EpochNumber epoch) = 0;
 
   /** Reads and repairs the log. Must complete before the flusher starts. */
-  virtual WalScanResult ScanAndRepairWal() = 0;
+  virtual WalScanResult ScanAndRepairWal(EpochNumber min_epoch) = 0;
 
   /** Starts the flusher. Called once, after the log has been scanned. */
   virtual void StartFlusher() = 0;

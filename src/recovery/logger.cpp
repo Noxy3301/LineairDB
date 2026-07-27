@@ -25,6 +25,7 @@
 #include <utility>
 #include <util/logger.hpp>
 
+#include "epoch_scan_checkpoint.h"
 #include "flush_trace.h"
 #include "impl/thread_local_logger.h"
 #include "types/definitions.h"
@@ -41,8 +42,13 @@ namespace {
  * index entries arrive as per-primary-key deltas and are regrouped into one
  * entry per secondary key, so a key deleted after being added does not come
  * back.
+ *
+ * The checkpoint image is folded in ahead of the log's tail as ordinary
+ * records. The rule that resolves the two is the same one that resolves two
+ * epochs of the log, which is what lets an image taken while transactions ran
+ * be mixed with the records written during it.
  */
-WriteSetType BuildRecoverySet(const LogRecords& records) {
+WriteSetType BuildRecoverySet(const LogRecords& image, const LogRecords& tail) {
   struct SecondaryOpKey {
     std::string table_name;
     std::string index_name;
@@ -126,62 +132,66 @@ WriteSetType BuildRecoverySet(const LogRecords& records) {
   // would cost the size of the database for every record in the log.
   std::unordered_map<PrimaryKey, size_t, PrimaryKeyHash> placed;
 
-  for (const auto& log_record : records) {
-    for (const auto& kvp : log_record.key_value_pairs) {
-      const auto op = static_cast<SecondaryIndexOp>(kvp.secondary_op);
-      const bool is_secondary_index =
-          !kvp.index_name.empty() || op != SecondaryIndexOp::None ||
-          !kvp.primary_keys.empty() || !kvp.secondary_primary_key.empty() ||
-          kvp.index_type != 0;
-      if (is_secondary_index) {
-        if (op == SecondaryIndexOp::Full) {
-          for (const auto& pk : kvp.primary_keys) {
-            SecondaryOpKey op_key{kvp.table_name, kvp.index_name,
-                                  kvp.index_type, kvp.key, pk};
+  const LogRecords* sources[] = {&image, &tail};
+  for (const auto* source : sources) {
+    for (const auto& log_record : *source) {
+      for (const auto& kvp : log_record.key_value_pairs) {
+        const auto op = static_cast<SecondaryIndexOp>(kvp.secondary_op);
+        const bool is_secondary_index =
+            !kvp.index_name.empty() || op != SecondaryIndexOp::None ||
+            !kvp.primary_keys.empty() || !kvp.secondary_primary_key.empty() ||
+            kvp.index_type != 0;
+        if (is_secondary_index) {
+          if (op == SecondaryIndexOp::Full) {
+            for (const auto& pk : kvp.primary_keys) {
+              SecondaryOpKey op_key{kvp.table_name, kvp.index_name,
+                                    kvp.index_type, kvp.key, pk};
+              auto it = secondary_latest.find(op_key);
+              if (it == secondary_latest.end() || it->second.tid < kvp.tid) {
+                secondary_latest[op_key] = {kvp.tid, SecondaryIndexOp::Add};
+              }
+            }
+          } else if (!kvp.secondary_primary_key.empty()) {
+            SecondaryOpKey op_key{kvp.table_name, kvp.index_name, kvp.index_type,
+                                  kvp.key, kvp.secondary_primary_key};
             auto it = secondary_latest.find(op_key);
             if (it == secondary_latest.end() || it->second.tid < kvp.tid) {
-              secondary_latest[op_key] = {kvp.tid, SecondaryIndexOp::Add};
+              secondary_latest[op_key] = {kvp.tid, op};
             }
           }
-        } else if (!kvp.secondary_primary_key.empty()) {
-          SecondaryOpKey op_key{kvp.table_name, kvp.index_name, kvp.index_type,
-                                kvp.key, kvp.secondary_primary_key};
-          auto it = secondary_latest.find(op_key);
-          if (it == secondary_latest.end() || it->second.tid < kvp.tid) {
-            secondary_latest[op_key] = {kvp.tid, op};
-          }
+          continue;
         }
-        continue;
-      }
 
-      const std::byte* value_ptr =
-          kvp.buffer.empty()
-              ? nullptr
-              : reinterpret_cast<const std::byte*>(kvp.buffer.data());
-      PrimaryKey place{kvp.table_name, kvp.index_name, kvp.key};
-      auto placed_it = placed.find(place);
-      if (placed_it != placed.end()) {
-        auto& item = recovery_set[placed_it->second];
-        if (item.data_item_copy.transaction_id.load() < kvp.tid) {
-          item.data_item_copy.Reset(value_ptr, kvp.buffer.size(), kvp.tid);
-          item.table_name = kvp.table_name;
-          item.index_name = kvp.index_name;
-          item.index_type = Index::SecondaryIndexType::FromRaw(kvp.index_type);
+        const std::byte* value_ptr =
+            kvp.buffer.empty()
+                ? nullptr
+                : reinterpret_cast<const std::byte*>(kvp.buffer.data());
+        PrimaryKey place{kvp.table_name, kvp.index_name, kvp.key};
+        auto placed_it = placed.find(place);
+        if (placed_it != placed.end()) {
+          auto& item = recovery_set[placed_it->second];
+          if (item.data_item_copy.transaction_id.load() < kvp.tid) {
+            item.data_item_copy.Reset(value_ptr, kvp.buffer.size(), kvp.tid);
+            item.table_name = kvp.table_name;
+            item.index_name = kvp.index_name;
+            item.index_type =
+                Index::SecondaryIndexType::FromRaw(kvp.index_type);
+          }
+          continue;
         }
-        continue;
+        Snapshot snapshot = {
+            kvp.key,
+            reinterpret_cast<const std::byte*>(kvp.buffer.data()),
+            kvp.buffer.size(),
+            nullptr,
+            kvp.table_name,
+            kvp.index_name,
+            kvp.tid,
+            Index::SecondaryIndexType::FromRaw(kvp.index_type),
+        };
+        recovery_set.emplace_back(std::move(snapshot));
+        placed.emplace(std::move(place), recovery_set.size() - 1);
       }
-      Snapshot snapshot = {
-          kvp.key,
-          reinterpret_cast<const std::byte*>(kvp.buffer.data()),
-          kvp.buffer.size(),
-          nullptr,
-          kvp.table_name,
-          kvp.index_name,
-          kvp.tid,
-          Index::SecondaryIndexType::FromRaw(kvp.index_type),
-      };
-      recovery_set.emplace_back(std::move(snapshot));
-      placed.emplace(std::move(place), recovery_set.size() - 1);
     }
   }
 
@@ -222,7 +232,9 @@ WriteSetType BuildRecoverySet(const LogRecords& records) {
 }  // namespace
 
 Logger::Logger(const Config& config, WalIo io)
-    : work_dir_(config.work_dir), durability_(config.commit_durability) {
+    : work_dir_(config.work_dir),
+      durability_(config.commit_durability),
+      replays_(config.enable_recovery) {
   LineairDB::Util::SetUpSPDLog();
   logger_ = std::make_unique<ThreadLocalLogger>(
       config, [this](EpochNumber frontier) { PublishDurable(frontier); },
@@ -240,7 +252,24 @@ bool Logger::Enqueue(const WriteSetType& ws_ref, EpochNumber epoch) {
 }
 
 Logger::RecoveryResult Logger::Recover() {
-  auto scan = logger_->ScanAndRepairWal();
+  // Only a replay reads the image. A startup that scans the log without
+  // replaying it does so to find the end of the log, which the image says
+  // nothing about.
+  // FIXME: an image is bound to a log by sharing a directory with it, and
+  // neither file names the database it came from
+  EpochScanCheckpoint::Image image;
+  if (replays_) {
+    image = EpochScanCheckpoint::Load(work_dir_);
+    if (image.status == EpochScanCheckpoint::Image::Status::Unusable) {
+      // An image that cannot be trusted is not a reason to refuse to start:
+      // the log alone still holds everything the image would have supplied.
+      SPDLOG_WARN("Ignoring the checkpoint image: {0}", image.detail);
+      image.records.clear();
+      image.cut_epoch = 0;
+    }
+  }
+
+  auto scan = logger_->ScanAndRepairWal(image.cut_epoch);
   RecoveryResult result;
   if (scan.status != WalScanResult::Status::Ok) {
     SPDLOG_CRITICAL("Durability Error: {0} ({1}), errno {2}", scan.detail,
@@ -252,9 +281,16 @@ Logger::RecoveryResult Logger::Recover() {
     return result;
   }
 
+  if (image.status == EpochScanCheckpoint::Image::Status::Ok) {
+    SPDLOG_INFO(
+        "Recovering from the checkpoint image of epoch {0}: {1} frames of {2} "
+        "bytes are covered by it and are not replayed",
+        image.cut_epoch, scan.frames_skipped, scan.bytes_skipped);
+  }
+
   durable_epoch_.store(scan.frontier, std::memory_order_seq_cst);
   result.frontier = scan.frontier;
-  result.recovery_set = BuildRecoverySet(scan.records);
+  result.recovery_set = BuildRecoverySet(image.records, scan.records);
   return result;
 }
 
