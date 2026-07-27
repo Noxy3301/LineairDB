@@ -220,6 +220,32 @@ struct Config {
 
   /**
    * @brief
+   * How often (milliseconds) an image of the live rows is written, or zero to
+   * write none.
+   *
+   * The image is scanned while transactions keep running and is merged with
+   * the log at recovery, which is what bounds the part of the log that has to
+   * be replayed. It does not bound the log on disk: nothing is truncated.
+   *
+   * Requires a durability contract that writes a log, since the image alone is
+   * not a recoverable state.
+   *
+   * Default: 0 (no image)
+   */
+  size_t checkpoint_interval_ms = 0;
+
+  /**
+   * @brief
+   * One image written this many milliseconds after startup, or zero for none.
+   * Independent of checkpoint_interval_ms, which keeps its own cadence
+   * afterwards when both are set.
+   *
+   * Default: 0 (no image)
+   */
+  size_t checkpoint_once_after_ms = 0;
+
+  /**
+   * @brief
    * It uses as the threshold (percentage) for rehashing of the hash index.
    * A large value (e.g., 99) will not easily rehash the index and thus reduce
    * memory consumption because leaving less room in the index. On the other
