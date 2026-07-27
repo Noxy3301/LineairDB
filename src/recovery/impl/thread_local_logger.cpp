@@ -25,6 +25,7 @@
 #include <utility>
 #include <util/logger.hpp>
 
+#include "recovery/flush_trace.h"
 #include "types/definitions.h"
 
 namespace LineairDB {
@@ -101,12 +102,19 @@ void ThreadLocalLogger::StartFlusher() {
 }
 
 void ThreadLocalLogger::ScheduleFlush(EpochNumber closed) {
+  auto& trace               = FlushTrace::Instance();
+  const bool traced         = trace.Enabled();
+  const int64_t close_enter = traced ? FlushTrace::Now() : 0;
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
     if (stop_requested_ || failed_) return;
     if (closed > pending_closed_) pending_closed_ = closed;
   }
+  // The hand-over is timed before the flusher is woken and recorded after, so
+  // the census never sits between the state change and the notification.
+  const int64_t close_exit = traced ? FlushTrace::Now() : 0;
   work_cv_.notify_one();
+  if (traced) trace.EpochClosed(closed, close_enter, close_exit);
 }
 
 bool ThreadLocalLogger::IsQuiescent() {
@@ -162,12 +170,17 @@ void ThreadLocalLogger::FlusherLoop() {
       publish_failure_(result.error_number);
       return;
     }
+    auto& trace                 = FlushTrace::Instance();
+    const bool traced           = trace.Enabled();
+    const int64_t publish_enter = traced ? FlushTrace::Now() : 0;
     publish_durable_(target);
+    if (traced) trace.GroupPublish(target, publish_enter, FlushTrace::Now());
   }
 }
 
 WalAppendResult ThreadLocalLogger::FlushThrough(EpochNumber target) {
   const EpochNumber durable_before = read_durable_();
+  FlushTrace::Instance().GroupCollectBegin(durable_before);
 
   nodes_.ForEach([&](ThreadLocalStorageNode* node) {
     LogRecords swapped;
@@ -191,6 +204,8 @@ WalAppendResult ThreadLocalLogger::FlushThrough(EpochNumber target) {
       carry_[record.epoch].emplace_back(std::move(record));
     }
   });
+
+  FlushTrace::Instance().GroupCollectEnd();
 
   const auto result = wal_.AppendGroup(carry_, target);
   if (!result.ok) return result;
