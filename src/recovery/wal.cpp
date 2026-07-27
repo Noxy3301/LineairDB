@@ -295,11 +295,12 @@ bool Wal::PreadAll(uint8_t* out, size_t size, off_t offset, int* error) const {
  * And they are the mark of a region that holds no frame, which is what lets the
  * scan find the end of the log.
  *
- * The blocks are allocated by writing them rather than by posix_fallocate:
- * fallocate leaves them unwritten, converting one on first write is itself a
- * metadata change, and a crash between the two would leave a file whose size
- * promises more than its blocks deliver. Writing zeroes makes the file's size and
- * the state of its blocks advance together.
+ * The blocks are initialised by writing rather than only by posix_fallocate.
+ * posix_fallocate does reserve storage, but filesystems such as ext4 may represent
+ * the range as unwritten extents. Their first data write must still convert extent
+ * metadata. Explicit zero writes followed by fsync move that work out of the
+ * group-flush path and establish the zero tail used by recovery. Whether this is
+ * faster is filesystem- and device-specific.
  */
 bool Wal::WriteZeroesAndSync(off_t from, off_t to, int* error) {
   if (to <= from) return true;

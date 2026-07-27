@@ -149,14 +149,14 @@ struct Config {
    * The log file is written out with zeroes to this size before any record lands
    * in it, and records are then written in place. A log that grows past it is
    * extended by the same amount again, so this is a granularity rather than a
-   * limit; the space is occupied from startup either way.
+   * limit.
    *
    * The point is what a commit's fdatasync has to persist. Writing past the end
-   * of a file changes its size and its block allocation as well, and persisting
-   * that is a filesystem journal commit on top of the device cache flush the data
-   * alone needs. Measured on ext4 over NVMe, a group flush costs 6.15ms when the
-   * file grows against 1.79ms for the same bytes written in place. Under the Sync
-   * contract that difference sits in front of every commit.
+   * of a file can add size, allocation, or extent-state metadata to the group
+   * flush. On filesystems such as ext4, posix_fallocate may reserve blocks as
+   * unwritten extents, whose first overwrite still converts metadata. Explicit
+   * zero initialisation moves that work out of the group-flush path. The benefit
+   * is filesystem- and device-specific.
    *
    * Larger is better while the log fits, because extending is synchronous and
    * writes out the whole new region. Against that, startup reads the reserved
@@ -165,10 +165,9 @@ struct Config {
    * written, which is what a Volatile database is given: it never writes a record,
    * and reserving would occupy the space for nothing.
    *
-   * Assumes a filesystem that does not let a file's size outlive the data below it
-   * across a crash. data=ordered and barriers are ext4 defaults; the data mode can
-   * be changed and barriers can be disabled, and the storage stack below has to
-   * honour a flush.
+   * The storage stack must honour fsync/fdatasync. The supported ext4 setup uses
+   * its default data ordering and barriers; changing those settings changes the
+   * crash assumptions this implementation has been tested under.
    *
    * A log left by a build that did not reserve is readable here, since it simply
    * ends where the file does. The other direction does not hold: a build without

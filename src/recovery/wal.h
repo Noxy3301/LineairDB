@@ -78,12 +78,11 @@ struct WalIo {
  *
  * Frames are written in place, at an offset the instance tracks, into a region
  * whose blocks were already allocated and written out with zeroes. Letting the
- * file grow instead would make each group's fdatasync persist a new file size and
- * new block allocations as well as the data, and that is a filesystem journal
- * commit on top of the device cache flush the data alone needs. Measured on ext4
- * over NVMe, a group flush costs 6.15ms when the file grows against 1.79ms for
- * the same bytes written in place, at every group size from 4 KiB to 1 MiB; under
- * the Sync contract that difference sits in front of every commit.
+ * file grow can make a group's fdatasync persist size, allocation, or extent-state
+ * metadata as well as data. On filesystems that represent preallocation as
+ * unwritten extents, posix_fallocate alone may leave the first overwrite with
+ * metadata conversion work. Explicit zero initialisation moves that work before
+ * the group flush; the size of the benefit is filesystem- and device-specific.
  *
  * Two consequences run through the rest of this class. The end of the log is not
  * the end of the file: it is where the zeroes begin, which is why nothing may be
