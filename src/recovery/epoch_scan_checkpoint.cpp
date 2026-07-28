@@ -16,6 +16,7 @@
 
 #include "crc32c.h"
 #include "index/concurrent_table.h"
+#include "index/impl/masstree_index.hpp"
 #include "index/secondary_index.h"
 #include "logger.h"
 #include "table/table.h"
@@ -350,6 +351,12 @@ bool EpochScanCheckpoint::RunOnce(Stats* out_stats) {
     }
   });
 
+  // Ends the index's reclamation critical section, which the pass held open
+  // from its first walk so that a row retired during it could not be freed
+  // under the copy. Everything the pass keeps has been copied out by now, and
+  // an index reclaims nothing at all while a thread is inside one.
+  Index::MasstreeReleaseThreadEpoch();
+
   stats.scan_ms = ElapsedMs(scan_begin);
   // Every version in the image was published at or below this epoch, which is
   // what the durability gate below is asked about.
@@ -482,11 +489,6 @@ bool EpochScanCheckpoint::CaptureTable(Table& table, LogRecord* record,
     unstable_entries.swap(entries_left);
   }
 
-  // The walk's reclamation critical section is deliberately left open. Ending
-  // it here lets the index reclaim what a delete retired, and rows committed
-  // before the scan then disappear from the database, so the scan holds its
-  // section for the life of the thread instead.
-  // FIXME: holding it also holds back every index's reclamation
   return !stopped && unstable_rows.empty() && unstable_entries.empty();
 }
 
