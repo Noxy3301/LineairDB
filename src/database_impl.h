@@ -933,7 +933,12 @@ class Database::Impl {
     return table_dictionary_.GetTable(table_name);
   }
 
-  bool WriteCheckpointImage() { return scan_checkpoint_.RunOnce(); }
+  bool WriteCheckpointImage(uint64_t* out_version_retries) {
+    Recovery::EpochScanCheckpoint::Stats stats;
+    const bool published = scan_checkpoint_.RunOnce(&stats);
+    if (out_version_retries != nullptr) *out_version_retries = stats.retries;
+    return published;
+  }
 
  private:
   void RegisterDeferredPurge(const Snapshot& snapshot,
