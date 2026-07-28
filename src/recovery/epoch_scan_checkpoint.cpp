@@ -16,7 +16,6 @@
 
 #include "crc32c.h"
 #include "index/concurrent_table.h"
-#include "index/impl/masstree_index.hpp"
 #include "index/secondary_index.h"
 #include "logger.h"
 #include "table/table.h"
@@ -483,10 +482,11 @@ bool EpochScanCheckpoint::CaptureTable(Table& table, LogRecord* record,
     unstable_entries.swap(entries_left);
   }
 
-  // Ends the index's reclamation critical section, which this walk held open
-  // for the whole table so that a row deleted during it could not be freed
-  // under the copy. Every byte the walk keeps has been copied out by now.
-  Index::MasstreeReleaseThreadEpoch();
+  // The walk's reclamation critical section is deliberately left open. Ending
+  // it here lets the index reclaim what a delete retired, and rows committed
+  // before the scan then disappear from the database, so the scan holds its
+  // section for the life of the thread instead.
+  // FIXME: holding it also holds back every index's reclamation
   return !stopped && unstable_rows.empty() && unstable_entries.empty();
 }
 
