@@ -504,6 +504,93 @@ WalScanResult Wal::FinishScan(WalScanResult&& result, off_t end_of_log) {
   return std::move(result);
 }
 
+/**
+ * Hops through the frames at or below `min_epoch`, reading only their headers,
+ * and leaves `offset` at the first frame above it (or at `file_size`, if every
+ * frame qualifies).
+ *
+ * Each header is trusted just far enough to compute where the next one begins;
+ * none of this is a claim that the frame is undamaged, since its payload is
+ * never read here. What is undamaged is checked once, by the caller, on the
+ * last frame this leaves behind: a lie in every earlier frame's length is
+ * indistinguishable, from here, from one only in the last, and both are caught
+ * the same way, by the header the lie leads to failing to parse.
+ *
+ * Returns false without touching `offset` if a header along the way does not
+ * parse as one of this build's frames; the caller falls back to reading every
+ * frame in full from offset 0 rather than guess which side of the lie is real.
+ */
+bool Wal::HopCoveredFrames(EpochNumber min_epoch, off_t file_size,
+                           off_t* offset, EpochNumber* frontier,
+                           bool* have_frame, size_t* frames_skipped,
+                           uint64_t* bytes_skipped, bool* guard_pending,
+                           off_t* guard_offset, uint32_t* guard_payload_size,
+                           uint8_t* guard_header, int* error) const {
+  off_t at = 0;
+  EpochNumber local_frontier = 0;
+  bool local_have_frame = false;
+  size_t local_frames_skipped = 0;
+  uint64_t local_bytes_skipped = 0;
+  bool local_guard_pending = false;
+  off_t local_guard_offset = 0;
+  uint32_t local_guard_payload_size = 0;
+  uint8_t local_guard_header[kHeaderSize];
+
+  // Every out-param is written from these locals in one place, at the single
+  // successful return below, so a `false` return - from any of the several
+  // places above that can produce one - never leaves a caller holding a
+  // partial hop's guard alongside a result it was told to distrust.
+  while (at < file_size) {
+    if (file_size - at < static_cast<off_t>(kHeaderSize)) return false;
+    uint8_t header[kHeaderSize];
+    if (!PreadAll(header, kHeaderSize, at, error)) return false;
+    const uint32_t magic = GetLe32(header);
+    const uint16_t version = GetLe16(header + 4);
+    const uint16_t flags = GetLe16(header + 6);
+    const uint32_t payload_size = GetLe32(header + 8);
+    const EpochNumber epoch = GetLe32(header + 12);
+    if (magic != kMagic || version != kVersion || flags != kFlags ||
+        payload_size > kMaxPayloadSize) {
+      // The zeroes of unwritten capacity read exactly this way, and are not
+      // a lie to fall back over: they are what a hop that has reached the
+      // true end of the log finds instead of another frame. The caller's own
+      // read of the same bytes, once handed this offset, reaches the same
+      // conclusion through its existing torn-tail handling.
+      if (HeaderIsTornPrefix(header)) break;
+      return false;
+    }
+    const uint64_t frame_end = static_cast<uint64_t>(at) + kHeaderSize + payload_size;
+    if (frame_end > static_cast<uint64_t>(file_size)) return false;
+    if (local_have_frame && epoch < local_frontier) return false;
+    if (epoch == 0) return false;
+    if (epoch > min_epoch) break;
+
+    local_guard_pending = true;
+    local_guard_offset = at;
+    local_guard_payload_size = payload_size;
+    std::memcpy(local_guard_header, header, kHeaderSize);
+
+    local_frontier = epoch;
+    local_have_frame = true;
+    ++local_frames_skipped;
+    local_bytes_skipped += kHeaderSize + payload_size;
+    at = static_cast<off_t>(frame_end);
+  }
+
+  *offset = at;
+  *frontier = local_frontier;
+  *have_frame = local_have_frame;
+  *frames_skipped = local_frames_skipped;
+  *bytes_skipped = local_bytes_skipped;
+  *guard_pending = local_guard_pending;
+  *guard_offset = local_guard_offset;
+  *guard_payload_size = local_guard_payload_size;
+  if (local_guard_pending) {
+    std::memcpy(guard_header, local_guard_header, kHeaderSize);
+  }
+  return true;
+}
+
 WalScanResult Wal::ScanAndRepair(EpochNumber min_epoch) {
   if (state_ == State::Failed) {
     return IoFailure("scan " + path_ + " after a failure", EIO);
@@ -522,6 +609,65 @@ WalScanResult Wal::ScanAndRepair(EpochNumber min_epoch) {
   size_t frames_skipped = 0;
   uint64_t bytes_skipped = 0;
   off_t offset = 0;
+
+  // The covered region is hopped by header alone when there is one to hop:
+  // `min_epoch == 0` asks for every record, and nothing there is skipped in
+  // the first place. Any doubt raised along the way - a header that does not
+  // parse, an I/O error reading one - falls back to leaving `offset` at 0 and
+  // letting the loop below read every frame in full, exactly as it would have
+  // without this block.
+  if (min_epoch != 0) {
+    bool guard_pending = false;
+    off_t guard_offset = 0;
+    uint32_t guard_payload_size = 0;
+    uint8_t guard_header[kHeaderSize];
+    int error = 0;
+    const bool hopped =
+        HopCoveredFrames(min_epoch, file_size, &offset, &frontier,
+                        &have_frame, &frames_skipped, &bytes_skipped,
+                        &guard_pending, &guard_offset, &guard_payload_size,
+                        guard_header, &error);
+    if (!hopped && error != 0) {
+      return IoFailure("pread header of " + path_, error);
+    }
+    if (hopped && guard_pending) {
+      std::vector<uint8_t> payload(guard_payload_size);
+      if (!PreadAll(payload.data(), guard_payload_size,
+                    guard_offset + static_cast<off_t>(kHeaderSize), &error)) {
+        return IoFailure("pread payload of " + path_, error);
+      }
+      Crc32c crc;
+      crc.Update(guard_header, 16);
+      crc.Update(payload.data(), payload.size());
+      if (crc.Finish() != GetLe32(guard_header + 16)) {
+        // The guard is exactly the frame a lie in an earlier length could have
+        // landed on by coincidence, so its own checksum failing is treated the
+        // same as a landing that did not parse: rediscovered and diagnosed by
+        // the full scan below, not decided here.
+        SPDLOG_WARN(
+            "The header hop through {0} left a frame at offset {1} whose "
+            "checksum does not hold; falling back to a full scan from "
+            "offset 0",
+            path_, static_cast<long long>(guard_offset));
+        offset = 0;
+        frontier = 0;
+        have_frame = false;
+        frames_skipped = 0;
+        bytes_skipped = 0;
+      }
+    } else if (!hopped) {
+      SPDLOG_WARN(
+          "The header hop through {0} landed on bytes that do not parse as a "
+          "frame; falling back to a full scan from offset 0",
+          path_);
+      offset = 0;
+      frontier = 0;
+      have_frame = false;
+      frames_skipped = 0;
+      bytes_skipped = 0;
+    }
+  }
+
   uint8_t header[kHeaderSize];
   std::vector<uint8_t> payload;
   // Empty while frames keep parsing; otherwise why the one at `offset` did not.

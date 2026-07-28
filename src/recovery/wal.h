@@ -50,7 +50,10 @@ struct WalScanResult {
   bool tail_truncated{false};
   int error_number{0};
   std::string detail;
-  /** Frames the scan verified but did not decode, and what they held. */
+  /**
+   * Frames the scan did not decode, and what they held. Verified by checksum
+   * unless the scan hopped over it by header alone; see ScanAndRepair.
+   */
   size_t frames_skipped{0};
   uint64_t bytes_skipped{0};
 };
@@ -132,10 +135,17 @@ class Wal {
    * later shorter group would leave them behind as a frame the next scan cannot
    * place.
    *
-   * A frame at or below `min_epoch` is verified and counted but not decoded,
-   * for a caller that already holds the state those frames would rebuild. The
-   * checksum is still taken: the frontier and the end of the log come from
-   * every frame, whether or not its records are wanted.
+   * A frame at or below `min_epoch` is counted but not decoded, for a caller
+   * that already holds the state those frames would rebuild; the frontier and
+   * the end of the log still come from every frame. Such a frame is hopped over
+   * by its header alone, without reading or checksumming its payload, except
+   * for the last one before the first frame that is decoded (or the last one in
+   * the log, if every frame is at or below `min_epoch`): that one frame is read
+   * and its checksum taken, as a cheap guard on the boundary the caller is
+   * trusting. A hop that lands on a header which does not parse is not by
+   * itself taken as damage, since the length it trusted was never checked; the
+   * scan falls back to reading and checksumming every frame from offset 0, the
+   * same as passing `min_epoch = 0`, and diagnoses the file from there.
    */
   WalScanResult ScanAndRepair(EpochNumber min_epoch = 0);
 
@@ -198,6 +208,12 @@ class Wal {
   WalScanResult Corrupt(const std::string& detail);
   WalScanResult IoFailure(const std::string& operation, int error);
   WalScanResult FinishScan(WalScanResult&& result, off_t end_of_log);
+  bool HopCoveredFrames(EpochNumber min_epoch, off_t file_size, off_t* offset,
+                       EpochNumber* frontier, bool* have_frame,
+                       size_t* frames_skipped, uint64_t* bytes_skipped,
+                       bool* guard_pending, off_t* guard_offset,
+                       uint32_t* guard_payload_size, uint8_t* guard_header,
+                       int* error) const;
   Probe ProbeFrameAt(off_t offset, off_t file_size, int* error) const;
   Probe SearchForFrameAfter(off_t offset, off_t search_end, off_t file_size,
                             int* error) const;
