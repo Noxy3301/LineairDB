@@ -165,7 +165,7 @@ TEST(ConcurrentTableTest, ForEachIsSafeWithRehashing) {
   // Test scenario: #Rehash and #ForEach are concurrently executed.
   std::vector<std::thread> threads;
   std::vector<LineairDB::DataItem*> items;
-  LineairDB::EpochFramework epoch(1);
+  LineairDB::EpochFramework epoch(1000);
   LineairDB::Config config;
   config.rehash_threshold = 0.3;
   epoch.Start();

@@ -156,7 +156,10 @@ class Database::Impl {
         thread_pool_(config_.max_thread),
         logger_(config_),
         callback_manager_(config_),
-        epoch_framework_(config_.epoch_duration_ms, EventsOnEpochIsUpdated()),
+        epoch_framework_(config_.epoch_duration_us != 0
+                             ? config_.epoch_duration_us
+                             : config_.epoch_duration_ms * 1000,
+                         EventsOnEpochIsUpdated()),
         checkpoint_manager_(config_, table_dictionary_, epoch_framework_) {
     // 2PL x Masstree unsupported (see 2PL ReadDirect FIXME).
     if (config_.concurrency_control_protocol ==

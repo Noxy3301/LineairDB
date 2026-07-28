@@ -52,6 +52,15 @@ struct Config {
    */
   size_t epoch_duration_ms = 40;
 
+  /**
+   * @brief
+   * Sub-millisecond epoch duration (microseconds); nonzero overrides
+   * epoch_duration_ms for the epoch tick period.
+   *
+   * Default: 0 (disabled).
+   */
+  size_t epoch_duration_us = 0;
+
   enum ConcurrencyControl { Silo, SiloNWR, TwoPhaseLocking };
   /**
    * @brief

@@ -51,18 +51,18 @@ class EpochFramework {
   static constexpr EpochNumber THREAD_OFFLINE = UINT32_MAX;
 
  public:
-  EpochFramework(size_t epoch_duration_ms = 40)
+  EpochFramework(size_t epoch_duration_us = 40000)
       : start_(false),
         stop_(false),
         global_epoch_(1),
-        epoch_writer_([=]() { EpochWriterJob(epoch_duration_ms); }) {}
-  EpochFramework(size_t epoch_duration_ms,
+        epoch_writer_([=]() { EpochWriterJob(epoch_duration_us); }) {}
+  EpochFramework(size_t epoch_duration_us,
                  std::function<void(EpochNumber)>&& pt)
       : start_(false),
         stop_(false),
         global_epoch_(1),
         publish_target_(pt),
-        epoch_writer_([=]() { EpochWriterJob(epoch_duration_ms); }) {}
+        epoch_writer_([=]() { EpochWriterJob(epoch_duration_us); }) {}
 
   ~EpochFramework() { Stop(); }
 
@@ -235,8 +235,8 @@ class EpochFramework {
     return min_epoch;
   }
 
-  void EpochWriterJob(size_t epoch_duration_ms) {
-    const uint64_t epoch_duration = epoch_duration_ms * 1000 * 1000;
+  void EpochWriterJob(size_t epoch_duration_us) {
+    const auto epoch_duration = std::chrono::microseconds(epoch_duration_us);
     {
       std::unique_lock<std::mutex> lk(epoch_mtx_);
       epoch_cv_.wait(lk, [&] { return start_.load(); });
@@ -247,13 +247,13 @@ class EpochFramework {
       if (stop_.load()) {
         // Post-stop the predicate below stays true; plain sleep keeps the
         // cadence while draining still-online threads
-        std::this_thread::sleep_for(std::chrono::nanoseconds(epoch_duration));
+        std::this_thread::sleep_for(epoch_duration);
       } else {
         // Forced requests wake the writer early; the advance condition
         // below still gates
         std::unique_lock<std::mutex> lk(epoch_mtx_);
         forced_wake = worker_cv_.wait_for(
-            lk, std::chrono::nanoseconds(epoch_duration), [&] {
+            lk, epoch_duration, [&] {
               return advance_requested_.load() || stop_.load();
             });
         advance_requested_.store(false);
