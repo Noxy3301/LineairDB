@@ -282,18 +282,21 @@ Logger::RecoveryResult Logger::Recover() {
   }
 
   if (image.status == EpochScanCheckpoint::Image::Status::Ok) {
-    // An image stands in for the frames it covers only if this log reaches the
-    // last epoch its scan could have observed. A log that stops short is not
-    // the log the image was written against, and honouring the cut would
-    // suppress frames that nothing else supplies. A log left by a database
-    // that went quiet before it stopped reaches this too, since its frontier
-    // advances through epochs that carry no frame; the whole log is replayed
-    // in both cases rather than the difference guessed at.
-    if (scan.frontier < image.end_epoch) {
+    // An image stands in for the frames it covers only if this log reaches at
+    // least as far as the log the image was published against already had:
+    // durability only advances, so a log that is truly the same one the image
+    // came from can never be found short of that bound, quiet tail or not.
+    // A log that falls short of it is not that log - most plainly, one
+    // genuinely truncated or substituted after the fact - and the cut is not
+    // honoured against it, since honouring it would suppress frames nothing
+    // else supplies. A foreign log with a higher frontier still slips
+    // through this, which is the identity gap the FIXME above already names.
+    if (scan.frontier < image.wal_frontier_at_publish) {
       SPDLOG_WARN(
-          "Ignoring the checkpoint image: its scan ended at epoch {0}, past "
-          "the last epoch {1} the log holds",
-          image.end_epoch, scan.frontier);
+          "Ignoring the checkpoint image: it was published when the log was "
+          "durable through epoch {0}, past the last epoch {1} this log "
+          "holds",
+          image.wal_frontier_at_publish, scan.frontier);
       image.records.clear();
       scan = logger_->ScanAndRepairWal(0);
       if (scan.status != WalScanResult::Status::Ok) {

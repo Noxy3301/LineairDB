@@ -52,6 +52,14 @@ class EpochScanCheckpoint {
     uint64_t generation{0};
     EpochNumber cut_epoch{0};
     EpochNumber end_epoch{0};
+    // The epoch of the log's last frame once the wait for `end_epoch` to be
+    // durable has returned, read from Wal::frontier rather than from the
+    // durable epoch a commit waits on: that epoch can reach `end_epoch`
+    // through a run of closed-but-empty epochs alone, which is a promise
+    // about what the log does not need, not about a frame it has. This one
+    // moves only when a frame is written, so it is what recovery's
+    // acceptance gate compares the rescanned log against.
+    EpochNumber wal_frontier_at_publish{0};
     uint64_t primary_rows{0};
     uint64_t secondary_entries{0};
     uint64_t image_bytes{0};
@@ -75,6 +83,7 @@ class EpochScanCheckpoint {
     Status status{Status::Absent};
     EpochNumber cut_epoch{0};
     EpochNumber end_epoch{0};
+    EpochNumber wal_frontier_at_publish{0};
     LogRecords records;
     std::string detail;
   };
@@ -111,9 +120,12 @@ class EpochScanCheckpoint {
   static const char* WorkingFileName();
 
   static constexpr uint32_t kMagic = 0x504b434c;  // "LCKP"
-  static constexpr uint16_t kVersion = 1;
+  // v2 adds wal_frontier_at_publish; a v1 image has no such field and is
+  // refused rather than read as one, since there is no value to fall back to
+  // that would not misstate what the log was asked to reach.
+  static constexpr uint16_t kVersion = 2;
   static constexpr uint16_t kFlags = 0;
-  static constexpr size_t kHeaderSize = 52;
+  static constexpr size_t kHeaderSize = 56;
 
  private:
   /** What one attempt at one row produced. */

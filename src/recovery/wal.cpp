@@ -499,6 +499,7 @@ WalScanResult Wal::FinishScan(WalScanResult&& result, off_t end_of_log) {
   // Published together with Ready: a scan that could not finish leaves no offset
   // behind to be mistaken for the end of the log.
   write_offset_ = end_of_log;
+  frontier_.store(result.frontier, std::memory_order_seq_cst);
   state_ = State::Ready;
   return std::move(result);
 }
@@ -687,10 +688,12 @@ WalAppendResult Wal::AppendGroup(
   const bool traced          = trace.Enabled();
   const int64_t encode_begin = traced ? FlushTrace::Now() : 0;
   uint32_t encoded_epochs    = 0;
+  EpochNumber last_encoded_epoch = 0;
   std::vector<uint8_t> group;
   for (const auto& [epoch, records] : buckets) {
     if (epoch > target) break;
     ++encoded_epochs;
+    last_encoded_epoch = epoch;
     // An empty bucket would produce a frame that recovery rejects; the caller
     // must never create one.
     assert(!records.empty());
@@ -766,6 +769,9 @@ WalAppendResult Wal::AppendGroup(
   write_offset_ += static_cast<off_t>(group.size());
   // Without preallocation the group carried the file's size with it.
   initialised_size_ = std::max(initialised_size_, write_offset_);
+  // Encoded buckets that fell above `target` never reached `group`, so this
+  // is the epoch of the last frame the write above actually put on disk.
+  frontier_.store(last_encoded_epoch, std::memory_order_seq_cst);
   return {true, 0};
 }
 

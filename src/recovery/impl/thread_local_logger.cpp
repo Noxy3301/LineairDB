@@ -96,6 +96,8 @@ WalScanResult ThreadLocalLogger::ScanAndRepairWal(EpochNumber min_epoch) {
   return wal_.ScanAndRepair(min_epoch);
 }
 
+EpochNumber ThreadLocalLogger::WalFrontier() const { return wal_.frontier(); }
+
 void ThreadLocalLogger::StartFlusher() {
   assert(!flusher_.joinable());
   flusher_ = std::thread([this]() { FlusherLoop(); });

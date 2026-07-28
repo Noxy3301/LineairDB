@@ -58,6 +58,7 @@ class ThreadLocalLogger final : public LoggerBase {
 
   bool Enqueue(const WriteSetType& ws_ref, EpochNumber epoch) final override;
   WalScanResult ScanAndRepairWal(EpochNumber min_epoch) final override;
+  EpochNumber WalFrontier() const final override;
   void StartFlusher() final override;
   void ScheduleFlush(EpochNumber closed) final override;
   void StopAndDrainFlusher() final override;

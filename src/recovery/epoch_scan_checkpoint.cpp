@@ -332,6 +332,15 @@ bool EpochScanCheckpoint::RunOnce(Stats* out_stats) {
   // values. Taking the scan's start time as the bound instead would drop the
   // commits still in flight when it was taken.
   stats.cut_epoch = epoch_framework_.GetGlobalEpoch();
+  // Read here, ahead of the barrier and the scan, because both give the log's
+  // frontier a chance to tick past what any frame on disk actually holds: the
+  // epoch clock keeps advancing on its own timer, closed epochs are handed to
+  // the flusher whether or not anything landed in them, and a closed empty
+  // epoch moves the durable epoch forward without writing a frame. Recovery's
+  // acceptance gate needs a bound a quiet log can still meet, so this is taken
+  // as close to "whatever the log last actually held" as the code has a name
+  // for.
+  stats.wal_frontier_at_publish = logger_.GetDurableEpoch();
   epoch_framework_.Sync();
   stats.barrier_ms = ElapsedMs(barrier_begin);
 
@@ -493,10 +502,38 @@ bool EpochScanCheckpoint::CaptureTable(Table& table, LogRecord* record,
 }
 
 bool EpochScanCheckpoint::Publish(const LogRecords& records, Stats* stats) {
-  const auto write_begin = Clock::now();
   msgpack::sbuffer payload;
   msgpack::pack(payload, records);
 
+  // The image holds versions the scan saw during it, and a version whose
+  // record never reached the device would come back alone, without the rest of
+  // the transaction that wrote it. Waiting until the log covers the last
+  // epoch the scan could have observed rules that out, and it is done before
+  // the header below is built because wal_frontier_at_publish is read from
+  // the same wait: every record this gate is waiting for is, by the time it
+  // returns, a frame already on disk, which is what lets recovery trust that
+  // bound as a floor on what the log still holds.
+  const auto gate_begin = Clock::now();
+  if (config_.enable_logging) {
+    const auto result =
+        logger_.WaitUntilDurable(stats->end_epoch, Clock::now() +
+                                                       kDurabilityWait);
+    if (result != Logger::WaitResult::Durable) {
+      // Nothing has been written to working_path_ this round, but a file
+      // left behind by an earlier, differently-failed attempt still might be
+      // there; a discarded checkpoint should not let one linger.
+      ::unlink(working_path_.c_str());
+      SPDLOG_WARN(
+          "Checkpoint {0} discarded: the log did not become durable through "
+          "epoch {1}",
+          stats->generation, stats->end_epoch);
+      return false;
+    }
+    stats->wal_frontier_at_publish = logger_.GetWalFrontier();
+  }
+  stats->gate_ms = ElapsedMs(gate_begin);
+
+  const auto write_begin = Clock::now();
   uint8_t header[kHeaderSize];
   std::memset(header, 0, sizeof(header));
   PutLe32(header, kMagic);
@@ -505,9 +542,10 @@ bool EpochScanCheckpoint::Publish(const LogRecords& records, Stats* stats) {
   PutLe64(header + 8, stats->generation);
   PutLe32(header + 16, stats->cut_epoch);
   PutLe32(header + 20, stats->end_epoch);
-  PutLe64(header + 24, stats->primary_rows);
-  PutLe64(header + 32, stats->secondary_entries);
-  PutLe64(header + 40, static_cast<uint64_t>(payload.size()));
+  PutLe32(header + 24, stats->wal_frontier_at_publish);
+  PutLe64(header + 28, stats->primary_rows);
+  PutLe64(header + 36, stats->secondary_entries);
+  PutLe64(header + 44, static_cast<uint64_t>(payload.size()));
   Crc32c crc;
   crc.Update(header, kHeaderSize - sizeof(uint32_t));
   crc.Update(payload.data(), payload.size());
@@ -533,26 +571,6 @@ bool EpochScanCheckpoint::Publish(const LogRecords& records, Stats* stats) {
     return false;
   }
   stats->write_ms = ElapsedMs(write_begin);
-
-  // The image holds versions the scan saw during it, and a version whose
-  // record never reached the device would come back alone, without the rest of
-  // the transaction that wrote it. Publishing only once the log covers the
-  // last epoch the scan could have observed rules that out.
-  const auto gate_begin = Clock::now();
-  if (config_.enable_logging) {
-    const auto result =
-        logger_.WaitUntilDurable(stats->end_epoch, Clock::now() +
-                                                       kDurabilityWait);
-    if (result != Logger::WaitResult::Durable) {
-      ::unlink(working_path_.c_str());
-      SPDLOG_WARN(
-          "Checkpoint {0} discarded: the log did not become durable through "
-          "epoch {1}",
-          stats->generation, stats->end_epoch);
-      return false;
-    }
-  }
-  stats->gate_ms = ElapsedMs(gate_begin);
 
   if (::rename(working_path_.c_str(), image_path_.c_str()) != 0) {
     const int rename_errno = errno;
@@ -609,7 +627,7 @@ EpochScanCheckpoint::Image EpochScanCheckpoint::Load(
   if (GetLe16(header + 6) != kFlags) {
     return unusable("the image carries unknown flags");
   }
-  const uint64_t payload_size = GetLe64(header + 40);
+  const uint64_t payload_size = GetLe64(header + 44);
   if (payload_size !=
       static_cast<uint64_t>(file_stat.st_size) - kHeaderSize) {
     return unusable("the image length disagrees with its header");
@@ -617,6 +635,7 @@ EpochScanCheckpoint::Image EpochScanCheckpoint::Load(
 
   const EpochNumber cut_epoch = GetLe32(header + 16);
   const EpochNumber end_epoch = GetLe32(header + 20);
+  const EpochNumber wal_frontier_at_publish = GetLe32(header + 24);
   // The scan ends no earlier than it began, and an image that claims
   // otherwise describes a history no run produced.
   if (cut_epoch == 0 || end_epoch < cut_epoch) {
@@ -656,6 +675,7 @@ EpochScanCheckpoint::Image EpochScanCheckpoint::Load(
   image.status = Image::Status::Ok;
   image.cut_epoch = cut_epoch;
   image.end_epoch = end_epoch;
+  image.wal_frontier_at_publish = wal_frontier_at_publish;
   return image;
 }
 
