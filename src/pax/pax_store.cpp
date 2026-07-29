@@ -336,6 +336,12 @@ size_t PaxGroup::GatherRow(uint32_t slot, std::byte* dst,
   for (size_t f = 0; f < fields; f++) {
     const std::byte* cell = arena_.get() + strip_offset_[f] +
                             static_cast<size_t>(stride_[f]) * slot;
+    __builtin_prefetch(cell, 0, 1);
+    __builtin_prefetch(cell + 64, 0, 1);
+  }
+  for (size_t f = 0; f < fields; f++) {
+    const std::byte* cell = arena_.get() + strip_offset_[f] +
+                            static_cast<size_t>(stride_[f]) * slot;
     uint16_t len;
     std::memcpy(&len, cell, sizeof(len));
     // Clamp against the cell width: a torn read can produce garbage but must
