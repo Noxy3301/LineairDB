@@ -348,17 +348,26 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
         auto table = tables.GetTable(range.table_name);
         if (!table.has_value()) return false;
 
-        std::vector<std::string> keys;
+        // Compare positionally against the evidence and stop at the first
+        // divergence, which bounds the replay at one live row past the
+        // evidence even when the range is unlimited.
+        size_t result_pos = 0;
         bool aborted = false;
+        bool matches = true;
         auto collect_key = [&](std::string_view key, DataItem& item) {
           if (locked_by_another(&item)) {
             aborted = true;
             return true;
           }
           if (item.IsPrimaryInitialized()) {
-            keys.emplace_back(key);
+            if (result_pos >= range.result_keys.size() ||
+                std::string_view(range.result_keys[result_pos]) != key) {
+              matches = false;
+              return true;
+            }
+            ++result_pos;
           }
-          return range.row_limit > 0 && keys.size() >= range.row_limit;
+          return range.row_limit > 0 && result_pos >= range.row_limit;
         };
 
         auto scan_result =
@@ -368,7 +377,8 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
                 : table.value()->GetPrimaryIndex().Scan(
                       range.start_key, range.end_key, collect_key, nullptr);
         if (aborted) return false;
-        return scan_result.has_value() && keys == range.result_keys;
+        return scan_result.has_value() && matches &&
+               result_pos == range.result_keys.size();
       };
 
   auto validate_secondary_key_list =
