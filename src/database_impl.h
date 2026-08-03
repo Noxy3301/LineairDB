@@ -306,23 +306,23 @@ class Database::Impl {
 
   // NOTE: Called by a special thread managed by EpochFramework.
   std::function<void(EpochNumber)> EventsOnEpochIsUpdated() {
-    return [&](EpochNumber old_epoch) {
+    return [&](EpochNumber updated_epoch) {
       // Logging
       if (config_.enable_logging) {
         EpochNumber durable_epoch = logger_.FlushDurableEpoch();
         thread_pool_.EnqueueForAllThreads(
-            [&, old_epoch]() { logger_.FlushLogs(old_epoch); });
+            [&, updated_epoch]() { logger_.FlushLogs(updated_epoch); });
         thread_pool_.EnqueueForAllThreads([&, durable_epoch] {
           callback_manager_.ExecuteCallbacks(durable_epoch);
         });
       }
 
       // Execute Callbacks
-      thread_pool_.EnqueueForAllThreads([&, old_epoch]() {
-        callback_manager_.ExecuteCallbacks(old_epoch);
+      thread_pool_.EnqueueForAllThreads([&, updated_epoch]() {
+        callback_manager_.ExecuteCallbacks(updated_epoch);
         {
           std::lock_guard<std::mutex> lk(fence_mtx_);
-          latest_callbacked_epoch_.store(old_epoch);
+          latest_callbacked_epoch_.store(updated_epoch);
         }
         fence_cv_.notify_all();
       });
@@ -331,7 +331,7 @@ class Database::Impl {
       // DataItem* limbo once min_active_epoch() catches up. Workers
       // release their epoch at tx/RPC boundaries via
       // ReleaseMasstreeThreadEpoch; we only move the watermark here.
-      reaper_.Reap(old_epoch);
+      reaper_.Reap(updated_epoch);
       Index::MasstreeAdvanceEpoch();
 
       if (config_.enable_checkpointing) {
