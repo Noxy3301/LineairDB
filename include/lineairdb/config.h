@@ -115,9 +115,54 @@ struct Config {
 
   /**
    * @brief
-   * If true, LineairDB performs logging for recovery.
+   * When a committing transaction is told that it has committed, relative to
+   * when its log record is durable.
    *
-   * Default: true
+   * - Volatile
+   *   - No logging at all. A commit is acknowledged once it passes
+   *     validation; nothing is written and nothing is recoverable.
+   * - Async
+   *   - Logging, acknowledged at precommit. The record becomes durable
+   *     behind the committer, so an acknowledged transaction can be lost by
+   *     a crash that happens before its epoch is written.
+   * - Sync
+   *   - Logging, acknowledged only after the committer's own epoch is
+   *     durable.
+   *
+   * @note The Sync acknowledgement gate is not implemented yet: the commit
+   * path treats Sync as Async until the gate lands.
+   *
+   * The equivalent names elsewhere, to keep Async from being read as a faster
+   * Sync:
+   * - Sync
+   *   - SQL Server: full durability
+   *   - PostgreSQL: synchronous_commit=on
+   *   - Oracle: COMMIT WAIT
+   * - Async
+   *   - SQL Server: delayed durability
+   *   - PostgreSQL: synchronous_commit=off
+   *   - Oracle: COMMIT NOWAIT
+   * - Volatile
+   *   - No production equivalent; it is the logging-disabled research
+   *     baseline.
+   *
+   * Default: Async
+   */
+  enum class CommitDurability {
+    Volatile,
+    Async,
+    Sync,
+  };
+  CommitDurability commit_durability = CommitDurability::Async;
+
+  /**
+   * @brief
+   * True while LineairDB performs logging for recovery.
+   *
+   * @deprecated Derived from commit_durability, which is the setting that
+   * decides logging. The Database ignores the value set here and derives its
+   * own stored copy from commit_durability. The field remains so that
+   * existing code that reads it keeps compiling.
    */
   bool enable_logging = true;
 

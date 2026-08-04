@@ -92,7 +92,17 @@ class Database::Impl {
     return frontier + 1;
   }
 
-  static const Config& ValidateDataItemLayoutConfig(const Config& config) {
+  /**
+   * @brief The configuration this instance runs with: derived settings are
+   * resolved here, and unsupported combinations stop startup.
+   * @details Logging is decided by commit_durability. enable_logging is
+   * overwritten from it before any component reads it, so a caller that sets
+   * only commit_durability and a caller that sets both agree.
+   */
+  static Config NormalizeAndValidateConfig(Config config) {
+    config.enable_logging =
+        config.commit_durability != Config::CommitDurability::Volatile;
+
     // The epoch-frame write-ahead log has no truncation path, so a checkpoint
     // would grow the log instead of bounding it. Refuse the combination rather
     // than accept it and silently do nothing.
@@ -133,7 +143,7 @@ class Database::Impl {
 
  public:
   Impl(const Config& c = Config())
-      : config_(ValidateDataItemLayoutConfig(c)),
+      : config_(NormalizeAndValidateConfig(c)),
         thread_pool_(config_.max_thread),
         logger_(config_),
         callback_manager_(config_),

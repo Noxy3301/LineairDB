@@ -18,7 +18,7 @@ LineairDB::Config MakeConfig() {
       LineairDB::Config::ConcurrencyControl::Silo;
   config.index_structure = LineairDB::Config::IndexStructure::Masstree;
   config.enable_recovery = true;
-  config.enable_logging = true;
+  config.commit_durability = LineairDB::Config::CommitDurability::Async;
   config.enable_checkpointing = false;
   config.work_dir = "./lineairdb_stateless_recovery_tid_test_logs";
   return config;

@@ -22,7 +22,7 @@ LineairDB::Config MakeConfig(size_t epoch_duration_ms) {
       LineairDB::Config::ConcurrencyControl::Silo;
   config.index_structure = LineairDB::Config::IndexStructure::Masstree;
   config.enable_recovery = false;
-  config.enable_logging = false;
+  config.commit_durability = LineairDB::Config::CommitDurability::Volatile;
   config.enable_checkpointing = false;
   config.work_dir = "./lineairdb_deferred_purge_test_logs";
   std::filesystem::remove_all(config.work_dir);

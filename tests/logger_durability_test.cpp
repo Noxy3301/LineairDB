@@ -38,7 +38,7 @@ class LoggerDurabilityTest : public ::testing::Test {
     ASSERT_NE(::mkdtemp(buffer.data()), nullptr);
     root_ = buffer.data();
     config_.work_dir = root_ + "/logs";
-    config_.enable_logging = true;
+    config_.commit_durability = LineairDB::Config::CommitDurability::Async;
     config_.enable_checkpointing = false;
   }
 

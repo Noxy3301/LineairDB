@@ -139,7 +139,7 @@ class SecondaryIndexLoggingTest : public ::testing::Test {
     spdlog::set_level(spdlog::level::info);
     std::filesystem::remove_all("lineairdb_logs");
     config_.max_thread = 4;
-    config_.enable_logging = true;
+    config_.commit_durability = LineairDB::Config::CommitDurability::Async;
     config_.enable_recovery = true;
     // The epoch-frame write-ahead log has no checkpoint path; the test that
     // exercised checkpointing is disabled below.
@@ -154,7 +154,7 @@ TEST_F(SecondaryIndexLoggingTest,
        SecondaryIndexDeltaLoggingAvoidsFullPrimaryKeyList) {
   LineairDB::Config config = db_->GetConfig();
   config.enable_checkpointing = false;
-  config.enable_logging = true;
+  config.commit_durability = LineairDB::Config::CommitDurability::Async;
   config.enable_recovery = false;
 
   db_.reset(nullptr);
@@ -232,7 +232,7 @@ TEST_F(SecondaryIndexLoggingTest,
 TEST_F(SecondaryIndexLoggingTest, RecoveryWithSecondaryIndexWithoutCheckpoint) {
   LineairDB::Config config = db_->GetConfig();
   config.enable_checkpointing = false;
-  config.enable_logging = true;
+  config.commit_durability = LineairDB::Config::CommitDurability::Async;
   config.enable_recovery = true;
 
   db_.reset(nullptr);
@@ -292,7 +292,7 @@ TEST_F(SecondaryIndexLoggingTest,
   LineairDB::Config config = db_->GetConfig();
   config.enable_checkpointing = true;
   config.checkpoint_period = 1;
-  config.enable_logging = true;
+  config.commit_durability = LineairDB::Config::CommitDurability::Async;
   config.enable_recovery = true;
   config.max_thread = 4;
 
@@ -349,7 +349,7 @@ TEST_F(SecondaryIndexLoggingTest,
 
 TEST_F(SecondaryIndexLoggingTest, SecondaryIndexAddTimingRecorded) {
   LineairDB::Config config = db_->GetConfig();
-  config.enable_logging = true;
+  config.commit_durability = LineairDB::Config::CommitDurability::Async;
   config.enable_checkpointing = false;
   config.enable_recovery = false;
   config.max_thread = 1;
