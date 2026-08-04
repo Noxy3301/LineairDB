@@ -591,6 +591,18 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     unlocked_tids.emplace(item, unlocked);
   }
 
+  // The log snapshot was captured under the lock and still carries the
+  // locked TID; recovery would install it verbatim, and every later access
+  // to the key would spin on a lock nobody owns. Publish the unlocked TID
+  // into the snapshot, as the native commit path does.
+  if (has_log_set) {
+    for (auto& snapshot : log_set) {
+      const auto tid_it = unlocked_tids.find(snapshot.index_cache);
+      if (tid_it == unlocked_tids.end()) continue;
+      snapshot.data_item_copy.transaction_id.store(tid_it->second);
+    }
+  }
+
   // Phase 3.4: register slots left empty by this transaction for deferred
   // physical purge, keyed by the published unlocked TID; immediate removal
   // could free memory still visible to concurrent readers.
