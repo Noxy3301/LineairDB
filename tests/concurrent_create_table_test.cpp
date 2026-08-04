@@ -43,7 +43,12 @@ class ConcurrentCreateTableTest : public ::testing::Test {
   }
 };
 
-TEST_F(ConcurrentCreateTableTest, ConcurrentCreateTableAndCheckpoint) {
+// Was ConcurrentCreateTableAndCheckpoint. Checkpointing is not implemented
+// for the epoch-frame write-ahead log; the replacement opens its window with
+// epoch fences and races CreateTable against the epoch tick and the
+// callbacks it runs. The checkpoint traversal the old test also crossed is
+// gone with checkpointing itself.
+TEST_F(ConcurrentCreateTableTest, ConcurrentCreateTableAcrossEpochs) {
   constexpr size_t kNumWorkers = 4;
   constexpr size_t kTablesPerSec = 100;
 
@@ -63,8 +68,8 @@ TEST_F(ConcurrentCreateTableTest, ConcurrentCreateTableAndCheckpoint) {
     });
   }
 
-  db_->WaitForCheckpoint();
-  db_->WaitForCheckpoint();
+  db_->Fence();
+  db_->Fence();
 
   stop.store(true);
   for (auto& w : workers) {

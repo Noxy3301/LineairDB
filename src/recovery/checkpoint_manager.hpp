@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <fstream>
 #include <msgpack.hpp>
 #include <string_view>
 #include <thread>
