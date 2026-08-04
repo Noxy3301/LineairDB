@@ -18,6 +18,8 @@
 #define LINEAIRDB_EPOCH_FRAMEWORK_H_
 
 #include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include <atomic>
 #include <chrono>
@@ -99,9 +101,11 @@ class EpochFramework {
    * Once this has returned an epoch E, the global epoch cannot reach E+2 while
    * the slot still reads E: only one writer scan that missed the publication
    * can be outstanding, and the next one reads E. This assumes E stays clear
-   * of wraparound (#kEpochHighWater); a wrapped counter can hand out 0, which
-   * scans skip. A thread still inside the loop carries no such guarantee,
-   * which is why the contract above exists.
+   * of wraparound: the epoch writer stops the process at #kEpochHighWater
+   * rather than wrapping, and a counter seeded at or past the mark before
+   * #Start() fail-stops on the writer's first eligible advance. A thread
+   * still inside the loop carries no such guarantee, which is why the
+   * contract above exists.
    */
   EpochNumber MakeMeOnline() {
     std::atomic<EpochNumber>* my_epoch =
@@ -156,8 +160,11 @@ class EpochFramework {
   // Margin below the uint32 wrap point. Forced advances and fences refuse
   // beyond it, and a read view's epoch lifetime is bounded well under the
   // margin; every read-view epoch comparison therefore stays inside one
-  // wrap-free window where plain unsigned ordering is exact. The
-  // timer-driven advance is not capped.
+  // wrap-free window where plain unsigned ordering is exact. The timer-driven
+  // advance stops the process at the mark rather than wrapping: past the wrap,
+  // the epoch no longer orders against the durability frontier, so a commit
+  // could be acknowledged as durable against a comparison that has lost its
+  // meaning.
   static constexpr EpochNumber kEpochHighWater = UINT32_MAX - (1u << 20);
 
   // Asks the epoch writer to run its advance check now instead of at the
@@ -255,6 +262,17 @@ class EpochFramework {
         continue;
       }
       if (min_epoch == THREAD_OFFLINE || min_epoch == old_epoch) {
+        if (old_epoch >= kEpochHighWater) {
+          // Stopping here is the conservative end, including during the
+          // post-Stop() drain: an epoch that wraps stops ordering against
+          // the durability frontier, and refusing to advance instead would
+          // stall every commit that waits for its epoch to close.
+          fprintf(stderr,
+                  "LineairDB: the global epoch reached the high-water mark "
+                  "%u; stopping before the counter can run toward the wrap\n",
+                  kEpochHighWater);
+          std::abort();
+        }
         {
           // fetch_add is atomic, but we hold epoch_mtx_ here to
           // ensure Sync()'s cv.wait does not miss the subsequent
