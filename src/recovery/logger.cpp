@@ -41,6 +41,19 @@ namespace {
  * entry per secondary key, so a key deleted after being added does not come
  * back.
  */
+/**
+ * @brief Folds one more field's hash into a seed.
+ * @note The constant is 2^32 divided by the golden ratio, boost's
+ * hash_combine mixer; with the shifts it spreads each field's bits before
+ * the fold. Chosen over hashing a delimited concatenation, which would
+ * build a temporary string for every lookup on the recovery fold's hot
+ * path; combining folds the fields' std::hash values allocation-free.
+ */
+size_t HashCombine(size_t seed, size_t value) {
+  constexpr size_t kGoldenRatioMix = 0x9e3779b9u;
+  return seed ^ (value + kGoldenRatioMix + (seed << 6) + (seed >> 2));
+}
+
 WriteSetType BuildRecoverySet(const LogRecords& records) {
   struct SecondaryOpKey {
     std::string table_name;
@@ -59,12 +72,10 @@ WriteSetType BuildRecoverySet(const LogRecords& records) {
     size_t operator()(const SecondaryOpKey& key) const {
       const std::hash<std::string> hasher;
       size_t seed = hasher(key.table_name);
-      seed ^= hasher(key.index_name) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-      seed ^= std::hash<uint32_t>{}(key.index_type) + 0x9e3779b9 + (seed << 6) +
-              (seed >> 2);
-      seed ^=
-          hasher(key.secondary_key) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-      seed ^= hasher(key.primary_key) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+      seed = HashCombine(seed, hasher(key.index_name));
+      seed = HashCombine(seed, std::hash<uint32_t>{}(key.index_type));
+      seed = HashCombine(seed, hasher(key.secondary_key));
+      seed = HashCombine(seed, hasher(key.primary_key));
       return seed;
     }
   };
@@ -86,11 +97,9 @@ WriteSetType BuildRecoverySet(const LogRecords& records) {
     size_t operator()(const SecondaryGroupKey& key) const {
       const std::hash<std::string> hasher;
       size_t seed = hasher(key.table_name);
-      seed ^= hasher(key.index_name) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-      seed ^= std::hash<uint32_t>{}(key.index_type) + 0x9e3779b9 + (seed << 6) +
-              (seed >> 2);
-      seed ^=
-          hasher(key.secondary_key) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+      seed = HashCombine(seed, hasher(key.index_name));
+      seed = HashCombine(seed, std::hash<uint32_t>{}(key.index_type));
+      seed = HashCombine(seed, hasher(key.secondary_key));
       return seed;
     }
   };
@@ -102,6 +111,18 @@ WriteSetType BuildRecoverySet(const LogRecords& records) {
   std::unordered_map<SecondaryOpKey, SecondaryOpState, SecondaryOpKeyHash>
       secondary_latest;
   WriteSetType recovery_set;
+
+  // (table_name, key) -> position in recovery_set. Only the primary path
+  // uses it; a primary kvp always carries an empty index_name.
+  struct PrimaryKeyHash {
+    size_t operator()(const std::pair<std::string, std::string>& key) const {
+      const std::hash<std::string> hasher;
+      return HashCombine(hasher(key.first), hasher(key.second));
+    }
+  };
+  std::unordered_map<std::pair<std::string, std::string>, size_t,
+                     PrimaryKeyHash>
+      primary_position;
 
   for (const auto& log_record : records) {
     for (const auto& kvp : log_record.key_value_pairs) {
@@ -135,21 +156,23 @@ WriteSetType BuildRecoverySet(const LogRecords& records) {
           kvp.buffer.empty()
               ? nullptr
               : reinterpret_cast<const std::byte*>(kvp.buffer.data());
-      bool not_found = true;
-      for (auto& item : recovery_set) {
-        if (item.key == kvp.key && item.table_name == kvp.table_name &&
-            item.index_name == kvp.index_name) {
-          not_found = false;
-          if (item.data_item_copy.transaction_id.load() < kvp.tid) {
-            item.data_item_copy.Reset(value_ptr, kvp.buffer.size(), kvp.tid);
-            item.table_name = kvp.table_name;
-            item.index_name = kvp.index_name;
-            item.index_type =
-                Index::SecondaryIndexType::FromRaw(kvp.index_type);
-          }
+      // Folded through an index rather than a rescan of the set: the fold
+      // runs once per logged write, and a linear rescan makes recovery
+      // quadratic in the log size.
+      const auto it = primary_position.find({kvp.table_name, kvp.key});
+      const bool not_found = it == primary_position.end();
+      if (!not_found) {
+        auto& item = recovery_set[it->second];
+        if (item.data_item_copy.transaction_id.load() < kvp.tid) {
+          item.data_item_copy.Reset(value_ptr, kvp.buffer.size(), kvp.tid);
+          item.table_name = kvp.table_name;
+          item.index_name = kvp.index_name;
+          item.index_type = Index::SecondaryIndexType::FromRaw(kvp.index_type);
         }
       }
       if (not_found) {
+        primary_position.emplace(
+            std::make_pair(kvp.table_name, kvp.key), recovery_set.size());
         Snapshot snapshot = {
             kvp.key,
             reinterpret_cast<const std::byte*>(kvp.buffer.data()),
