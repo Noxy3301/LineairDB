@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <gtest/gtest.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -225,6 +226,36 @@ TEST_F(LoggerDurabilityTest, AsyncAndUnloggedCommitsDoNotWait) {
   sync_logger.AwaitCommitDurability(99, false);
   EXPECT_EQ(sync_logger.GetDurableEpoch(), 0u);
   sync_logger.StopAndDrainFlusher();
+}
+
+// With the fail-stop armed, a write failure ends the process by abort: under
+// Async nobody waits on the frontier, and a process that carried on would keep
+// acknowledging commits that exist only in memory. The rest of this file
+// constructs loggers without arming: there an I/O failure surfaces as
+// WaitResult::Failed instead of ending the process.
+TEST_F(LoggerDurabilityTest, ArmedFailStopEndsTheProcessOnASyncFailure) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+
+  WalIo io = WalIo::Posix();
+  io.fdatasync = [](int) {
+    errno = EIO;
+    return -1;
+  };
+
+  // Everything lives inside the child: a flusher started in the parent would
+  // not survive the fork the death test performs. Armed before the flusher
+  // starts, in the database's order.
+  EXPECT_EXIT(
+      {
+        Logger logger(config_, io);
+        logger.Recover();
+        logger.EnableProcessFailStop();
+        logger.StartFlusher();
+        logger.Enqueue(MakeWriteSet("alice"), 3);
+        logger.ScheduleFlush(3);
+        std::this_thread::sleep_for(kTestTimeout);
+      },
+      ::testing::KilledBySignal(SIGABRT), "");
 }
 
 TEST_F(LoggerDurabilityTest, RecordsAboveTheTargetAreCarriedForward) {

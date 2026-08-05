@@ -293,17 +293,31 @@ void Logger::PublishDurable(EpochNumber frontier) {
 }
 
 void Logger::PublishFailure(int error_number) {
+  bool fail_stop = false;
   {
     std::lock_guard<std::mutex> lock(durability_mutex_);
-    if (state_ == State::Failed) return;
-    state_ = State::Failed;
-    failure_errno_ = error_number;
-    SPDLOG_CRITICAL(
-        "Durability Error: the log cannot be written (errno {0}); no further "
-        "commit is acknowledged as durable",
-        error_number);
+    fail_stop = process_fail_stop_;
+    // A repeated failure has nothing new to publish, but arming still turns
+    // it into an abort: a failure that predates the arming must not exempt
+    // the process afterwards.
+    if (state_ != State::Failed) {
+      state_ = State::Failed;
+      failure_errno_ = error_number;
+      SPDLOG_CRITICAL(
+          "Durability Error: the log cannot be written (errno {0}); no "
+          "further commit is acknowledged as durable",
+          error_number);
+    } else if (!fail_stop) {
+      return;
+    }
   }
   durability_cv_.notify_all();
+  if (fail_stop) std::abort();
+}
+
+void Logger::EnableProcessFailStop() {
+  std::lock_guard<std::mutex> lock(durability_mutex_);
+  process_fail_stop_ = true;
 }
 
 void Logger::PublishStopped() {

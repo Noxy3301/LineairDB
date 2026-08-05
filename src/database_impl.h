@@ -193,6 +193,9 @@ class Database::Impl {
         epoch_framework_.SetGlobalEpoch(ResumeEpochAbove(scanned.frontier));
       }
     }
+    // Armed after recovery, which reports its own failures by refusing to
+    // start, and before the flusher that can raise one at run time.
+    if (config_.enable_logging) logger_.EnableProcessFailStop();
     logger_.StartFlusher();
     epoch_framework_.Start();
   }

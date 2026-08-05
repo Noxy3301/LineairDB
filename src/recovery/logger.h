@@ -139,6 +139,19 @@ class Logger {
    */
   void StopAndDrainFlusher();
 
+  /**
+   * @brief Makes an I/O failure stop the process, once the log is the
+   * durability contract's foundation rather than a component under test.
+   * @details A logger that cannot write has no way to make later commits
+   * durable, and under Async nobody waits to be told: the process would keep
+   * acknowledging commits that are only in memory, and a measurement taken
+   * after that point would describe a contract the run was no longer
+   * honouring.
+   * @note Armed explicitly, so a test that constructs a Logger directly can
+   * still observe the failure state instead of dying with it.
+   */
+  void EnableProcessFailStop();
+
  private:
   void PublishDurable(EpochNumber frontier);
   void PublishFailure(int error_number);
@@ -153,6 +166,7 @@ class Logger {
   std::condition_variable durability_cv_;
   State state_{State::Running};
   int failure_errno_{0};
+  bool process_fail_stop_{false};
 
   // Declared last: the backend's flusher publishes through the members above,
   // so it must be destroyed before them.
