@@ -129,9 +129,6 @@ struct Config {
    *   - Logging, acknowledged only after the committer's own epoch is
    *     durable.
    *
-   * @note The Sync acknowledgement gate is not implemented yet: the commit
-   * path treats Sync as Async until the gate lands.
-   *
    * The equivalent names elsewhere, to keep Async from being read as a faster
    * Sync:
    * - Sync

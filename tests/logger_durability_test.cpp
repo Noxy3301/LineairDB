@@ -2,10 +2,13 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <future>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -120,6 +123,108 @@ TEST_F(LoggerDurabilityTest, WaitersWakeAtEpochGranularity) {
   ASSERT_EQ(later.wait_for(kTestTimeout), std::future_status::ready);
   EXPECT_EQ(later.get(), Logger::WaitResult::Durable);
   logger.StopAndDrainFlusher();
+}
+
+// The acknowledgement a Sync commit waits for cannot be given while the
+// fdatasync that would earn it is still running. Holding the syscall makes the
+// order observable rather than merely likely.
+TEST_F(LoggerDurabilityTest, SyncAcknowledgementFollowsTheFdatasync) {
+  config_.commit_durability = LineairDB::Config::CommitDurability::Sync;
+
+  std::mutex mutex;
+  std::condition_variable held;
+  bool inside_fdatasync = false;
+  bool released = false;
+
+  WalIo io = WalIo::Posix();
+  auto posix_fdatasync = io.fdatasync;
+  io.fdatasync = [&](int fd) {
+    std::unique_lock<std::mutex> lock(mutex);
+    inside_fdatasync = true;
+    held.notify_all();
+    held.wait(lock, [&] { return released; });
+    lock.unlock();
+    return posix_fdatasync(fd);
+  };
+
+  Logger logger(config_, io);
+  std::atomic<bool> committer_started{false};
+  std::future<void> committer;
+
+  // Releases a held fdatasync and drains the flusher on every exit path: an
+  // assertion failure would otherwise leave the committer waiting forever,
+  // and the future's destructor would block before ~Logger could wake it.
+  // Declared after the future so unwinding runs the guard first; the drain
+  // wakes the committer with either the durable epoch or the stopped state.
+  struct ReleaseOnExit {
+    Logger& logger;
+    std::mutex& mutex;
+    std::condition_variable& held;
+    bool& released;
+    ~ReleaseOnExit() {
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        released = true;
+      }
+      held.notify_all();
+      logger.StopAndDrainFlusher();
+    }
+  } release_on_exit{logger, mutex, held, released};
+
+  ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::Ok);
+  logger.StartFlusher();
+
+  ASSERT_TRUE(logger.Enqueue(MakeWriteSet("alice"), 3));
+  committer = std::async(std::launch::async, [&logger, &committer_started] {
+    committer_started.store(true);
+    logger.AwaitCommitDurability(3, true);
+  });
+  // The timeout probe below measures the wait, not thread startup: flush only
+  // once the committer thread is provably running.
+  while (!committer_started.load()) std::this_thread::yield();
+  logger.ScheduleFlush(3);
+
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(held.wait_for(lock, kTestTimeout,
+                              [&] { return inside_fdatasync; }));
+  }
+  EXPECT_EQ(committer.wait_for(std::chrono::milliseconds(200)),
+            std::future_status::timeout);
+  EXPECT_EQ(logger.GetDurableEpoch(), 0u);
+
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    released = true;
+  }
+  held.notify_all();
+
+  ASSERT_EQ(committer.wait_for(kTestTimeout), std::future_status::ready);
+  committer.get();
+  EXPECT_EQ(logger.GetDurableEpoch(), 3u);
+  logger.StopAndDrainFlusher();
+}
+
+// Only Sync pays for the wait, and only for a transaction that left a record.
+TEST_F(LoggerDurabilityTest, AsyncAndUnloggedCommitsDoNotWait) {
+  Logger logger(config_);
+  ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::Ok);
+  logger.StartFlusher();
+
+  // Async: an epoch that will never be flushed still returns at once.
+  logger.AwaitCommitDurability(99, true);
+  EXPECT_EQ(logger.GetDurableEpoch(), 0u);
+  logger.StopAndDrainFlusher();
+
+  config_.commit_durability = LineairDB::Config::CommitDurability::Sync;
+  Logger sync_logger(config_);
+  ASSERT_EQ(sync_logger.Recover().status, Logger::RecoveryStatus::Ok);
+  sync_logger.StartFlusher();
+
+  // Sync, but nothing was enqueued: there is no record to wait for.
+  sync_logger.AwaitCommitDurability(99, false);
+  EXPECT_EQ(sync_logger.GetDurableEpoch(), 0u);
+  sync_logger.StopAndDrainFlusher();
 }
 
 TEST_F(LoggerDurabilityTest, RecordsAboveTheTargetAreCarriedForward) {
