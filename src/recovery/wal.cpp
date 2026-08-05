@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "crc32c.h"
+#include "util/debug_sync.hpp"
 #include "util/logger.hpp"
 
 namespace LineairDB {
@@ -501,6 +502,10 @@ WalAppendResult Wal::AppendGroup(
     append_failed_ = true;
     return {false, error};
   }
+  // The records are written but not yet known durable: a Sync commit waiting
+  // on this group must not have been acknowledged when this point is reached.
+  LINEAIRDB_DEBUG_SYNC("wal.before_fdatasync");
+
   int rc;
   do {
     rc = io_.fdatasync(fd_);
