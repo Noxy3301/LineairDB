@@ -67,6 +67,11 @@ struct WalAppendResult {
  * inject a write or fdatasync failure.
  * @note Everything else (open, pread, ftruncate, fsync) is always the real
  * syscall.
+ * @note LINEAIRDB_WAL_FDATASYNC_FAIL_AFTER=<count> makes the fdatasync that
+ * Posix() returns let that many calls through and fail every later call with
+ * EIO. Each Posix() call creates one counter, shared by every copy of the
+ * WalIo it returned. A value that is not decimal digits, or that does not
+ * fit in a long, stops startup.
  */
 struct WalIo {
   std::function<ssize_t(int, const void*, size_t)> write;

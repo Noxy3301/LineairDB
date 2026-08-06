@@ -6,8 +6,12 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <msgpack.hpp>
 #include <stdexcept>
 #include <system_error>
@@ -76,7 +80,42 @@ WalIo WalIo::Posix() {
   io.write = [](int fd, const void* data, size_t size) {
     return ::write(fd, data, size);
   };
-  io.fdatasync = [](int fd) { return ::fdatasync(fd); };
+
+  // Armed from the environment, like a debug sync point, so an out-of-process
+  // test can arrange an EIO. Unset means the bare syscall.
+  const char* raw = std::getenv("LINEAIRDB_WAL_FDATASYNC_FAIL_AFTER");
+  if (raw == nullptr) {
+    io.fdatasync = [](int fd) { return ::fdatasync(fd); };
+    return io;
+  }
+  // Digits only. A value that does not parse stops startup rather than
+  // arming a count no run reaches.
+  errno = 0;
+  char* end = nullptr;
+  const long successes = std::strtol(raw, &end, 10);
+  if (!std::isdigit(static_cast<unsigned char>(raw[0])) || *end != '\0' ||
+      errno == ERANGE) {
+    SPDLOG_CRITICAL(
+        "Invalid LINEAIRDB_WAL_FDATASYNC_FAIL_AFTER='{0}': expected a "
+        "non-negative count of calls to let through",
+        raw);
+    exit(EXIT_FAILURE);
+  }
+  auto remaining = std::make_shared<std::atomic<long>>(successes);
+  io.fdatasync = [remaining](int fd) -> int {
+    // Zero is sticky: a plain decrement would wrap and eventually let a call
+    // through again, making "fails every later call" false in the limit.
+    long current = remaining->load(std::memory_order_relaxed);
+    while (current > 0 &&
+           !remaining->compare_exchange_weak(current, current - 1,
+                                             std::memory_order_relaxed)) {
+    }
+    if (current <= 0) {
+      errno = EIO;
+      return -1;
+    }
+    return ::fdatasync(fd);
+  };
   return io;
 }
 

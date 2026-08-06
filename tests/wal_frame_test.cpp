@@ -650,4 +650,53 @@ TEST_F(WalFrameTest, EmptyGroupNeitherWritesNorSyncs) {
   EXPECT_EQ(FileSize(), 0);
 }
 
+TEST_F(WalFrameTest, InjectedFdatasyncFailsAfterTheAllowedCalls) {
+  ASSERT_EQ(::setenv("LINEAIRDB_WAL_FDATASYNC_FAIL_AFTER", "2", 1), 0);
+  LineairDB::Recovery::WalIo io = LineairDB::Recovery::WalIo::Posix();
+  // The factory captured the count; the variable must not leak to later
+  // tests.
+  ASSERT_EQ(::unsetenv("LINEAIRDB_WAL_FDATASYNC_FAIL_AFTER"), 0);
+
+  Wal wal(work_dir_, io);
+  ASSERT_EQ(wal.ScanAndRepair().status, WalScanResult::Status::Ok);
+  std::map<EpochNumber, LogRecords> buckets;
+  buckets[1] = MakeRecords(1, "k1");
+  ASSERT_TRUE(wal.AppendGroup(buckets, 1).ok);
+  buckets.clear();
+  buckets[2] = MakeRecords(2, "k2");
+  ASSERT_TRUE(wal.AppendGroup(buckets, 2).ok);
+  buckets.clear();
+  buckets[3] = MakeRecords(3, "k3");
+  const auto result = wal.AppendGroup(buckets, 3);
+  EXPECT_FALSE(result.ok);
+  EXPECT_EQ(result.error_number, EIO);
+
+  // The failed sync poisons the instance exactly like a failed write: a
+  // later append is refused before it touches the file.
+  const off_t size_after_failure = FileSize();
+  buckets.clear();
+  buckets[4] = MakeRecords(4, "k4");
+  EXPECT_FALSE(wal.AppendGroup(buckets, 4).ok);
+  EXPECT_EQ(FileSize(), size_after_failure);
+}
+
+TEST_F(WalFrameTest, AnUnparsableInjectionCountStopsStartup) {
+  const char* const malformed[] = {
+      "",      // armed with nothing
+      "abc",   // not a number
+      "1junk",  // trailing garbage
+      "-1",    // sign
+      "+1",    // sign
+      " 1",    // leading whitespace
+      "99999999999999999999",  // out of long range
+  };
+  for (const char* value : malformed) {
+    ASSERT_EQ(::setenv("LINEAIRDB_WAL_FDATASYNC_FAIL_AFTER", value, 1), 0);
+    EXPECT_EXIT(LineairDB::Recovery::WalIo::Posix(),
+                ::testing::ExitedWithCode(EXIT_FAILURE), "")
+        << "value: " << value;
+  }
+  ASSERT_EQ(::unsetenv("LINEAIRDB_WAL_FDATASYNC_FAIL_AFTER"), 0);
+}
+
 }  // namespace
