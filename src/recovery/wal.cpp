@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "crc32c.h"
+#include "flush_trace.h"
 #include "util/debug_sync.hpp"
 #include "util/logger.hpp"
 
@@ -663,10 +664,15 @@ WalAppendResult Wal::AppendGroup(
     std::abort();
   }
 
+  auto& trace                = FlushTrace::Instance();
+  const bool traced          = trace.Enabled();
+  const int64_t encode_begin = traced ? FlushTrace::Now() : 0;
+  uint32_t encoded_epochs    = 0;
   std::vector<uint8_t> group;
   EpochNumber last_encoded = frontier_;
   for (const auto& [epoch, records] : buckets) {
     if (epoch > target) break;
+    ++encoded_epochs;
     // A bucket the scan would reject is refused before anything is
     // written, which leaves the log's end known and this instance usable.
     if (records.empty() || epoch == 0) return {false, EINVAL};
@@ -699,6 +705,11 @@ WalAppendResult Wal::AppendGroup(
     PutLe32(frame + 16, crc.Finish());
   }
 
+  if (traced) {
+    trace.GroupEncode(encode_begin, FlushTrace::Now(), group.size(),
+                      encoded_epochs);
+  }
+
   if (group.empty()) return {true, 0};
 
   int error = 0;
@@ -713,15 +724,18 @@ WalAppendResult Wal::AppendGroup(
                static_cast<long long>(initialised_size_), extension_count_);
   }
 
+  const int64_t write_begin = traced ? FlushTrace::Now() : 0;
   if (!WriteAllAt(group.data(), group.size(), write_offset_, &error)) {
     state_ = State::Failed;
     return {false, error};
   }
+  if (traced) trace.GroupWrite(write_begin, FlushTrace::Now());
   // The records are written but not yet known durable: a Sync commit
   // waiting on this group must not have been acknowledged when this point
   // is reached.
   LINEAIRDB_DEBUG_SYNC("wal.before_fdatasync");
 
+  const int64_t sync_begin = traced ? FlushTrace::Now() : 0;
   int rc;
   do {
     rc = io_.fdatasync(fd_);
@@ -731,6 +745,7 @@ WalAppendResult Wal::AppendGroup(
     state_ = State::Failed;
     return {false, failure};
   }
+  if (traced) trace.GroupSync(sync_begin, FlushTrace::Now());
 
   write_offset_ += static_cast<off_t>(group.size());
   // Without preallocation the group carried the file's size with it.

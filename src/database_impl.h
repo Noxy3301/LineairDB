@@ -43,6 +43,7 @@
 #include "callback/callback_manager.h"
 #include "pax/version_store.hpp"
 #include "recovery/checkpoint_manager.hpp"
+#include "recovery/flush_trace.h"
 #include "concurrency_control/stable_read.hpp"
 #include "index/reaper.h"
 #include "recovery/logger.h"
@@ -196,6 +197,9 @@ class Database::Impl {
     // Armed after recovery, which reports its own failures by refusing to
     // start, and before the flusher that can raise one at run time.
     if (config_.enable_logging) logger_.EnableProcessFailStop();
+    // Built before any thread records, so its storage and its dump signal are
+    // in place rather than raised by whichever path happens to reach it first.
+    Recovery::FlushTrace::Instance();
     logger_.StartFlusher();
     epoch_framework_.Start();
   }
@@ -218,6 +222,9 @@ class Database::Impl {
         "Epoch number and Durable epoch number are ended at {0}, and {1}, "
         "respectively.",
         epoch_framework_.GetGlobalEpoch(), logger_.GetDurableEpoch());
+    // Written once every thread that records has joined, so the census reaches
+    // the filesystem without any of its cost landing on a measured path.
+    Recovery::FlushTrace::Instance().Dump();
     SPDLOG_INFO("LineairDB instance has been destructed.");
     assert(Database::Impl::CurrentDBInstance == this);
     Database::Impl::CurrentDBInstance = nullptr;

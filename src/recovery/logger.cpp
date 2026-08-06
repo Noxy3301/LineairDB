@@ -25,6 +25,7 @@
 #include <utility>
 #include <util/logger.hpp>
 
+#include "flush_trace.h"
 #include "impl/thread_local_logger.h"
 #include "types/definitions.h"
 
@@ -358,9 +359,24 @@ void Logger::AwaitCommitDurability(EpochNumber commit_epoch,
   if (durability_ != Config::CommitDurability::Sync) return;
   if (!log_enqueued) return;
 
+  // The sample is drawn before the wait, so a commit whose epoch is already
+  // durable is represented alongside one that waits. The watermark reading is
+  // what the commit saw on arrival; publication can land before the wait makes
+  // its own check, which is why the recorded field says only that.
+  auto& trace              = FlushTrace::Instance();
+  const bool sampled       = trace.SampleThisCommit();
+  const int64_t wait_enter = sampled ? FlushTrace::Now() : 0;
+  const bool not_durable_at_enter =
+      sampled &&
+      durable_epoch_.load(std::memory_order_seq_cst) < commit_epoch;
+
   // TimedOut cannot arrive from an infinite deadline; treating it as a failure
   // keeps a later finite deadline from turning into a silent acknowledgement.
   const auto result = WaitUntilDurable(commit_epoch, Deadline::max());
+  if (sampled) {
+    trace.RecordCommit(commit_epoch, wait_enter, FlushTrace::Now(),
+                       not_durable_at_enter);
+  }
   if (result == WaitResult::Durable) return;
 
   SPDLOG_CRITICAL(
