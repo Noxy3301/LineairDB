@@ -44,6 +44,9 @@ class LoggerDurabilityTest : public ::testing::Test {
     config_.work_dir = root_ + "/logs";
     config_.commit_durability = LineairDB::Config::CommitDurability::Async;
     config_.enable_checkpointing = false;
+    // Every fixture writes out its capacity before its first group; these
+    // logs hold a handful of frames.
+    config_.wal_initial_capacity_bytes = 1ull << 20;
   }
 
   void TearDown() override {
@@ -208,15 +211,20 @@ TEST_F(LoggerDurabilityTest, SyncAcknowledgementFollowsTheFdatasync) {
 
 // Only Sync pays for the wait, and only for a transaction that left a record.
 TEST_F(LoggerDurabilityTest, AsyncAndUnloggedCommitsDoNotWait) {
-  Logger logger(config_);
-  ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::Ok);
-  logger.StartFlusher();
+  {
+    Logger logger(config_);
+    ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::Ok);
+    logger.StartFlusher();
 
-  // Async: an epoch that will never be flushed still returns at once.
-  logger.AwaitCommitDurability(99, true);
-  EXPECT_EQ(logger.GetDurableEpoch(), 0u);
-  logger.StopAndDrainFlusher();
+    // Async: an epoch that will never be flushed still returns at once.
+    logger.AwaitCommitDurability(99, true);
+    EXPECT_EQ(logger.GetDurableEpoch(), 0u);
+    logger.StopAndDrainFlusher();
+  }
 
+  // The log is held exclusively for as long as a logger owns it, so the
+  // second contract gets its own scope rather than overlapping with the
+  // first.
   config_.commit_durability = LineairDB::Config::CommitDurability::Sync;
   Logger sync_logger(config_);
   ASSERT_EQ(sync_logger.Recover().status, Logger::RecoveryStatus::Ok);
@@ -275,7 +283,9 @@ TEST_F(LoggerDurabilityTest, RecordsAboveTheTargetAreCarriedForward) {
   }
 
   // Both epochs must be present, in order, after reopening.
-  LineairDB::Recovery::Wal wal(config_.work_dir);
+  LineairDB::Recovery::Wal wal(config_.work_dir,
+                              LineairDB::Recovery::WalIo::Posix(),
+                              config_.wal_initial_capacity_bytes);
   const auto scan = wal.ScanAndRepair();
   ASSERT_EQ(scan.status, LineairDB::Recovery::WalScanResult::Status::Ok);
   EXPECT_EQ(scan.frontier, 9u);
@@ -336,7 +346,7 @@ TEST_F(LoggerDurabilityTest, FdatasyncFailureHoldsTheFrontierAndFailsWaiters) {
 
 TEST_F(LoggerDurabilityTest, WriteFailureFailsWaiters) {
   WalIo io = WalIo::Posix();
-  io.write = [](int, const void*, size_t) -> ssize_t {
+  io.pwrite = [](int, const void*, size_t, off_t) -> ssize_t {
     errno = EIO;
     return -1;
   };
@@ -377,7 +387,9 @@ TEST_F(LoggerDurabilityTest, StopDrainsWhatWasAlreadyClosed) {
     EXPECT_EQ(logger.GetDurableEpoch(), 6u);
   }
 
-  LineairDB::Recovery::Wal wal(config_.work_dir);
+  LineairDB::Recovery::Wal wal(config_.work_dir,
+                              LineairDB::Recovery::WalIo::Posix(),
+                              config_.wal_initial_capacity_bytes);
   const auto scan = wal.ScanAndRepair();
   ASSERT_EQ(scan.status, LineairDB::Recovery::WalScanResult::Status::Ok);
   EXPECT_EQ(scan.frontier, 6u);

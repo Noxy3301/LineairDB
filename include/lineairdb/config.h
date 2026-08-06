@@ -154,6 +154,31 @@ struct Config {
 
   /**
    * @brief
+   * How much of the write-ahead log is made writable in place at a time.
+   *
+   * @details
+   * The log file is written out with zeroes to this size before any record
+   * lands in it, and records are then written in place, so a commit's
+   * fdatasync persists data and not the size, allocation, or extent-state
+   * metadata a growing file drags in (the benefit is filesystem- and
+   * device-specific). A log that grows past it is extended by the same
+   * amount again: a granularity rather than a limit. Larger means fewer
+   * synchronous extensions but a longer startup scan of the reserved
+   * region. Zero disables reservation and lets the file grow as written,
+   * which is what a Volatile database is given: it never writes a record.
+   *
+   * @note The storage stack must honour fsync/fdatasync; the supported
+   * ext4 setup uses its default data ordering and barriers. A log from a
+   * build that did not reserve is readable here; the reverse does not
+   * hold (such a build reads the reserved zeroes as a broken frame and
+   * refuses to start).
+   *
+   * Default: 64 MiB
+   */
+  uint64_t wal_initial_capacity_bytes = 64ull * 1024ull * 1024ull;
+
+  /**
+   * @brief
    * True while LineairDB performs logging for recovery.
    *
    * @deprecated Derived from commit_durability, which is the setting that
