@@ -282,11 +282,12 @@ bool Wal::PreadAll(uint8_t* out, size_t size, off_t offset, int* error) const {
   return true;
 }
 
-// Writes out zeroes over [from, to) and persists them. The zeroes put the
-// blocks in the written state, so a group flush into them persists data
-// and nothing else, and they mark a region that holds no frame, which is
-// what lets the scan find the end of the log. Both capacity
-// initialisation and tail repair are this one operation.
+// Writes out zeroes over [from, to) and persists them. The zeroes move any
+// size, allocation, or extent-state metadata work out of the group-flush
+// path (how much exists depends on the filesystem and device), and they
+// mark a region that holds no frame, which is what lets the scan find the
+// end of the log. Both capacity initialisation and tail repair are this
+// one operation.
 bool Wal::WriteZeroesAndSync(off_t from, off_t to, int* error) {
   if (to <= from) return true;
 
