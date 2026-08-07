@@ -18,6 +18,7 @@
 #define LINEAIRDB_CONFIG_H
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <thread>
 
