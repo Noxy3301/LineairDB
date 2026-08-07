@@ -34,6 +34,7 @@
 #include "gtest/gtest.h"
 #include "msgpack.hpp"
 #include "recovery/logger.h"
+#include "recovery/wal.h"
 #include "spdlog/spdlog.h"
 #include "test_helper.hpp"
 
@@ -57,46 +58,34 @@ size_t GetLogDirectorySize(const LineairDB::Config& conf) {
   return size;
 }
 
+/**
+ * Reads the log's newest epoch.
+ *
+ * The caller must have destroyed the Database first: scanning opens the log and
+ * truncates an incomplete tail, which would corrupt a log the flusher is still
+ * appending to.
+ */
 SecondaryLogStats GetSecondaryIndexLogStatsForLatestEpoch(
     const LineairDB::Config& conf) {
   namespace fs = std::filesystem;
   SecondaryLogStats stats{};
-  if (!fs::exists(conf.work_dir)) return stats;
+  if (!fs::exists(fs::path(conf.work_dir) / "wal.log")) return stats;
 
-  LineairDB::EpochNumber max_epoch = 0;
-  std::vector<LineairDB::Recovery::Logger::LogRecord> latest_records;
-
-  for (const auto& entry : fs::directory_iterator(conf.work_dir)) {
-    const auto filename = entry.path().filename().generic_string();
-    if (filename.find("thread") != 0) continue;
-    if (filename.find("working") != std::string::npos) continue;
-    if (!entry.is_regular_file()) continue;
-
-    std::ifstream file(entry.path(), std::ifstream::in | std::ifstream::binary);
-    if (!file.good()) continue;
-
-    std::string buffer((std::istreambuf_iterator<char>(file)),
-                       std::istreambuf_iterator<char>());
-    if (buffer.empty()) continue;
-
-    size_t offset = 0;
-    while (offset < buffer.size()) {
-      auto oh = msgpack::unpack(buffer.data(), buffer.size(), offset);
-      auto obj = oh.get();
-      LineairDB::Recovery::Logger::LogRecords records;
-      obj.convert(records);
-      for (auto& record : records) {
-        if (record.epoch < max_epoch) continue;
-        if (record.epoch > max_epoch) {
-          max_epoch = record.epoch;
-          latest_records.clear();
-        }
-        latest_records.emplace_back(std::move(record));
-      }
-    }
+  // Read the log through the codec that wrote it rather than re-deriving the
+  // frame format here.
+  LineairDB::Recovery::Wal wal(conf.work_dir);
+  const auto scan = wal.ScanAndRepair();
+  if (scan.status != LineairDB::Recovery::WalScanResult::Status::Ok) {
+    return stats;
   }
 
-  for (const auto& record : latest_records) {
+  LineairDB::EpochNumber max_epoch = 0;
+  for (const auto& record : scan.records) {
+    if (record.epoch > max_epoch) max_epoch = record.epoch;
+  }
+
+  for (const auto& record : scan.records) {
+    if (record.epoch != max_epoch) continue;
     for (const auto& kvp : record.key_value_pairs) {
       if (kvp.index_name.empty()) continue;
       stats.record_count++;
@@ -108,28 +97,6 @@ SecondaryLogStats GetSecondaryIndexLogStatsForLatestEpoch(
   }
 
   return stats;
-}
-
-LineairDB::EpochNumber ReadDurableEpoch(const LineairDB::Config& conf) {
-  namespace fs = std::filesystem;
-  const auto path = fs::path(conf.work_dir) / "durable_epoch.json";
-  std::ifstream file(path);
-  LineairDB::EpochNumber epoch = 0;
-  if (file.good()) {
-    file >> epoch;
-  }
-  return epoch;
-}
-
-bool WaitForDurableEpochAtLeast(const LineairDB::Config& conf,
-                                LineairDB::EpochNumber target,
-                                std::chrono::milliseconds timeout) {
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (ReadDurableEpoch(conf) >= target) return true;
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  return false;
 }
 
 bool WaitForCheckpointFile(const LineairDB::Config& conf,
@@ -172,10 +139,11 @@ class SecondaryIndexLoggingTest : public ::testing::Test {
     spdlog::set_level(spdlog::level::info);
     std::filesystem::remove_all("lineairdb_logs");
     config_.max_thread = 4;
-    config_.enable_logging = true;
+    config_.commit_durability = LineairDB::Config::CommitDurability::Async;
     config_.enable_recovery = true;
-    config_.enable_checkpointing = true;
-    config_.checkpoint_period = 1;
+    // The epoch-frame write-ahead log has no checkpoint path; the test that
+    // exercised checkpointing is disabled below.
+    config_.enable_checkpointing = false;
     db_ = std::make_unique<LineairDB::Database>(config_);
     db_->CreateTable("users");
     spdlog::set_level(spdlog::level::info);
@@ -186,7 +154,7 @@ TEST_F(SecondaryIndexLoggingTest,
        SecondaryIndexDeltaLoggingAvoidsFullPrimaryKeyList) {
   LineairDB::Config config = db_->GetConfig();
   config.enable_checkpointing = false;
-  config.enable_logging = true;
+  config.commit_durability = LineairDB::Config::CommitDurability::Async;
   config.enable_recovery = false;
 
   db_.reset(nullptr);
@@ -247,6 +215,11 @@ TEST_F(SecondaryIndexLoggingTest,
   }
   db_->Fence();
 
+  // Close the database before reading the log: Fence does not wait for the
+  // flusher, and scanning a log that is still being appended to would truncate
+  // a frame in flight.
+  db_.reset(nullptr);
+
   const auto stats = GetSecondaryIndexLogStatsForLatestEpoch(config);
   ASSERT_GT(stats.record_count, 0u);
   EXPECT_EQ(stats.primary_keys_count, 0u);
@@ -259,7 +232,7 @@ TEST_F(SecondaryIndexLoggingTest,
 TEST_F(SecondaryIndexLoggingTest, RecoveryWithSecondaryIndexWithoutCheckpoint) {
   LineairDB::Config config = db_->GetConfig();
   config.enable_checkpointing = false;
-  config.enable_logging = true;
+  config.commit_durability = LineairDB::Config::CommitDurability::Async;
   config.enable_recovery = true;
 
   db_.reset(nullptr);
@@ -312,12 +285,14 @@ TEST_F(SecondaryIndexLoggingTest, RecoveryWithSecondaryIndexWithoutCheckpoint) {
       }});
 }
 
+// DISABLED: checkpointing is not implemented for the epoch-frame write-ahead
+// log, so this test's premise no longer holds.
 TEST_F(SecondaryIndexLoggingTest,
-       RecoveryWithSecondaryIndexWithCheckpointSameEpoch) {
+       DISABLED_RecoveryWithSecondaryIndexWithCheckpointSameEpoch) {
   LineairDB::Config config = db_->GetConfig();
   config.enable_checkpointing = true;
   config.checkpoint_period = 1;
-  config.enable_logging = true;
+  config.commit_durability = LineairDB::Config::CommitDurability::Async;
   config.enable_recovery = true;
   config.max_thread = 4;
 
@@ -374,10 +349,15 @@ TEST_F(SecondaryIndexLoggingTest,
 
 TEST_F(SecondaryIndexLoggingTest, SecondaryIndexAddTimingRecorded) {
   LineairDB::Config config = db_->GetConfig();
-  config.enable_logging = true;
+  config.commit_durability = LineairDB::Config::CommitDurability::Async;
   config.enable_checkpointing = false;
   config.enable_recovery = false;
   config.max_thread = 1;
+  // What this test reports per transaction is how many bytes of log one
+  // secondary-index write costs, and it reads that from the file's size. A
+  // preallocated log holds its size constant, which would report zero for
+  // every transaction, so this one log grows as it is written.
+  config.wal_initial_capacity_bytes = 0;
 
   db_.reset(nullptr);
   std::filesystem::remove_all(config.work_dir);

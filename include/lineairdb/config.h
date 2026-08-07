@@ -18,6 +18,7 @@
 #define LINEAIRDB_CONFIG_H
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <thread>
 
@@ -115,29 +116,90 @@ struct Config {
 
   /**
    * @brief
-   * If true, LineairDB performs logging for recovery.
+   * When a committing transaction is told that it has committed, relative to
+   * when its log record is durable.
    *
-   * Default: true
+   * - Volatile
+   *   - No logging at all. A commit is acknowledged once it passes
+   *     validation; nothing is written and nothing is recoverable.
+   * - Async
+   *   - Logging, acknowledged at precommit. The record becomes durable
+   *     behind the committer, so an acknowledged transaction can be lost by
+   *     a crash that happens before its epoch is written.
+   * - Sync
+   *   - Logging, acknowledged only after the committer's own epoch is
+   *     durable.
+   *
+   * The equivalent names elsewhere, to keep Async from being read as a faster
+   * Sync:
+   * - Sync
+   *   - SQL Server: full durability
+   *   - PostgreSQL: synchronous_commit=on
+   *   - Oracle: COMMIT WAIT
+   * - Async
+   *   - SQL Server: delayed durability
+   *   - PostgreSQL: synchronous_commit=off
+   *   - Oracle: COMMIT NOWAIT
+   * - Volatile
+   *   - No production equivalent; it is the logging-disabled research
+   *     baseline.
+   *
+   * Default: Async
+   */
+  enum class CommitDurability {
+    Volatile,
+    Async,
+    Sync,
+  };
+  CommitDurability commit_durability = CommitDurability::Async;
+
+  /**
+   * @brief
+   * How much of the write-ahead log is made writable in place at a time.
+   *
+   * @details
+   * The log file is written out with zeroes to this size before any record
+   * lands in it, and records are then written in place, so a commit's
+   * fdatasync persists data and not the size, allocation, or extent-state
+   * metadata a growing file drags in (the benefit is filesystem- and
+   * device-specific). A log that grows past it is extended by the same
+   * amount again: a granularity rather than a limit. Larger means fewer
+   * synchronous extensions but a longer startup scan of the reserved
+   * region. Zero disables reservation and lets the file grow as written,
+   * which is what a Volatile database is given: it never writes a record.
+   *
+   * @note The storage stack must honour fsync/fdatasync; the supported
+   * ext4 setup uses its default data ordering and barriers. A log from a
+   * build that did not reserve is readable here; the reverse does not
+   * hold (such a build reads the reserved zeroes as a broken frame and
+   * refuses to start).
+   *
+   * Default: 64 MiB
+   */
+  uint64_t wal_initial_capacity_bytes = 64ull * 1024ull * 1024ull;
+
+  /**
+   * @brief
+   * True while LineairDB performs logging for recovery.
+   *
+   * @deprecated Derived from commit_durability, which is the setting that
+   * decides logging. The Database ignores the value set here and derives its
+   * own stored copy from commit_durability. The field remains so that
+   * existing code that reads it keeps compiling.
    */
   bool enable_logging = true;
 
   /**
    * @brief
-   * If true, LineairDB performs logging for checkpoint-recovery.
-   * Checkpointing prevents the log file size from increasing monotonically.
-   * i.e, if this parameter is set to false, The disk space used by LineairDB is
-   * unbounded.
-   * You can also turn off enable_logging and use only Checkpointing.
-   * This configure gives the recoverability property called CPR-consistency
-   * [1]. CPR-consitency may volatilize the data of committed transactions at
-   * last the number of seconds specified at checkpoint_period; however, the
-   * persistence of the data before that time is guaranteed.
+   * Checkpointing (CPR-consistency [1]) is not implemented for the
+   * epoch-frame write-ahead log: setting this to true is a startup error
+   * rather than a silent no-op, and the log grows without truncation.
    *
-   * Default: true
+   * Default: false
    * @ref [1]:
    * https://www.microsoft.com/en-us/research/uploads/prod/2019/01/cpr-sigmod19.pdf
    */
-  bool enable_checkpointing = true;
+  bool enable_checkpointing = false;
 
   /**
    * @brief

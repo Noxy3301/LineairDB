@@ -552,9 +552,7 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
   // Phase 3.2: build the log snapshot before unlock so a later transaction
   // cannot overwrite the values we just logged.
   WriteSetType log_set;
-  bool has_log_set = false;
   if (config.enable_logging) {
-    has_log_set = true;
     log_set.reserve(resolved_writes.size() + resolved_si_ops.size());
 
     for (const auto& write : resolved_writes) {
@@ -591,6 +589,16 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     unlocked_tids.emplace(item, unlocked);
   }
 
+  // The log snapshot was captured under the lock and still carries the
+  // locked TID; recovery would install it verbatim, and every later access
+  // to the key would spin on a lock nobody owns. Publish the unlocked TID
+  // into the snapshot, as the native commit path does.
+  for (auto& snapshot : log_set) {
+    const auto tid_it = unlocked_tids.find(snapshot.index_cache);
+    if (tid_it == unlocked_tids.end()) continue;
+    snapshot.data_item_copy.transaction_id.store(tid_it->second);
+  }
+
   // Phase 3.4: register slots left empty by this transaction for deferred
   // physical purge, keyed by the published unlocked TID; immediate removal
   // could free memory still visible to concurrent readers.
@@ -617,11 +625,14 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
   }
 
   // Phase 3.5: enqueue the log set, then leave the epoch.
-  if (has_log_set) {
-    logger.Enqueue(log_set, current_epoch, true);
+  bool log_enqueued = false;
+  if (!log_set.empty()) {
+    log_enqueued = logger.Enqueue(log_set, current_epoch);
   }
 
   epoch_framework.MakeMeOffline();
+
+  logger.AwaitCommitDurability(current_epoch, log_enqueued);
   return true;
 }
 

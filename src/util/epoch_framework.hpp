@@ -18,6 +18,8 @@
 #define LINEAIRDB_EPOCH_FRAMEWORK_H_
 
 #include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include <atomic>
 #include <chrono>
@@ -67,25 +69,68 @@ class EpochFramework {
   void SetGlobalEpoch(const EpochNumber epoch) { global_epoch_.store(epoch); }
 
   EpochNumber GetGlobalEpoch() const { return global_epoch_.load(); }
-  EpochNumber& GetMyThreadLocalEpoch() {
-    EpochNumber* my_epoch =
+
+  /**
+   * Returns the epoch this thread participates in, or #THREAD_OFFLINE for
+   * none. The slot stays private so that every access to it shares one
+   * sequentially consistent order with #GetSmallestEpoch's scan.
+   */
+  EpochNumber GetMyThreadLocalEpoch() {
+    std::atomic<EpochNumber>* my_epoch =
         tls_.Get<EpochNumber>([]() { return THREAD_OFFLINE; });
-    return *my_epoch;
+    return my_epoch->load(std::memory_order_seq_cst);
   }
 
-  EpochNumber MakeMeOnline() {
-    EpochNumber* my_epoch =
+  /**
+   * Overwrites this thread's epoch with a replayed one. Valid only before
+   * #Start(), where the epoch writer has not begun scanning slots.
+   */
+  void SetMyThreadLocalEpochForRecovery(const EpochNumber epoch) {
+    assert(!start_.load(std::memory_order_seq_cst));
+    assert(epoch != THREAD_OFFLINE);
+    std::atomic<EpochNumber>* my_epoch =
         tls_.Get<EpochNumber>([]() { return THREAD_OFFLINE; });
-    assert(*my_epoch == THREAD_OFFLINE);
-    *my_epoch = GetGlobalEpoch();
-    return *my_epoch;
+    assert(my_epoch->load(std::memory_order_seq_cst) != THREAD_OFFLINE);
+    my_epoch->store(epoch, std::memory_order_seq_cst);
+  }
+
+  /**
+   * Joins the current epoch and returns it. The caller must not enqueue log
+   * records, and must not take its commit epoch, before this returns.
+   *
+   * Once this has returned an epoch E, the global epoch cannot reach E+2 while
+   * the slot still reads E: only one writer scan that missed the publication
+   * can be outstanding, and the next one reads E. This assumes E stays clear
+   * of wraparound: the epoch writer stops the process at #kEpochHighWater
+   * rather than wrapping, and a counter seeded at or past the mark before
+   * #Start() fail-stops on the writer's first eligible advance. A thread
+   * still inside the loop carries no such guarantee, which is why the
+   * contract above exists.
+   */
+  EpochNumber MakeMeOnline() {
+    std::atomic<EpochNumber>* my_epoch =
+        tls_.Get<EpochNumber>([]() { return THREAD_OFFLINE; });
+    assert(my_epoch->load(std::memory_order_seq_cst) == THREAD_OFFLINE);
+
+    EpochNumber published = global_epoch_.load(std::memory_order_seq_cst);
+    for (;;) {
+      my_epoch->store(published, std::memory_order_seq_cst);
+      const EpochNumber reloaded =
+          global_epoch_.load(std::memory_order_seq_cst);
+      if (reloaded == published) return published;
+      // A single store does not suffice: two consecutive writer scans can
+      // read the slot before the store lands, and the advances they gate
+      // leave this thread online two epochs behind. Republish until the
+      // reload agrees.
+      published = reloaded;
+    }
   }
 
   void MakeMeOffline() {
-    EpochNumber* my_epoch =
+    std::atomic<EpochNumber>* my_epoch =
         tls_.Get<EpochNumber>([]() { return THREAD_OFFLINE; });
-    assert(*my_epoch != THREAD_OFFLINE);
-    *my_epoch = THREAD_OFFLINE;
+    assert(my_epoch->load(std::memory_order_seq_cst) != THREAD_OFFLINE);
+    my_epoch->store(THREAD_OFFLINE, std::memory_order_seq_cst);
   }
 
   EpochNumber Sync() {
@@ -115,8 +160,11 @@ class EpochFramework {
   // Margin below the uint32 wrap point. Forced advances and fences refuse
   // beyond it, and a read view's epoch lifetime is bounded well under the
   // margin; every read-view epoch comparison therefore stays inside one
-  // wrap-free window where plain unsigned ordering is exact. The
-  // timer-driven advance is not capped.
+  // wrap-free window where plain unsigned ordering is exact. The timer-driven
+  // advance stops the process at the mark rather than wrapping: past the wrap,
+  // the epoch no longer orders against the durability frontier, so a commit
+  // could be acknowledged as durable against a comparison that has lost its
+  // meaning.
   static constexpr EpochNumber kEpochHighWater = UINT32_MAX - (1u << 20);
 
   // Asks the epoch writer to run its advance check now instead of at the
@@ -173,8 +221,8 @@ class EpochFramework {
  public:
   uint32_t GetSmallestEpoch() {
     uint32_t min_epoch = THREAD_OFFLINE;
-    tls_.ForEach([&](const EpochNumber* local_epoch) {
-      const EpochNumber e = *local_epoch;
+    tls_.ForEach([&](const std::atomic<EpochNumber>* local_epoch) {
+      const EpochNumber e = local_epoch->load(std::memory_order_seq_cst);
       if (0 < e && e < min_epoch) {
         min_epoch = e;
       }
@@ -214,6 +262,17 @@ class EpochFramework {
         continue;
       }
       if (min_epoch == THREAD_OFFLINE || min_epoch == old_epoch) {
+        if (old_epoch >= kEpochHighWater) {
+          // Stopping here is the conservative end, including during the
+          // post-Stop() drain: an epoch that wraps stops ordering against
+          // the durability frontier, and refusing to advance instead would
+          // stall every commit that waits for its epoch to close.
+          fprintf(stderr,
+                  "LineairDB: the global epoch reached the high-water mark "
+                  "%u; stopping before the counter can run toward the wrap\n",
+                  kEpochHighWater);
+          std::abort();
+        }
         {
           // fetch_add is atomic, but we hold epoch_mtx_ here to
           // ensure Sync()'s cv.wait does not miss the subsequent
@@ -239,7 +298,7 @@ class EpochFramework {
   std::condition_variable worker_cv_;
   const std::function<void(EpochNumber)> publish_target_;
   std::thread epoch_writer_;
-  ThreadKeyStorage<EpochNumber> tls_;
+  ThreadKeyStorage<std::atomic<EpochNumber>> tls_;
 };
 
 }  // namespace LineairDB

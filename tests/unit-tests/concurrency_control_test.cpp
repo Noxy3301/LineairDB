@@ -40,7 +40,7 @@ class ConcurrencyControlTest
   virtual void SetUp() {
     config_.concurrency_control_protocol = ConcurrencyControlTest::GetParam();
     config_.enable_recovery = false;
-    config_.enable_logging = false;
+    config_.commit_durability = LineairDB::Config::CommitDurability::Volatile;
     config_.enable_checkpointing = false;
     // NOTE: The testcase AvoidingReadOnlyAnomaly requires to be executed on 3
     // threads in parallel.
