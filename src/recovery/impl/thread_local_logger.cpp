@@ -92,8 +92,8 @@ bool ThreadLocalLogger::Enqueue(const WriteSetType& ws_ref, EpochNumber epoch) {
   return true;
 }
 
-WalScanResult ThreadLocalLogger::ScanAndRepairWal() {
-  return wal_.ScanAndRepair();
+WalScanResult ThreadLocalLogger::ScanAndRepairWal(EpochNumber min_epoch) {
+  return wal_.ScanAndRepair(min_epoch);
 }
 
 void ThreadLocalLogger::StartFlusher() {

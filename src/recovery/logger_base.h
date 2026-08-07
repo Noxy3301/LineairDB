@@ -42,7 +42,7 @@ class LoggerBase {
    * @brief Reads and repairs the log. Must complete before the flusher
    * starts.
    */
-  virtual WalScanResult ScanAndRepairWal() = 0;
+  virtual WalScanResult ScanAndRepairWal(EpochNumber min_epoch) = 0;
 
   /** @brief Starts the flusher. Called once, after the log has been
    * scanned. */

@@ -56,6 +56,9 @@ struct WalScanResult {
   bool tail_truncated{false};
   int error_number{0};
   std::string detail;
+  /** Frames the scan verified but did not decode, and what they held. */
+  size_t frames_skipped{0};
+  uint64_t bytes_skipped{0};
 };
 
 struct WalAppendResult {
@@ -147,8 +150,13 @@ class Wal {
    * with zeroes a later shorter group would leave them behind as a frame
    * the next scan cannot place. A scan run after this instance has already
    * failed does not retry; it reports the failure again.
+   *
+   * A frame at or below `min_epoch` is verified and counted but not decoded,
+   * for a caller that already holds the state those frames would rebuild. The
+   * checksum is still taken: the frontier and the end of the log come from
+   * every frame, whether or not its records are wanted.
    */
-  WalScanResult ScanAndRepair();
+  WalScanResult ScanAndRepair(EpochNumber min_epoch = 0);
 
   /**
    * @brief Appends one frame per bucket whose epoch is at or below `target`,

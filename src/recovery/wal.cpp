@@ -479,7 +479,7 @@ WalScanResult Wal::FinishScan(WalScanResult&& result, off_t end_of_log) {
   return std::move(result);
 }
 
-WalScanResult Wal::ScanAndRepair() {
+WalScanResult Wal::ScanAndRepair(EpochNumber min_epoch) {
   if (state_ == State::Failed) {
     return IoFailure("scan " + path_ + " after a failure", EIO);
   }
@@ -494,6 +494,8 @@ WalScanResult Wal::ScanAndRepair() {
   LogRecords records;
   EpochNumber frontier = 0;
   bool have_frame = false;
+  size_t frames_skipped = 0;
+  uint64_t bytes_skipped = 0;
   off_t offset = 0;
   uint8_t header[kHeaderSize];
   std::vector<uint8_t> payload;
@@ -565,6 +567,18 @@ WalScanResult Wal::ScanAndRepair() {
     if (have_frame && epoch < frontier) return Corrupt("frame epoch regressed");
     if (epoch == 0) return Corrupt("frame epoch is zero");
 
+    // The records of a frame the caller already holds are not rebuilt, but the
+    // frame still counts: where the log ends and how far it is durable are
+    // properties of every frame in it.
+    if (epoch <= min_epoch) {
+      ++frames_skipped;
+      bytes_skipped += kHeaderSize + payload_size;
+      frontier = epoch;
+      have_frame = true;
+      offset = static_cast<off_t>(frame_end);
+      continue;
+    }
+
     LogRecords decoded;
     try {
       size_t consumed = 0;
@@ -598,6 +612,8 @@ WalScanResult Wal::ScanAndRepair() {
   WalScanResult result;
   result.status = WalScanResult::Status::Ok;
   result.frontier = frontier;
+  result.frames_skipped = frames_skipped;
+  result.bytes_skipped = bytes_skipped;
 
   if (!anomaly.empty()) {
     int error = 0;
