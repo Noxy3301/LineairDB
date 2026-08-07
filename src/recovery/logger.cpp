@@ -35,14 +35,6 @@ namespace Recovery {
 namespace {
 
 /**
- * Folds decoded records into the write set the database replays.
- *
- * A key may appear in several epochs; the newest transaction id wins. Secondary
- * index entries arrive as per-primary-key deltas and are regrouped into one
- * entry per secondary key, so a key deleted after being added does not come
- * back.
- */
-/**
  * @brief Folds one more field's hash into a seed.
  * @note The constant is 2^32 divided by the golden ratio, boost's
  * hash_combine mixer; with the shifts it spreads each field's bits before
@@ -55,6 +47,14 @@ size_t HashCombine(size_t seed, size_t value) {
   return seed ^ (value + kGoldenRatioMix + (seed << 6) + (seed >> 2));
 }
 
+/**
+ * Folds decoded records into the write set the database replays.
+ *
+ * A key may appear in several epochs; the newest transaction id wins. Secondary
+ * index entries arrive as per-primary-key deltas and are regrouped into one
+ * entry per secondary key, so a key deleted after being added does not come
+ * back.
+ */
 WriteSetType BuildRecoverySet(const LogRecords& records) {
   struct SecondaryOpKey {
     std::string table_name;
