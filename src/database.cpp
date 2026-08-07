@@ -167,8 +167,8 @@ bool Database::ValidateAndCommit(
                                       range_reads, abort_reason);
 }
 
-bool Database::WriteCheckpointImage() {
-  return db_pimpl_->WriteCheckpointImage();
+bool Database::WriteCheckpointImage(uint64_t* out_version_retries) {
+  return db_pimpl_->WriteCheckpointImage(out_version_retries);
 }
 
 }  // namespace LineairDB

@@ -459,11 +459,14 @@ class Database {
    * the epoch to advance past every transaction in flight, and its own would
    * hold that open.
    *
+   * @param out_version_retries Optional out parameter, set to how many times a
+   *        row had to be read again because a writer held it or changed it
+   *        during the copy.
    * @return true when an image was published.
    * @return false when the attempt was abandoned, leaving the image published
    *         before it, if any, in place.
    */
-  bool WriteCheckpointImage();
+  bool WriteCheckpointImage(uint64_t* out_version_retries = nullptr);
 
   class Impl;
 

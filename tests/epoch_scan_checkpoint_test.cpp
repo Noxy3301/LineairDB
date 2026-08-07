@@ -167,6 +167,20 @@ class EpochScanCheckpointTest : public ::testing::Test {
     return rows;
   }
 
+  /** Every secondary-index hit, as `secondary_key/primary_key=value`. */
+  static std::vector<std::string> ReadIndex(LineairDB::Database& db) {
+    auto result = db.StatelessSecondaryRangeScan(kTable, kIndex, "", "\xff", 0,
+                                                 false);
+    db.ReleaseMasstreeThreadEpoch();
+    std::vector<std::string> hits;
+    for (const auto& row : result.rows) {
+      hits.emplace_back(row.secondary_key + "/" + row.primary_key + "=" +
+                        row.value);
+    }
+    std::sort(hits.begin(), hits.end());
+    return hits;
+  }
+
   /** The row value the image holds for `key`, if it holds one. */
   static std::optional<std::string> RowInImage(
       const EpochScanCheckpoint::Image& image, const std::string& key) {
@@ -340,23 +354,59 @@ TEST_F(EpochScanCheckpointTest, RecoveryWithTheImageMatchesRecoveryWithout) {
   }
 
   std::vector<std::string> with_image;
+  std::vector<std::string> index_with_image;
   {
     auto config = MakeConfig(true);
     LineairDB::Database db(config);
     with_image = ReadAll(db);
+    index_with_image = ReadIndex(db);
   }
 
-  std::filesystem::remove(image_path());
+  std::error_code ec;
+  ASSERT_TRUE(std::filesystem::remove(image_path(), ec)) << ec.message();
   std::vector<std::string> without_image;
+  std::vector<std::string> index_without_image;
   {
     auto config = MakeConfig(true);
     LineairDB::Database db(config);
     without_image = ReadAll(db);
+    index_without_image = ReadIndex(db);
   }
 
   EXPECT_EQ(with_image, without_image);
   EXPECT_EQ(with_image,
             (std::vector<std::string>{"alice=two", "bob=", "carol=two"}));
+  EXPECT_EQ(index_with_image, index_without_image);
+  // The index reaches the row the tail rewrote and the one it added, and no
+  // longer reaches the row the tail deleted.
+  EXPECT_EQ(index_with_image,
+            (std::vector<std::string>{"s/alice=two", "s/carol=two"}));
+}
+
+TEST_F(EpochScanCheckpointTest, AnImageAheadOfTheLogIsIgnored) {
+  {
+    auto config = MakeConfig(false);
+    LineairDB::Database db(config);
+    ASSERT_TRUE(CommitWrite(db, "alice", "one"));
+    ASSERT_TRUE(CommitWrite(db, "bob", "one"));
+    // Nothing is written afterwards, so the scan ends past the epoch of the
+    // last frame the log holds.
+    ASSERT_TRUE(db.WriteCheckpointImage());
+  }
+
+  const auto image = EpochScanCheckpoint::Load(work_dir_);
+  ASSERT_EQ(image.status, EpochScanCheckpoint::Image::Status::Ok);
+  {
+    Wal wal(work_dir_, LineairDB::Recovery::WalIo::Posix(), 1ull << 20);
+    auto scan = wal.ScanAndRepair(0);
+    ASSERT_EQ(scan.status, WalScanResult::Status::Ok);
+    ASSERT_LT(scan.frontier, image.end_epoch);
+  }
+
+  auto config = MakeConfig(true);
+  LineairDB::Database db(config);
+  EXPECT_EQ(Read(db, "alice").value, "one");
+  EXPECT_EQ(Read(db, "bob").value, "one");
 }
 
 TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
@@ -377,8 +427,10 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
       "arrive_and_wait:" + std::to_string(write_arrived.write_fd()) + ":" +
           std::to_string(write_release.read_fd()));
 
-  auto scan = std::async(std::launch::async,
-                         [&db] { return db.WriteCheckpointImage(); });
+  uint64_t version_retries = 0;
+  auto scan = std::async(std::launch::async, [&db, &version_retries] {
+    return db.WriteCheckpointImage(&version_retries);
+  });
   // See ReleaseOnExit: unblocks a scan parked at its current wait before
   // `scan`'s own destructor would otherwise join it forever.
   ReleaseOnExit release_scan_on_exit{scan_release.write_fd()};
@@ -431,6 +483,9 @@ TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {
 
   ASSERT_EQ(scan.wait_for(kTestTimeout), std::future_status::ready);
   EXPECT_TRUE(scan.get());
+  // The writer held both rows for the whole of its park, so a scan that
+  // reported no retry did not read them while they were held.
+  EXPECT_GT(version_retries, 0u);
   scan_arrived.CloseWrite();
   ASSERT_EQ(releaser.wait_for(kTestTimeout), std::future_status::ready);
   releaser.get();

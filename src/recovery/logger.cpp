@@ -285,10 +285,32 @@ Logger::RecoveryResult Logger::Recover() {
   }
 
   if (image.status == EpochScanCheckpoint::Image::Status::Ok) {
-    SPDLOG_INFO(
-        "Recovering from the checkpoint image of epoch {0}: {1} frames of {2} "
-        "bytes are covered by it and are not replayed",
-        image.cut_epoch, scan.frames_skipped, scan.bytes_skipped);
+    // An image is honoured only when the log reaches the last epoch its scan
+    // could have observed; a shorter log is not the one it was written
+    // against, and its cut would suppress frames nothing else supplies.
+    if (scan.frontier < image.end_epoch) {
+      SPDLOG_WARN(
+          "Ignoring the checkpoint image: its scan ended at epoch {0}, past "
+          "the last epoch {1} the log holds",
+          image.end_epoch, scan.frontier);
+      image.records.clear();
+      scan = logger_->ScanAndRepairWal(0);
+      if (scan.status != WalScanResult::Status::Ok) {
+        SPDLOG_CRITICAL("Durability Error: {0} ({1}), errno {2}", scan.detail,
+                        scan.status == WalScanResult::Status::Corrupt
+                            ? "corrupt"
+                            : "I/O error",
+                        scan.error_number);
+        PublishFailure(scan.error_number != 0 ? scan.error_number : EIO);
+        result.status = RecoveryStatus::Failed;
+        return result;
+      }
+    } else {
+      SPDLOG_INFO(
+          "Recovering from the checkpoint image of epoch {0}: {1} frames of "
+          "{2} bytes are covered by it and are not replayed",
+          image.cut_epoch, scan.frames_skipped, scan.bytes_skipped);
+    }
   }
 
   durable_epoch_.store(scan.frontier, std::memory_order_seq_cst);
