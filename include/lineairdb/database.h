@@ -451,6 +451,20 @@ class Database {
       const std::vector<ExternalRangeReadEntry>& range_reads = {},
       std::string* abort_reason = nullptr);
 
+  /**
+   * @brief Writes one image of the live rows, on the calling thread.
+   *
+   * Does what the configured checkpoint interval does, at a moment the caller
+   * chooses. The caller must not be inside a transaction: the scan waits for
+   * the epoch to advance past every transaction in flight, and its own would
+   * hold that open.
+   *
+   * @return true when an image was published.
+   * @return false when the attempt was abandoned, leaving the image published
+   *         before it, if any, in place.
+   */
+  bool WriteCheckpointImage();
+
   class Impl;
 
  private:
