@@ -313,8 +313,8 @@ bool Wal::WriteZeroesAndSync(off_t from, off_t to, int* error) {
     }
   }
 
-  // The size and the blocks have to reach the device before a group relies
-  // on its own fdatasync persisting data alone.
+  // The size and the blocks have to reach the device here, so that none of
+  // this initialisation work lands on a group's own fdatasync.
   if (FsyncRetryingOnInterrupt(fd_) != 0) {
     *error = errno;
     return false;
