@@ -3,6 +3,7 @@
 
 #include <sys/types.h>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -184,6 +185,20 @@ class Wal {
   off_t write_offset() const { return write_offset_; }
 
   /**
+   * @brief The epoch of the last frame actually on disk, safe to read from a
+   * thread other than the one that owns this instance between StartFlusher
+   * and the join.
+   * @details This moves only when a frame is written: an epoch that closed
+   * without a record advances the durable epoch a commit waits on, but it
+   * advances this not at all, which is what a caller needs from it when the
+   * question is what the log itself can be trusted to still hold after a
+   * crash.
+   */
+  EpochNumber frontier() const {
+    return frontier_.load(std::memory_order_seq_cst);
+  }
+
+  /**
    * @brief How many times capacity had to be extended.
    * @details Extension is synchronous and writes out a whole new region, so
    * a measurement that means to see the cost of a group flush alone has to
@@ -237,7 +252,7 @@ class Wal {
   uint64_t initial_capacity_bytes_;
   State state_{State::Unscanned};
   off_t write_offset_{0};
-  EpochNumber frontier_{0};
+  std::atomic<EpochNumber> frontier_{0};  // read cross-thread through frontier()
   /**
    * @brief The file's size, which under preallocation is also the offset
    * below which every block is allocated and holds written-out zeroes.

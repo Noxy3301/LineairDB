@@ -383,14 +383,14 @@ TEST_F(EpochScanCheckpointTest, RecoveryWithTheImageMatchesRecoveryWithout) {
             (std::vector<std::string>{"s/alice=two", "s/carol=two"}));
 }
 
-TEST_F(EpochScanCheckpointTest, AnImageAheadOfTheLogIsIgnored) {
+TEST_F(EpochScanCheckpointTest, AQuietTailAfterTheImageIsAccepted) {
   {
     auto config = MakeConfig(false);
     LineairDB::Database db(config);
     ASSERT_TRUE(CommitWrite(db, "alice", "one"));
     ASSERT_TRUE(CommitWrite(db, "bob", "one"));
     // Nothing is written afterwards, so the scan ends past the epoch of the
-    // last frame the log holds.
+    // last frame the log holds: the database went quiet before the image did.
     ASSERT_TRUE(db.WriteCheckpointImage());
   }
 
@@ -400,13 +400,72 @@ TEST_F(EpochScanCheckpointTest, AnImageAheadOfTheLogIsIgnored) {
     Wal wal(work_dir_, LineairDB::Recovery::WalIo::Posix(), 1ull << 20);
     auto scan = wal.ScanAndRepair(0);
     ASSERT_EQ(scan.status, WalScanResult::Status::Ok);
+    // The quiet tail this test is named for: the log's frontier never
+    // reaches the epoch the scan ended at, which is what made the v1 gate
+    // refuse a legitimate image.
     ASSERT_LT(scan.frontier, image.end_epoch);
+    // The v2 gate asks a question this log still answers: it reaches at
+    // least as far as the log was durable when the image was published.
+    ASSERT_GE(scan.frontier, image.wal_frontier_at_publish);
   }
 
   auto config = MakeConfig(true);
   LineairDB::Database db(config);
   EXPECT_EQ(Read(db, "alice").value, "one");
   EXPECT_EQ(Read(db, "bob").value, "one");
+}
+
+TEST_F(EpochScanCheckpointTest, ALogShorterThanThePublishFrontierIsRejected) {
+  const std::string short_log_copy = root_ + "/short_wal.log";
+  {
+    auto config = MakeConfig(false);
+    LineairDB::Database db(config);
+    ASSERT_TRUE(CommitWrite(db, "alice", "one"));
+    ASSERT_TRUE(CommitWrite(db, "bob", "one"));
+    // A copy of the log as it stands here, before the commits the image
+    // published below will require the log to reach.
+    std::filesystem::copy_file(work_dir_ + "/wal.log", short_log_copy);
+    ASSERT_TRUE(CommitWrite(db, "carol", "one"));
+    ASSERT_TRUE(CommitWrite(db, "dave", "one"));
+    ASSERT_TRUE(db.WriteCheckpointImage());
+  }
+
+  const auto image = EpochScanCheckpoint::Load(work_dir_);
+  ASSERT_EQ(image.status, EpochScanCheckpoint::Image::Status::Ok);
+
+  // Stand in for a log genuinely truncated, or substituted, after the image
+  // was published: put the earlier, shorter log back in its place.
+  std::filesystem::copy_file(
+      short_log_copy, work_dir_ + "/wal.log",
+      std::filesystem::copy_options::overwrite_existing);
+  Wal wal(work_dir_, LineairDB::Recovery::WalIo::Posix(), 1ull << 20);
+  const auto scan = wal.ScanAndRepair(0);
+  ASSERT_EQ(scan.status, WalScanResult::Status::Ok);
+  EXPECT_LT(scan.frontier, image.wal_frontier_at_publish);
+}
+
+TEST_F(EpochScanCheckpointTest, AV1FormatImageIsRefused) {
+  {
+    auto config = MakeConfig(false);
+    LineairDB::Database db(config);
+    ASSERT_TRUE(CommitWrite(db, "alice", "one"));
+    ASSERT_TRUE(db.WriteCheckpointImage());
+  }
+
+  // Downgrade the version field to what a v1 writer would have left. There is
+  // no migration for it: v1 has no wal_frontier_at_publish field to read.
+  {
+    std::fstream file(image_path(),
+                      std::ios::in | std::ios::out | std::ios::binary);
+    ASSERT_TRUE(file.is_open());
+    file.seekp(4);
+    const uint8_t v1_version[2] = {0x01, 0x00};
+    file.write(reinterpret_cast<const char*>(v1_version), sizeof(v1_version));
+  }
+
+  auto image = EpochScanCheckpoint::Load(work_dir_);
+  EXPECT_EQ(image.status, EpochScanCheckpoint::Image::Status::Unusable);
+  EXPECT_TRUE(image.records.empty());
 }
 
 TEST_F(EpochScanCheckpointTest, ARowLockedDuringTheScanIsRetried) {

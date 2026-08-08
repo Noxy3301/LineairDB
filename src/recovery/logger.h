@@ -97,6 +97,9 @@ class Logger {
     return durable_epoch_.load(std::memory_order_seq_cst);
   }
 
+  /** See LoggerBase::WalFrontier. */
+  EpochNumber GetWalFrontier() const { return logger_->WalFrontier(); }
+
   /**
    * @brief Blocks until the frontier reaches `commit_epoch`.
    * @details Pass Deadline::max() to wait without a timeout; shutdown and an

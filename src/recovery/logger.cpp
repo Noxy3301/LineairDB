@@ -285,14 +285,15 @@ Logger::RecoveryResult Logger::Recover() {
   }
 
   if (image.status == EpochScanCheckpoint::Image::Status::Ok) {
-    // An image is honoured only when the log reaches the last epoch its scan
-    // could have observed; a shorter log is not the one it was written
-    // against, and its cut would suppress frames nothing else supplies.
-    if (scan.frontier < image.end_epoch) {
+    // An image is honoured only when the log is at least as durable now as it
+    // was when this image was published, since durability only advances and a
+    // shorter log cannot be the one the image came from (see the FIXME above).
+    if (scan.frontier < image.wal_frontier_at_publish) {
       SPDLOG_WARN(
-          "Ignoring the checkpoint image: its scan ended at epoch {0}, past "
-          "the last epoch {1} the log holds",
-          image.end_epoch, scan.frontier);
+          "Ignoring the checkpoint image: it was published when the log was "
+          "durable through epoch {0}, past the last epoch {1} this log "
+          "holds",
+          image.wal_frontier_at_publish, scan.frontier);
       image.records.clear();
       scan = logger_->ScanAndRepairWal(0);
       if (scan.status != WalScanResult::Status::Ok) {
