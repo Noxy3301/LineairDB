@@ -57,9 +57,7 @@ size_t HashCombine(size_t seed, size_t value) {
  * back.
  *
  * The checkpoint image is folded in ahead of the log's tail as ordinary
- * records. The rule that resolves the two is the same one that resolves two
- * epochs of the log, which is what lets an image taken while transactions ran
- * be mixed with the records written during it.
+ * records, under the same rule that resolves two epochs of the log.
  */
 WriteSetType BuildRecoverySet(const LogRecords& image, const LogRecords& tail) {
   struct SecondaryOpKey {

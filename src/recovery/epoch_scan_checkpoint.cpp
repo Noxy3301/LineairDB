@@ -33,10 +33,9 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-// How long one row is spun on before it is set aside for the retry pass. A
-// writer holds a row for the length of its install, so a short spin covers the
-// common case and a longer wait belongs to the pass that runs without holding
-// up the rest of the table.
+// How long one row is spun on before it is set aside for the retry pass: a
+// short spin covers a writer's install, and a longer wait belongs to the
+// pass that runs without holding up the rest of the table.
 constexpr unsigned kSpinAttempts = 64;
 // The retry pass gives up eventually rather than scanning forever, because a
 // row that never settles means the image cannot be written at all.
@@ -160,12 +159,10 @@ const char* EpochScanCheckpoint::WorkingFileName() {
 }
 
 /**
- * Copies one row's bytes together with the version they belong to.
- *
- * The protocol is the read path's: refuse a locked version, copy, then confirm
- * the version did not move. A row that stays locked for the whole budget is
- * reported as unstable rather than skipped, because the transaction holding it
- * may still abort and leave no record of the value the image would be missing.
+ * Copies one row's bytes together with the version they belong to, by the
+ * read path's protocol: refuse a locked version, copy, confirm the version
+ * did not move. A row locked for the whole budget is unstable rather than
+ * skipped, since its holder may abort and leave no record of the value.
  */
 EpochScanCheckpoint::Capture EpochScanCheckpoint::CapturePrimaryRow(
     const std::string& table_name, std::string_view key, const DataItem& item,
@@ -207,10 +204,8 @@ EpochScanCheckpoint::Capture EpochScanCheckpoint::CapturePrimaryRow(
 
 /**
  * Copies one secondary key's whole primary-key list under the same protocol.
- *
- * The list is written as a complete posting list rather than as a delta, so a
- * later delta in the log composes with it the way one delta composes with
- * another.
+ * The list is a complete posting list rather than a delta, so a later delta
+ * in the log composes with it the way one delta composes with another.
  */
 EpochScanCheckpoint::Capture EpochScanCheckpoint::CaptureSecondaryEntry(
     const std::string& table_name, const std::string& index_name,
@@ -326,11 +321,9 @@ bool EpochScanCheckpoint::RunOnce(Stats* out_stats) {
   stats.generation = ++generation_;
 
   const auto barrier_begin = Clock::now();
-  // The cut is read before the barrier and the scan begins after it: once Sync
-  // returns, no thread is online in an epoch at or below the cut, so every
-  // commit that belongs to the replay's lower bound has already installed its
-  // values. Taking the scan's start time as the bound instead would drop the
-  // commits still in flight when it was taken.
+  // The cut is read before the barrier: once Sync returns, every commit at or
+  // below it has installed its values. A cut taken after the scan started
+  // would drop the commits still in flight at that moment.
   stats.cut_epoch = epoch_framework_.GetGlobalEpoch();
   // A conservative default; the durable epoch can pass closed empty epochs
   // that wrote no frame, and Publish overwrites this with the frame-backed
@@ -355,10 +348,9 @@ bool EpochScanCheckpoint::RunOnce(Stats* out_stats) {
     }
   });
 
-  // Ends the index's reclamation critical section, which the pass held open
-  // from its first walk so that a row retired during it could not be freed
-  // under the copy. Everything the pass keeps has been copied out by now, and
-  // an index reclaims nothing at all while a thread is inside one.
+  // Ends the reclamation critical section the pass held open from its first
+  // walk, so a row retired during it could not be freed under the copy; no
+  // index reclaims anything while a thread is inside one.
   Index::MasstreeReleaseThreadEpoch();
 
   stats.scan_ms = ElapsedMs(scan_begin);

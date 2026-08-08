@@ -27,23 +27,13 @@ class Logger;
 /**
  * @brief An image of the live rows, written while transactions keep running.
  *
- * The scan begins after EpochFramework::Sync, which is what makes the image
- * usable: once it returns, no thread is still online in an epoch at or below
- * the one recorded as the cut, so every commit at or below the cut has landed
- * in memory. Rows committed during the scan may be captured as well, and the
- * image is fuzzy in exactly that sense. Recovery folds the image under the
- * same newest-transaction-id-wins rule as the log and replays only the frames
- * above the cut, which resolves the mixture: a row the scan captured early is
- * overwritten by a later record, and a row it captured late already agrees
- * with one.
- *
- * A row is copied under the version protocol the read path uses, so the image
- * never holds a value torn by a concurrent install. The image is published
- * only once the log covers every epoch the scan could have observed, so a
- * recovery that reads it never installs a transaction whose record was lost.
- *
- * Nothing here bounds the size of the log on disk. What the image bounds is
- * how much of it recovery has to replay.
+ * The scan starts after a barrier, so every commit at or below the cut is
+ * already in memory; rows committed during the scan may be captured too, and
+ * recovery resolves that mixture by folding the image under the log's own
+ * newest-transaction-id-wins rule and replaying everything above the cut.
+ * Each row's copy is torn-free under the read path's version protocol, and
+ * the image is published only once the log covers every epoch the scan could
+ * have observed. What the image bounds is the replay, not the log on disk.
  */
 class EpochScanCheckpoint {
  public:
