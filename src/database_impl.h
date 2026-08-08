@@ -43,6 +43,7 @@
 #include "callback/callback_manager.h"
 #include "pax/version_store.hpp"
 #include "recovery/checkpoint_manager.hpp"
+#include "recovery/epoch_scan_checkpoint.h"
 #include "recovery/flush_trace.h"
 #include "concurrency_control/stable_read.hpp"
 #include "index/reaper.h"
@@ -149,7 +150,9 @@ class Database::Impl {
         logger_(config_),
         callback_manager_(config_),
         epoch_framework_(config_.epoch_duration_ms, EventsOnEpochIsUpdated()),
-        checkpoint_manager_(config_, table_dictionary_, epoch_framework_) {
+        checkpoint_manager_(config_, table_dictionary_, epoch_framework_),
+        scan_checkpoint_(config_, table_dictionary_, epoch_framework_,
+                         logger_) {
     // 2PL x Masstree unsupported (see 2PL ReadDirect FIXME).
     if (config_.concurrency_control_protocol ==
             Config::ConcurrencyControl::TwoPhaseLocking &&
@@ -202,12 +205,17 @@ class Database::Impl {
     Recovery::FlushTrace::Instance();
     logger_.StartFlusher();
     epoch_framework_.Start();
+    // Last: its scan waits on the epoch it starts.
+    scan_checkpoint_.Start();
   }
 
   ~Impl() {
     Fence();
     thread_pool_.StopAcceptingTransactions();
     epoch_framework_.Sync();
+    // Before the epoch writer stops, since a capture in progress waits for the
+    // epoch to advance.
+    scan_checkpoint_.Stop();
     checkpoint_manager_.Stop();
     epoch_framework_.Stop();
     // After the epoch writer has joined no further closed epoch arrives, so the
@@ -917,6 +925,13 @@ class Database::Impl {
     return table_dictionary_.GetTable(table_name);
   }
 
+  bool WriteCheckpointImage(uint64_t* out_version_retries) {
+    Recovery::EpochScanCheckpoint::Stats stats;
+    const bool published = scan_checkpoint_.RunOnce(&stats);
+    if (out_version_retries != nullptr) *out_version_retries = stats.retries;
+    return published;
+  }
+
  private:
   void RegisterDeferredPurge(const Snapshot& snapshot,
                              TransactionId delete_commit_tid) {
@@ -1005,6 +1020,7 @@ class Database::Impl {
   std::mutex fence_mtx_;
   std::condition_variable fence_cv_;
   Recovery::CPRManager checkpoint_manager_;
+  Recovery::EpochScanCheckpoint scan_checkpoint_;
   mutable std::shared_mutex schema_mutex_;
   Index::Reaper reaper_;
 };

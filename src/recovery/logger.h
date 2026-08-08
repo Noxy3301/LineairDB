@@ -97,6 +97,9 @@ class Logger {
     return durable_epoch_.load(std::memory_order_seq_cst);
   }
 
+  /** See LoggerBase::WalFrontier. */
+  EpochNumber GetWalFrontier() const { return logger_->WalFrontier(); }
+
   /**
    * @brief Blocks until the frontier reaches `commit_epoch`.
    * @details Pass Deadline::max() to wait without a timeout; shutdown and an
@@ -159,6 +162,9 @@ class Logger {
 
   const std::string work_dir_;
   const Config::CommitDurability durability_;
+  // Whether this instance replays what it reads, which is what decides
+  // whether a checkpoint image is read at all.
+  const bool replays_;
   std::atomic<EpochNumber> durable_epoch_{0};
 
   enum class State { Running, Stopped, Failed };

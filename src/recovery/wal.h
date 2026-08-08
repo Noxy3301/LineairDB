@@ -3,6 +3,7 @@
 
 #include <sys/types.h>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -56,6 +57,12 @@ struct WalScanResult {
   bool tail_truncated{false};
   int error_number{0};
   std::string detail;
+  /**
+   * Frames the scan did not decode, and what they held. Verified by checksum
+   * unless the scan hopped over it by header alone; see ScanAndRepair.
+   */
+  size_t frames_skipped{0};
+  uint64_t bytes_skipped{0};
 };
 
 struct WalAppendResult {
@@ -147,8 +154,14 @@ class Wal {
    * with zeroes a later shorter group would leave them behind as a frame
    * the next scan cannot place. A scan run after this instance has already
    * failed does not retry; it reports the failure again.
+   *
+   * A frame at or below `min_epoch` is counted but not decoded, for a caller
+   * that already holds the state it would rebuild; the frontier and log end
+   * still come from every frame. Such a frame is hopped by header alone,
+   * except the boundary frame, which is read and checksummed in full. A
+   * header that fails to parse falls back to a full scan from offset 0.
    */
-  WalScanResult ScanAndRepair();
+  WalScanResult ScanAndRepair(EpochNumber min_epoch = 0);
 
   /**
    * @brief Appends one frame per bucket whose epoch is at or below `target`,
@@ -174,6 +187,20 @@ class Wal {
   /** @brief Offset one past the last frame, which is where the next group
    * lands. */
   off_t write_offset() const { return write_offset_; }
+
+  /**
+   * @brief The epoch of the last frame actually on disk, safe to read from a
+   * thread other than the one that owns this instance between StartFlusher
+   * and the join.
+   * @details This moves only when a frame is written: an epoch that closed
+   * without a record advances the durable epoch a commit waits on, but it
+   * advances this not at all, which is what a caller needs from it when the
+   * question is what the log itself can be trusted to still hold after a
+   * crash.
+   */
+  EpochNumber frontier() const {
+    return frontier_.load(std::memory_order_seq_cst);
+  }
 
   /**
    * @brief How many times capacity had to be extended.
@@ -206,6 +233,12 @@ class Wal {
   WalScanResult Corrupt(const std::string& detail);
   WalScanResult IoFailure(const std::string& operation, int error);
   WalScanResult FinishScan(WalScanResult&& result, off_t end_of_log);
+  bool HopCoveredFrames(EpochNumber min_epoch, off_t file_size, off_t* offset,
+                       EpochNumber* frontier, bool* have_frame,
+                       size_t* frames_skipped, uint64_t* bytes_skipped,
+                       bool* guard_pending, off_t* guard_offset,
+                       uint32_t* guard_payload_size, uint8_t* guard_header,
+                       int* error) const;
   Probe ProbeFrameAt(off_t offset, off_t file_size, uint64_t* io_budget,
                      int* error) const;
   Probe SearchForFrameAfter(off_t offset, off_t search_end, off_t file_size,
@@ -229,7 +262,7 @@ class Wal {
   uint64_t initial_capacity_bytes_;
   State state_{State::Unscanned};
   off_t write_offset_{0};
-  EpochNumber frontier_{0};
+  std::atomic<EpochNumber> frontier_{0};  // read cross-thread through frontier()
   /**
    * @brief The file's size, which under preallocation is also the offset
    * below which every block is allocated and holds written-out zeroes.

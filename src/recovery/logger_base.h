@@ -42,7 +42,14 @@ class LoggerBase {
    * @brief Reads and repairs the log. Must complete before the flusher
    * starts.
    */
-  virtual WalScanResult ScanAndRepairWal() = 0;
+  virtual WalScanResult ScanAndRepairWal(EpochNumber min_epoch) = 0;
+
+  /**
+   * @brief The epoch of the last frame actually written to the log. Safe to
+   * call from a thread other than the flusher's; see Wal::frontier for what
+   * makes that safe and why it is not the same question as GetDurableEpoch.
+   */
+  virtual EpochNumber WalFrontier() const = 0;
 
   /** @brief Starts the flusher. Called once, after the log has been
    * scanned. */
