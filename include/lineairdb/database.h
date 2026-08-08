@@ -463,8 +463,9 @@ class Database {
    *        row had to be read again because a writer held it or changed it
    *        during the copy.
    * @return true when an image was published.
-   * @return false when the attempt was abandoned, leaving the image published
-   *         before it, if any, in place.
+   * @return false when no image was published, or when the final directory
+   *         sync failed after the atomic rename, in which case the new image
+   *         is in place but its publication is not yet durable.
    */
   bool WriteCheckpointImage(uint64_t* out_version_retries = nullptr);
 

@@ -93,10 +93,12 @@ class EpochScanCheckpoint {
   void Stop();
 
   /**
-   * @brief Captures one image and publishes it, or abandons the attempt and
-   * leaves the previously published image in place.
+   * @brief Captures one image and publishes it, or abandons the attempt.
+   * An abandoned attempt leaves the image published before it in place; only
+   * a directory-sync failure after the atomic rename can report failure with
+   * the new image already in place.
    * @param[out] out_stats What the capture did, when non-null.
-   * @return Whether it published.
+   * @return Whether it published durably.
    */
   bool RunOnce(Stats* out_stats = nullptr);
 
