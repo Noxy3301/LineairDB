@@ -438,10 +438,21 @@ TEST_F(EpochScanCheckpointTest, ALogShorterThanThePublishFrontierIsRejected) {
   std::filesystem::copy_file(
       short_log_copy, work_dir_ + "/wal.log",
       std::filesystem::copy_options::overwrite_existing);
-  Wal wal(work_dir_, LineairDB::Recovery::WalIo::Posix(), 1ull << 20);
-  const auto scan = wal.ScanAndRepair(0);
-  ASSERT_EQ(scan.status, WalScanResult::Status::Ok);
-  EXPECT_LT(scan.frontier, image.wal_frontier_at_publish);
+  {
+    Wal wal(work_dir_, LineairDB::Recovery::WalIo::Posix(), 1ull << 20);
+    const auto scan = wal.ScanAndRepair(0);
+    ASSERT_EQ(scan.status, WalScanResult::Status::Ok);
+    ASSERT_LT(scan.frontier, image.wal_frontier_at_publish);
+  }
+
+  // The refusal is only real if recovery acts on it: rows the image alone
+  // holds must not come back from a log that never carried them.
+  auto config = MakeConfig(true);
+  LineairDB::Database db(config);
+  EXPECT_EQ(Read(db, "alice").value, "one");
+  EXPECT_EQ(Read(db, "bob").value, "one");
+  EXPECT_FALSE(Read(db, "carol").found);
+  EXPECT_FALSE(Read(db, "dave").found);
 }
 
 TEST_F(EpochScanCheckpointTest, AV1FormatImageIsRefused) {
