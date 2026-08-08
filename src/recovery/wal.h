@@ -57,7 +57,10 @@ struct WalScanResult {
   bool tail_truncated{false};
   int error_number{0};
   std::string detail;
-  /** Frames the scan verified but did not decode, and what they held. */
+  /**
+   * Frames the scan did not decode, and what they held. Verified by checksum
+   * unless the scan hopped over it by header alone; see ScanAndRepair.
+   */
   size_t frames_skipped{0};
   uint64_t bytes_skipped{0};
 };
@@ -152,10 +155,11 @@ class Wal {
    * the next scan cannot place. A scan run after this instance has already
    * failed does not retry; it reports the failure again.
    *
-   * A frame at or below `min_epoch` is verified and counted but not decoded,
-   * for a caller that already holds the state those frames would rebuild. The
-   * checksum is still taken: the frontier and the end of the log come from
-   * every frame, whether or not its records are wanted.
+   * A frame at or below `min_epoch` is counted but not decoded, for a caller
+   * that already holds the state it would rebuild; the frontier and log end
+   * still come from every frame. Such a frame is hopped by header alone,
+   * except the boundary frame, which is read and checksummed in full. A
+   * header that fails to parse falls back to a full scan from offset 0.
    */
   WalScanResult ScanAndRepair(EpochNumber min_epoch = 0);
 
@@ -229,6 +233,12 @@ class Wal {
   WalScanResult Corrupt(const std::string& detail);
   WalScanResult IoFailure(const std::string& operation, int error);
   WalScanResult FinishScan(WalScanResult&& result, off_t end_of_log);
+  bool HopCoveredFrames(EpochNumber min_epoch, off_t file_size, off_t* offset,
+                       EpochNumber* frontier, bool* have_frame,
+                       size_t* frames_skipped, uint64_t* bytes_skipped,
+                       bool* guard_pending, off_t* guard_offset,
+                       uint32_t* guard_payload_size, uint8_t* guard_header,
+                       int* error) const;
   Probe ProbeFrameAt(off_t offset, off_t file_size, uint64_t* io_budget,
                      int* error) const;
   Probe SearchForFrameAfter(off_t offset, off_t search_end, off_t file_size,

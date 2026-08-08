@@ -26,6 +26,18 @@ class Crc32c {
 
 uint32_t ComputeCrc32c(const void* data, size_t size);
 
+/**
+ * @brief Test-only: forces the table or hardware path regardless of what the
+ * CPU running the test supports. UpdateWithSse42ForTesting() falls back to
+ * the table off x86 or without SSE4.2; check HasSse42ForTesting() to know
+ * which.
+ */
+uint32_t UpdateWithTableForTesting(uint32_t state, const void* data,
+                                   size_t size);
+uint32_t UpdateWithSse42ForTesting(uint32_t state, const void* data,
+                                   size_t size);
+bool HasSse42ForTesting();
+
 }  // namespace Recovery
 }  // namespace LineairDB
 

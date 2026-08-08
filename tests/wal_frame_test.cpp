@@ -1249,6 +1249,115 @@ TEST_F(WalFrameTest, EmptyGroupNeitherWritesNorSyncs) {
   EXPECT_EQ(wal.write_offset(), 0);
 }
 
+// The hop's whole point: a covered frame costs one header read and nothing
+// else, except the one frame right before the tail, which is read in full as
+// a guard on the boundary the caller is trusting.
+TEST_F(WalFrameTest, HopReadsOnlyTheGuardAndTailPayloads) {
+  AppendEpochs({1, 2, 3, 4, 5});
+
+  LineairDB::Recovery::WalIo io = LineairDB::Recovery::WalIo::Posix();
+  auto header_reads = std::make_shared<int>(0);
+  auto payload_reads = std::make_shared<int>(0);
+  auto real_pread = io.pread;
+  // A frame's payload here is a few dozen bytes; the only reads anywhere near
+  // capacity-sized are the unrelated end-of-log scan this test does not mean
+  // to count.
+  io.pread = [real_pread, header_reads, payload_reads](
+                 int fd, void* data, size_t size, off_t offset) -> ssize_t {
+    if (size == Wal::kHeaderSize) {
+      ++*header_reads;
+    } else if (size > Wal::kHeaderSize && size < 4096) {
+      ++*payload_reads;
+    }
+    return real_pread(fd, data, size, offset);
+  };
+
+  WalScanResult hopped;
+  {
+    Wal wal(work_dir_, io, kCapacity);
+    hopped = wal.ScanAndRepair(3);
+  }
+  ASSERT_EQ(hopped.status, WalScanResult::Status::Ok) << hopped.detail;
+  EXPECT_EQ(hopped.frames_skipped, 3u);
+  EXPECT_FALSE(hopped.tail_truncated);
+  ASSERT_EQ(hopped.records.size(), 2u);
+  EXPECT_EQ(hopped.records[0].epoch, 4u);
+  EXPECT_EQ(hopped.records[1].epoch, 5u);
+
+  // Header reads: 3 hopped frames, +1 to see the frame after them is past
+  // min_epoch, +3 more as the resuming scan re-reads that frame, the tail,
+  // and the all-zero header ending the log. 4 + 3 = 7.
+  EXPECT_EQ(*header_reads, 7);
+  // One payload read per frame that is not a pure hop: the guard at epoch 3
+  // plus the two tail frames.
+  EXPECT_EQ(*payload_reads, 3);
+
+  Wal full_wal(work_dir_, LineairDB::Recovery::WalIo::Posix(), kCapacity);
+  const auto full = full_wal.ScanAndRepair(0);
+  ASSERT_EQ(full.status, WalScanResult::Status::Ok);
+  EXPECT_EQ(hopped.frontier, full.frontier);
+  // bytes_skipped covers exactly the three hopped frames: the offset one past
+  // the third is where the first replayed frame, epoch 4, begins.
+  const off_t third_frame_end = FrameEnd(FrameEnd(FrameEnd(0)));
+  EXPECT_EQ(hopped.bytes_skipped, static_cast<uint64_t>(third_frame_end));
+}
+
+// The whole log at or below min_epoch: the guard is the true last frame, and
+// end-of-log handling has to run exactly as it would without a hop.
+TEST_F(WalFrameTest, HopOfTheWholeLogStillFinishesTheScan) {
+  AppendEpochs({1, 2, 3});
+  const off_t log_end = EndOfLog();
+
+  LineairDB::Recovery::WalIo io = LineairDB::Recovery::WalIo::Posix();
+  auto payload_reads = std::make_shared<int>(0);
+  auto real_pread = io.pread;
+  // The end-of-log check reads the whole capacity looking for a surviving
+  // frame once it finds the all-zero header past the last one; that read is
+  // far larger than any frame's payload here and is not what this counts.
+  io.pread = [real_pread, payload_reads](int fd, void* data, size_t size,
+                                         off_t offset) -> ssize_t {
+    if (size > Wal::kHeaderSize && size < 4096) ++*payload_reads;
+    return real_pread(fd, data, size, offset);
+  };
+
+  Wal wal(work_dir_, io, kCapacity);
+  const auto result = wal.ScanAndRepair(3);
+  ASSERT_EQ(result.status, WalScanResult::Status::Ok) << result.detail;
+  EXPECT_EQ(result.frontier, 3u);
+  EXPECT_EQ(result.frames_skipped, 3u);
+  EXPECT_TRUE(result.records.empty());
+  EXPECT_FALSE(result.tail_truncated);
+  EXPECT_EQ(wal.write_offset(), log_end);
+  // Only the guard, the true last frame of the log, has its payload read.
+  EXPECT_EQ(*payload_reads, 1);
+}
+
+// A corrupted length inside the covered region lands the hop's next header
+// read on bytes that don't parse; it can't tell that apart from a lie only
+// in the last covered frame, so it falls back to a full scan from offset 0.
+TEST_F(WalFrameTest, ACorruptedLengthInTheCoveredRegionFallsBackAndStaysCorrect) {
+  AppendEpochs({1, 2, 3, 4, 5});
+  // Frame 1's declared length, shrunk so the hop's blind trust in it lands
+  // mid-frame-1's own real payload rather than on frame 2's header.
+  SetPayloadLengthAt(0, 4);
+
+  WalScanResult hop_result;
+  {
+    Wal wal(work_dir_, LineairDB::Recovery::WalIo::Posix(), kCapacity);
+    hop_result = wal.ScanAndRepair(4);
+  }
+  WalScanResult full_result;
+  {
+    Wal wal(work_dir_, LineairDB::Recovery::WalIo::Posix(), kCapacity);
+    full_result = wal.ScanAndRepair(0);
+  }
+
+  EXPECT_EQ(full_result.status, WalScanResult::Status::Corrupt);
+  EXPECT_EQ(hop_result.status, full_result.status);
+  EXPECT_EQ(hop_result.detail, full_result.detail);
+  EXPECT_FALSE(hop_result.tail_truncated);
+}
+
 TEST_F(WalFrameTest, InjectedFdatasyncFailsAfterTheAllowedCalls) {
   ASSERT_EQ(::setenv("LINEAIRDB_WAL_FDATASYNC_FAIL_AFTER", "2", 1), 0);
   LineairDB::Recovery::WalIo io = LineairDB::Recovery::WalIo::Posix();
