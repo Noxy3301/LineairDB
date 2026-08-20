@@ -19,6 +19,8 @@
 #include <lineairdb/transaction.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <set>
 #include <utility>
@@ -38,6 +40,19 @@ thread_local void* current_transaction_context = nullptr;
 thread_local uint64_t tx_context_thread_tag =
     (std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xFFFFFFFF) << 32;
 thread_local uint64_t tx_context_seq = 0;
+
+// Above this many entries, a set lookup builds and uses a hash index instead
+// of scanning. Below it the scan is cheaper and allocates nothing.
+constexpr size_t kSetIndexThreshold = 64;
+
+uint64_t SetEntryHash(std::string_view table_name, std::string_view index_name,
+                      std::string_view key) {
+  const std::hash<std::string_view> hasher;
+  uint64_t hash = hasher(table_name);
+  hash = (hash ^ hasher(index_name)) * 0x100000001b3ull;
+  hash = (hash ^ hasher(key)) * 0x100000001b3ull;
+  return hash;
+}
 
 // True when this transaction wrote a base row inside [begin, end).
 bool HasOwnBaseRowWriteInRange(const WriteSetType& write_set,
@@ -243,6 +258,8 @@ void Transaction::Impl::Reset(Database::Impl* db_pimpl) {
       reinterpret_cast<void*>(tx_context_thread_tag | (++tx_context_seq & 0xFFFFFFFF));
   read_set_.clear();
   write_set_.clear();
+  read_index_ = {};
+  write_index_ = {};
   remainingNotNullSkWrites_.clear();
   node_version_set_.clear();
 
@@ -258,6 +275,50 @@ void Transaction::Impl::Reset(Database::Impl* db_pimpl) {
 
 TxStatus Transaction::Impl::GetCurrentStatus() { return current_status_; }
 
+Snapshot* Transaction::Impl::FindInSet(std::vector<Snapshot>& set,
+                                       SetIndex& index,
+                                       const std::string_view table_name,
+                                       const std::string_view index_name,
+                                       const std::string_view key) {
+  auto matches = [&](const Snapshot& snapshot) {
+    return snapshot.key == key && snapshot.table_name == table_name &&
+           snapshot.index_name == index_name;
+  };
+
+  if (set.size() < kSetIndexThreshold) {
+    for (auto& snapshot : set) {
+      if (matches(snapshot)) return &snapshot;
+    }
+    return nullptr;
+  }
+
+  if (index.positions == nullptr) {
+    index.positions = std::make_unique<SetIndex::PositionMap>();
+    index.positions->reserve(set.size() * 2);
+  }
+  for (; index.indexed < set.size(); ++index.indexed) {
+    const auto& snapshot = set[index.indexed];
+    index.positions->emplace(
+        SetEntryHash(snapshot.table_name, snapshot.index_name, snapshot.key),
+        index.indexed);
+  }
+
+  // The index only narrows candidates; the set decides the match, so a hash
+  // collision cannot change the result. Ties resolve to the earliest position,
+  // which is what the scan above returns.
+  Snapshot* found = nullptr;
+  size_t found_at = set.size();
+  const auto range =
+      index.positions->equal_range(SetEntryHash(table_name, index_name, key));
+  for (auto it = range.first; it != range.second; ++it) {
+    if (it->second >= found_at) continue;
+    if (!matches(set[it->second])) continue;
+    found_at = it->second;
+    found = &set[it->second];
+  }
+  return found;
+}
+
 const std::pair<const std::byte* const, const size_t> Transaction::Impl::Read(
     const std::string_view key) {
   if (IsAborted()) return {nullptr, 0};
@@ -266,22 +327,15 @@ const std::pair<const std::byte* const, const size_t> Transaction::Impl::Read(
 
   const auto& table_name = current_table_->GetTableName();
 
-  // Linear search in write_set
-  for (auto& snapshot : write_set_) {
-    if (snapshot.key == key && snapshot.table_name == table_name &&
-        snapshot.index_name.empty()) {
-      return std::make_pair(snapshot.data_item_copy.value(),
-                            snapshot.data_item_copy.size());
-    }
+  if (auto* own_write =
+          FindInSet(write_set_, write_index_, table_name, "", key)) {
+    return std::make_pair(own_write->data_item_copy.value(),
+                          own_write->data_item_copy.size());
   }
 
-  // Linear search in read_set
-  for (auto& snapshot : read_set_) {
-    if (snapshot.key == key && snapshot.table_name == table_name &&
-        snapshot.index_name.empty()) {
-      return std::make_pair(snapshot.data_item_copy.value(),
-                            snapshot.data_item_copy.size());
-    }
+  if (auto* own_read = FindInSet(read_set_, read_index_, table_name, "", key)) {
+    return std::make_pair(own_read->data_item_copy.value(),
+                          own_read->data_item_copy.size());
   }
 
   // Read path: never structurally insert. ForcePutBlankEntry would bump the
@@ -319,19 +373,15 @@ Transaction::Impl::ReadSecondaryIndex(const std::string_view index_name,
 
   const auto& table_name = current_table_->GetTableName();
 
-  for (auto& snapshot : write_set_) {
-    if (snapshot.key == key && snapshot.table_name == table_name &&
-        snapshot.index_name == index_name) {
-      RefreshSecondaryIndexWriteSnapshot(concurrency_control_.get(), &snapshot);
-      return SecondaryIndexReadResult(snapshot.data_item_copy);
-    }
+  if (auto* own_write =
+          FindInSet(write_set_, write_index_, table_name, index_name, key)) {
+    RefreshSecondaryIndexWriteSnapshot(concurrency_control_.get(), own_write);
+    return SecondaryIndexReadResult(own_write->data_item_copy);
   }
 
-  for (auto& snapshot : read_set_) {
-    if (snapshot.key == key && snapshot.table_name == table_name &&
-        snapshot.index_name == index_name) {
-      return SecondaryIndexReadResult(snapshot.data_item_copy);
-    }
+  if (auto* own_read =
+          FindInSet(read_set_, read_index_, table_name, index_name, key)) {
+    return SecondaryIndexReadResult(own_read->data_item_copy);
   }
 
   // Read path: avoid structural insert — see Read() above.
@@ -361,22 +411,16 @@ void Transaction::Impl::Write(const std::string_view key,
   const auto& table_name = current_table_->GetTableName();
 
   bool is_rmf = false;
-  for (auto& snapshot : read_set_) {
-    if (snapshot.key == key && snapshot.table_name == table_name &&
-        snapshot.index_name.empty()) {
-      is_rmf = true;
-      snapshot.is_read_modify_write = true;
-      break;
-    }
+  if (auto* own_read = FindInSet(read_set_, read_index_, table_name, "", key)) {
+    is_rmf = true;
+    own_read->is_read_modify_write = true;
   }
 
-  for (auto& snapshot : write_set_) {
-    if (snapshot.key == key && snapshot.table_name == table_name &&
-        snapshot.index_name.empty()) {
-      snapshot.data_item_copy.Reset(value, size);
-      if (is_rmf) snapshot.is_read_modify_write = true;
-      return;
-    }
+  if (auto* own_write =
+          FindInSet(write_set_, write_index_, table_name, "", key)) {
+    own_write->data_item_copy.Reset(value, size);
+    if (is_rmf) own_write->is_read_modify_write = true;
+    return;
   }
 
   Index::NodeVersionUpdate own_insert;
@@ -427,32 +471,28 @@ void Transaction::Impl::WriteSecondaryIndex(
 
   bool is_rmf = false;
   const DataItem* base_data = nullptr;
-  for (auto& snapshot : read_set_) {
-    if (snapshot.key == key && snapshot.table_name == table_name &&
-        snapshot.index_name == index_name) {
-      is_rmf = true;
-      base_data = &snapshot.data_item_copy;
-      snapshot.is_read_modify_write = true;
-      break;
-    }
+  if (auto* own_read =
+          FindInSet(read_set_, read_index_, table_name, index_name, key)) {
+    is_rmf = true;
+    base_data = &own_read->data_item_copy;
+    own_read->is_read_modify_write = true;
   }
 
   // unique constraint check in the transaction
-  for (auto& snapshot : write_set_) {
-    if (snapshot.key != key || snapshot.table_name != table_name ||
-        snapshot.index_name != index_name)
-      continue;
+  if (auto* own_write =
+          FindInSet(write_set_, write_index_, table_name, index_name, key)) {
     if (index->IsUnique()) {
       Abort();
       return;
     }
 
-    snapshot.index_type = index_type;
-    snapshot.si_ref = index;
-    snapshot.data_item_copy.AddSecondaryIndexValue(primary_key_buffer,
-                                                   primary_key_size);
-    snapshot.RecordSecondaryIndexDelta(primary_key_view, SecondaryIndexOp::Add);
-    if (is_rmf) snapshot.is_read_modify_write = true;
+    own_write->index_type = index_type;
+    own_write->si_ref = index;
+    own_write->data_item_copy.AddSecondaryIndexValue(primary_key_buffer,
+                                                     primary_key_size);
+    own_write->RecordSecondaryIndexDelta(primary_key_view,
+                                         SecondaryIndexOp::Add);
+    if (is_rmf) own_write->is_read_modify_write = true;
     return;
   }
 
@@ -524,17 +564,15 @@ void Transaction::Impl::Update(const std::string_view key,
   // succeed even if the index entry has not been updated yet. Snapshots from
   // WriteSecondaryIndex live in the same write_set_, so filter on the empty
   // index_name to match base-table writes only.
-  for (auto& snapshot : write_set_) {
-    if (snapshot.key == key && snapshot.table_name == table_name &&
-        snapshot.index_name.empty()) {
-      // If the key was deleted within this transaction, Update should fail.
-      if (!snapshot.data_item_copy.IsPrimaryInitialized()) {
-        Abort();
-        return;
-      }
-      Write(key, value, size);
+  if (auto* own_write =
+          FindInSet(write_set_, write_index_, table_name, "", key)) {
+    // If the key was deleted within this transaction, Update should fail.
+    if (!own_write->data_item_copy.IsPrimaryInitialized()) {
+      Abort();
       return;
     }
+    Write(key, value, size);
+    return;
   }
 
   auto* index_leaf = current_table_->GetPrimaryIndex().Get(key);
@@ -579,17 +617,12 @@ const std::optional<size_t> Transaction::Impl::ScanPrimaryIndexWithEarlyStop(
     if (IsAborted()) return true;
 
     // Reuse read_set_ so repeated reads keep the same value and validation.
-    for (auto& snapshot : read_set_) {
-      if (snapshot.key != key || snapshot.table_name != table_name || !snapshot.index_name.empty()) {
-        continue;
-      }
-      if (snapshot.data_item_copy.IsPrimaryInitialized()) {
-        std::pair<const void*, const size_t> value_pair = {
-          snapshot.data_item_copy.value(), snapshot.data_item_copy.size()};
-        total_count++;
-        return operation(snapshot.key, value_pair);
-      }
-      return false;
+    if (auto* own_read = FindInSet(read_set_, read_index_, table_name, "", key)) {
+      if (!own_read->data_item_copy.IsPrimaryInitialized()) return false;
+      std::pair<const void*, const size_t> value_pair = {
+          own_read->data_item_copy.value(), own_read->data_item_copy.size()};
+      total_count++;
+      return operation(own_read->key, value_pair);
     }
 
     // ReadDirect records OCC validation for the row found by the index scan.
@@ -1121,40 +1154,32 @@ void Transaction::Impl::DeleteSecondaryIndex(
   if (IsAborted()) return;
   bool found_in_write_set = false;
 
+  const auto& table_name = current_table_->GetTableName();
   bool is_rmf = false;
   const DataItem* base_data = nullptr;
-  for (auto& snapshot : read_set_) {
-    if (snapshot.key == secondary_key &&
-        snapshot.table_name == current_table_->GetTableName() &&
-        snapshot.index_name == index_name) {
-      is_rmf = true;
-      base_data = &snapshot.data_item_copy;
-      snapshot.is_read_modify_write = true;
-      break;
-    }
+  if (auto* own_read = FindInSet(read_set_, read_index_, table_name, index_name,
+                                 secondary_key)) {
+    is_rmf = true;
+    base_data = &own_read->data_item_copy;
+    own_read->is_read_modify_write = true;
   }
 
   // case A: old_key is in write_set
-  for (auto& snapshot : write_set_) {
-    if (snapshot.key != secondary_key ||
-        snapshot.table_name != current_table_->GetTableName() ||
-        snapshot.index_name != index_name)
-      continue;
-
+  if (auto* own_write = FindInSet(write_set_, write_index_, table_name,
+                                  index_name, secondary_key)) {
     found_in_write_set = true;
-    snapshot.index_type = index_type;
-    snapshot.si_ref = index;
-    snapshot.data_item_copy.RemoveSecondaryIndexValue(primary_key_buffer,
-                                                      primary_key_size);
-    snapshot.RecordSecondaryIndexDelta(primary_key_view,
-                                       SecondaryIndexOp::Remove);
+    own_write->index_type = index_type;
+    own_write->si_ref = index;
+    own_write->data_item_copy.RemoveSecondaryIndexValue(primary_key_buffer,
+                                                        primary_key_size);
+    own_write->RecordSecondaryIndexDelta(primary_key_view,
+                                         SecondaryIndexOp::Remove);
     if (!MaybeDeleteEmptyUniqueSecondaryIndex(
-            index, index_type, secondary_key, snapshot.data_item_copy)) {
+            index, index_type, secondary_key, own_write->data_item_copy)) {
       Abort();
       return;
     }
-    if (is_rmf) snapshot.is_read_modify_write = true;
-    break;
+    if (is_rmf) own_write->is_read_modify_write = true;
   }
 
   // case B: old_key is not in write_set
@@ -1217,40 +1242,33 @@ void Transaction::Impl::UpdateSecondaryIndex(
   if (IsAborted()) return;
   bool old_found_in_write_set = false;
 
+  const auto& table_name = current_table_->GetTableName();
   bool is_rmf_old_key = false;
   const DataItem* base_data_old_key = nullptr;
-  for (auto& snapshot : read_set_) {
-    if (snapshot.key == old_secondary_key &&
-        snapshot.table_name == current_table_->GetTableName() &&
-        snapshot.index_name == index_name) {
-      is_rmf_old_key = true;
-      base_data_old_key = &snapshot.data_item_copy;
-      snapshot.is_read_modify_write = true;
-      break;
-    }
+  if (auto* own_read = FindInSet(read_set_, read_index_, table_name, index_name,
+                                 old_secondary_key)) {
+    is_rmf_old_key = true;
+    base_data_old_key = &own_read->data_item_copy;
+    own_read->is_read_modify_write = true;
   }
 
   // case A: old_key is in write_set
-  for (auto& snapshot : write_set_) {
-    if (snapshot.key != old_secondary_key ||
-        snapshot.table_name != current_table_->GetTableName() ||
-        snapshot.index_name != index_name)
-      continue;
-
+  if (auto* own_write = FindInSet(write_set_, write_index_, table_name,
+                                  index_name, old_secondary_key)) {
     old_found_in_write_set = true;
-    snapshot.index_type = index_type;
-    snapshot.si_ref = index;
-    snapshot.data_item_copy.RemoveSecondaryIndexValue(primary_key_buffer,
-                                                      primary_key_size);
-    snapshot.RecordSecondaryIndexDelta(primary_key_view,
-                                       SecondaryIndexOp::Remove);
+    own_write->index_type = index_type;
+    own_write->si_ref = index;
+    own_write->data_item_copy.RemoveSecondaryIndexValue(primary_key_buffer,
+                                                        primary_key_size);
+    own_write->RecordSecondaryIndexDelta(primary_key_view,
+                                         SecondaryIndexOp::Remove);
     if (!MaybeDeleteEmptyUniqueSecondaryIndex(
-            index, index_type, old_secondary_key, snapshot.data_item_copy)) {
+            index, index_type, old_secondary_key,
+            own_write->data_item_copy)) {
       Abort();
       return;
     }
-    if (is_rmf_old_key) snapshot.is_read_modify_write = true;
-    break;
+    if (is_rmf_old_key) own_write->is_read_modify_write = true;
   }
 
   // case B: old_key is not in write_set
@@ -1306,24 +1324,16 @@ void Transaction::Impl::UpdateSecondaryIndex(
 
   bool is_rmf_new_key = false;
   const DataItem* base_data_new_key = nullptr;
-  for (auto& snapshot : read_set_) {
-    if (snapshot.key == new_secondary_key &&
-        snapshot.table_name == current_table_->GetTableName() &&
-        snapshot.index_name == index_name) {
-      is_rmf_new_key = true;
-      snapshot.is_read_modify_write = true;
-      base_data_new_key = &snapshot.data_item_copy;
-      break;
-    }
+  if (auto* own_read = FindInSet(read_set_, read_index_, table_name, index_name,
+                                 new_secondary_key)) {
+    is_rmf_new_key = true;
+    own_read->is_read_modify_write = true;
+    base_data_new_key = &own_read->data_item_copy;
   }
 
   // case: new_key is in write_set
-  for (auto& snapshot : write_set_) {
-    if (snapshot.key != new_secondary_key ||
-        snapshot.table_name != current_table_->GetTableName() ||
-        snapshot.index_name != index_name)
-      continue;
-
+  if (auto* own_write = FindInSet(write_set_, write_index_, table_name,
+                                  index_name, new_secondary_key)) {
     // unique constraint check in the transaction
     if (index->IsUnique()) {
       Abort();
@@ -1331,13 +1341,13 @@ void Transaction::Impl::UpdateSecondaryIndex(
     }
 
     new_found_in_write_set = true;
-    snapshot.index_type = index_type;
-    snapshot.si_ref = index;
-    snapshot.data_item_copy.AddSecondaryIndexValue(primary_key_buffer,
-                                                   primary_key_size);
-    snapshot.RecordSecondaryIndexDelta(primary_key_view, SecondaryIndexOp::Add);
-    if (is_rmf_new_key) snapshot.is_read_modify_write = true;
-    break;
+    own_write->index_type = index_type;
+    own_write->si_ref = index;
+    own_write->data_item_copy.AddSecondaryIndexValue(primary_key_buffer,
+                                                     primary_key_size);
+    own_write->RecordSecondaryIndexDelta(primary_key_view,
+                                         SecondaryIndexOp::Add);
+    if (is_rmf_new_key) own_write->is_read_modify_write = true;
   }
 
   // case: new_key is not in write_set
@@ -1387,6 +1397,11 @@ void Transaction::Impl::Abort() {
 }
 bool Transaction::Impl::Precommit() {
   if (IsAborted()) return false;
+
+  // Commit reorders and may clear the write set, so drop the position indexes
+  // here rather than let them outlive the layout they describe.
+  read_index_ = {};
+  write_index_ = {};
 
   // Install deferred phantom validator. Silo runs this at the serial
   // point (under write locks, after AntiDepValidation) so concurrent
