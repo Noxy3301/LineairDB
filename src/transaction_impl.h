@@ -142,6 +142,19 @@ class Transaction::Impl {
   // No-op when `update.valid` is false or the leaf is not in node_version_set_.
   void ReconcileOwnInsertWithNodeVersionSet(
       const Index::NodeVersionUpdate& update);
+  // Position index over read_set_ / write_set_, keyed by a hash of
+  // (table_name, index_name, key). Both sets are append-only until Precommit,
+  // so cached positions stay valid and refreshing means indexing the tail.
+  struct SetIndex {
+    using PositionMap = std::unordered_multimap<uint64_t, size_t>;
+    std::unique_ptr<PositionMap> positions;
+    size_t indexed = 0;
+  };
+  // First entry of `set` matching (table_name, index_name, key), or nullptr.
+  // The result is invalidated by any later append to `set`.
+  Snapshot* FindInSet(std::vector<Snapshot>& set, SetIndex& index,
+                      std::string_view table_name, std::string_view index_name,
+                      std::string_view key);
   // Scan the primary index so the callback can stop the tree walk early.
   const std::optional<size_t> ScanPrimaryIndexWithEarlyStop(
       const std::string_view begin, const std::string_view end,
@@ -156,6 +169,10 @@ class Transaction::Impl {
 
   ReadSetType read_set_;
   WriteSetType write_set_;
+  // Materialized only once the corresponding set outgrows the linear-scan
+  // threshold, so a small transaction allocates nothing here.
+  SetIndex read_index_;
+  SetIndex write_index_;
   // Deferred phantom-detection snapshots collected from Masstree-backed
   // scans during this transaction. Re-checked at Precommit; empty for PL.
   std::vector<Index::NodeVersionEntry> node_version_set_;
