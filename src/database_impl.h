@@ -322,7 +322,7 @@ class Database::Impl {
 
     EpochNumber commit_epoch = 0;
     bool log_enqueued = false;
-    bool callback_awaits_durability = false;
+    bool awaits_durability = false;
     bool committed = tx.Precommit();
     if (committed) {
       tx.tx_pimpl_->PostProcessing(TxStatus::Committed);
@@ -333,15 +333,13 @@ class Database::Impl {
         log_enqueued = logger_.Enqueue(tx.tx_pimpl_->write_set_, commit_epoch);
       }
 
-      // The commit callback is an acknowledgement, so under Sync it cannot be
-      // handed out before the record is durable. The callback manager releases
-      // a callback once the stable epoch reaches the commit epoch, which
-      // happens one epoch before the flusher writes that epoch, so a Sync
-      // commit registers its callback after its own wait instead.
-      callback_awaits_durability =
+      // Under Sync the callback is an acknowledgement and cannot be handed
+      // out before the record is durable, so a Sync commit registers it after
+      // its own wait. Capture the policy once: both decisions read this value.
+      awaits_durability =
           log_enqueued &&
-          config_.commit_durability == Config::CommitDurability::Sync;
-      if (!callback_awaits_durability) {
+          logger_.GetCommitDurability() == Config::CommitDurability::Sync;
+      if (!awaits_durability) {
         callback_manager_.Enqueue(std::move(clbk), commit_epoch, true);
       }
     } else {
@@ -350,8 +348,8 @@ class Database::Impl {
     }
     epoch_framework_.MakeMeOffline();
 
-    logger_.AwaitCommitDurability(commit_epoch, log_enqueued);
-    if (callback_awaits_durability) {
+    logger_.AwaitCommitDurability(commit_epoch, awaits_durability);
+    if (awaits_durability) {
       callback_manager_.Enqueue(std::move(clbk), commit_epoch, true);
     }
 
