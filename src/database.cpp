@@ -57,6 +57,13 @@ bool Database::EndTransaction(Transaction& tx, CallbackType clbk) {
 }
 
 void Database::Fence() const noexcept { db_pimpl_->Fence(); }
+bool Database::SetCommitDurability(
+    Config::CommitDurability mode, std::chrono::milliseconds barrier_timeout) {
+  return db_pimpl_->SetCommitDurability(mode, barrier_timeout);
+}
+Config::CommitDurability Database::GetCommitDurability() const {
+  return db_pimpl_->GetCommitDurability();
+}
 void Database::WaitForCheckpoint() const noexcept {
   db_pimpl_->WaitForCheckpoint();
 }

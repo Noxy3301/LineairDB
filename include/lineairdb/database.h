@@ -21,6 +21,7 @@
 #include <lineairdb/stateless.h>
 #include <lineairdb/transaction.h>
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -119,8 +120,10 @@ class Database {
    * @param[out] clbk A callback function accepts a result (Committed or
    * Aborted).
    * @return true if the LineairDB's concurrency control protocol **decides** to
-   * commit the given `tx`. What that decision is worth depends on
-   * Config::commit_durability:
+   * commit the given `tx`. What that decision is worth depends on the policy
+   * this commit captured, which is GetCommitDurability() and not
+   * GetConfig().commit_durability: the latter keeps the construction value
+   * even after SetCommitDurability has changed the policy in force.
    * - Sync
    *   - This method returns, and clbk is released, only after the
    *     transaction's log is on the device, so a true return is an
@@ -150,10 +153,46 @@ class Database {
   void Fence() const noexcept;
 
   /**
+   * @brief Switches the commit acknowledgement policy of a running database
+   * between CommitDurability::Async and CommitDurability::Sync. Thread-safe.
+   *
+   * A switch to Sync returns only once every transaction that was already
+   * acknowledged under Async is on the device, so from this call's return the
+   * database is indistinguishable from one that ran Sync from the start, and
+   * no earlier acknowledgement can be lost by a later crash. A switch to
+   * Async publishes the new policy and returns; commits that capture it
+   * afterwards stop waiting.
+   *
+   * @param mode CommitDurability::Async or CommitDurability::Sync.
+   * CommitDurability::Volatile is structural, decided at construction, and is
+   * rejected here in both directions.
+   * @param barrier_timeout Bound on the whole call: waiting out a concurrent
+   * switch, the durable barrier itself, and the store come out of it together.
+   * It is checked last immediately before the store, so only a preemption
+   * between that check and the store itself falls outside it.
+   * @return false with nothing changed for a database constructed Volatile,
+   * for a Volatile `mode`, for a calling thread that still has a transaction
+   * in progress, and when the timeout expires while another switch is running.
+   * @return false from a switch to Sync that did publish the policy means the
+   * barrier was not confirmed inside `barrier_timeout`: the policy is Sync from
+   * then on, which is the stricter of the two, but transactions acknowledged
+   * before the call are not known to be durable. Calling again is well defined
+   * and is how a caller confirms them.
+   * @note The policy in force after a false return is whatever was published
+   * last, which GetCommitDurability() reports. It does not say which call
+   * published it: a concurrent call for the same mode may have gone first.
+   */
+  bool SetCommitDurability(Config::CommitDurability mode,
+                           std::chrono::milliseconds barrier_timeout);
+
+  /** @brief The policy commits are currently acknowledged under. */
+  Config::CommitDurability GetCommitDurability() const;
+
+  /**
    * @brief
    * Checkpointing is not implemented for the epoch-frame write-ahead log:
    * enabling it stops startup, so this method returns immediately and
-   * durability comes from Config::commit_durability alone.
+   * durability comes from the commit durability policy in force alone.
    */
   void WaitForCheckpoint() const noexcept;
 
