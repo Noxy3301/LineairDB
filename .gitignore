@@ -92,3 +92,6 @@ Temporary Items
 .history
 
 # End of https://www.gitignore.io/api/osx,c++,linux,visualstudiocode
+
+# LineairDB runtime output (WAL, checkpoints) written by tests and local runs
+lineairdb_logs/
