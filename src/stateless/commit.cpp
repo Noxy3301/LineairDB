@@ -51,6 +51,9 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     bool is_delete = false;
     DataItem* item = nullptr;
     Index::ConcurrentTable* index = nullptr;
+    // Insert entry that is the first entry for its key in this request, so
+    // the committed row is what decides whether the key is free.
+    bool check_committed_row = false;
   };
   struct ResolvedSecondaryIndexOp {
     std::string table_name;
@@ -75,6 +78,15 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
   std::vector<DataItem*> lock_items;
   std::vector<LockTarget> lock_targets;
   std::unordered_set<std::string> unique_si_adds;
+  // Liveness a key reached through the entries already resolved in this
+  // request; absent means the request has not touched the key yet. Only an
+  // insert consults it, so a request without one does not pay for it.
+  std::unordered_map<std::string, bool> live_in_request;
+  const bool has_insert_entry =
+      std::any_of(writes.begin(), writes.end(),
+                  [](const ExternalWriteEntry& entry) {
+                    return entry.is_insert;
+                  });
 
   auto abort_before_lock = [&](const std::string& reason) {
     if (abort_reason != nullptr) *abort_reason = reason;
@@ -129,9 +141,26 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
         return abort_before_lock("write_get_or_insert_failed");
       }
 
+      // An insert onto a key an earlier entry of this request already made
+      // live is a duplicate the committed state cannot excuse.
+      bool check_committed_row = false;
+      if (has_insert_entry) {
+        const std::string request_key = write.table_name + '\0' + write.key;
+        auto live_it = live_in_request.find(request_key);
+        if (write.is_insert) {
+          if (live_it == live_in_request.end()) {
+            check_committed_row = true;
+          } else if (live_it->second) {
+            return abort_before_lock(kDuplicateKeyAbortReason);
+          }
+        }
+        live_in_request[request_key] = !write.is_delete;
+      }
+
       auto* primary_index = &table.value()->GetPrimaryIndex();
       resolved_writes.push_back({write.table_name, write.key, write.value,
-                                 write.is_delete, item, primary_index});
+                                 write.is_delete, item, primary_index,
+                                 check_committed_row});
       lock_items.push_back(item);
       lock_targets.push_back({item, primary_index, nullptr, write.key});
     }
@@ -467,7 +496,17 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
     }
   }
 
-  // Phase 2.3: post-lock UNIQUE recheck. A competing add may have installed
+  // Phase 2.3: an insert must find its key free. Checked under the write lock
+  // that installs the rows, so a competing inserter of the same key is
+  // serialized behind it and sees the row this transaction is about to write.
+  for (const auto& write : resolved_writes) {
+    if (!write.check_committed_row) continue;
+    if (write.item->IsPrimaryInitialized()) {
+      return unlock_and_abort(kDuplicateKeyAbortReason);
+    }
+  }
+
+  // Phase 2.4: post-lock UNIQUE recheck. A competing add may have installed
   // the same secondary key while we were waiting on the write lock, so the
   // resolve-time dedup (R3) is not enough on its own.
   std::unordered_map<DataItem*, PackedPrimaryKeys::Ptr> si_primary_keys;
