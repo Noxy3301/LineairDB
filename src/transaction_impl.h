@@ -72,8 +72,10 @@ class Transaction::Impl {
 
   /*   void Write(const std::string_view key, const std::byte value[],
                const size_t size); */
+  // `is_insert` marks a write that claimed a key holding no row; commit
+  // refuses it if the claimed entry holds one by then.
   void Write(const std::string_view key, const std::byte value[],
-             const size_t size);
+             const size_t size, bool is_insert = false);
   void WriteSecondaryIndex(const std::string_view index_name,
                            const std::string_view key,
                            const std::byte primary_key_buffer[],
@@ -129,8 +131,16 @@ class Transaction::Impl {
 
   bool SetTable(const std::string_view table_name);
 
+  bool AbortedByDuplicateKey() const { return aborted_by_duplicate_key_; }
+
+  // True while every row and range this transaction observed, through reads
+  // and scans, still carries the version it observed.
+  bool ReadSetIsStillValid();
+
  private:
   void EnsureCurrentTable();
+  // True while every recorded range's node versions are unchanged.
+  bool PhantomsStillValid();
   bool IsAborted() { return current_status_ == TxStatus::Aborted; };
 
   // Apply the Silo §4.6 own-write rule to node_version_set_: when this tx
@@ -163,6 +173,9 @@ class Transaction::Impl {
 
  private:
   TxStatus current_status_;
+  // Set when Insert refused a key that already holds a live row, so the
+  // caller can tell a duplicate from a contention abort.
+  bool aborted_by_duplicate_key_ = false;
   Database::Impl* db_pimpl_;
   const Config* config_ptr_;
   std::unique_ptr<ConcurrencyControlBase> concurrency_control_;

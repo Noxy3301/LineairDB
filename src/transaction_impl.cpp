@@ -30,6 +30,7 @@
 #include "concurrency_control/impl/two_phase_locking.hpp"
 #include "database_impl.h"
 #include "types/snapshot.hpp"
+#include "util/debug_sync.hpp"
 
 namespace LineairDB {
 
@@ -248,6 +249,7 @@ void Transaction::Impl::ReconcileOwnInsertWithNodeVersionSet(
 
 void Transaction::Impl::Reset(Database::Impl* db_pimpl) {
   current_status_ = TxStatus::Running;
+  aborted_by_duplicate_key_ = false;
   db_pimpl_ = db_pimpl;
   config_ptr_ = &db_pimpl_->GetConfig();
   current_table_ = nullptr;
@@ -401,7 +403,8 @@ Transaction::Impl::ReadSecondaryIndex(const std::string_view index_name,
 }
 
 void Transaction::Impl::Write(const std::string_view key,
-                              const std::byte value[], const size_t size) {
+                              const std::byte value[], const size_t size,
+                              bool is_insert) {
   if (IsAborted()) return;
 
   // TODO: if `size` is larger than Config.internal_buffer_size,
@@ -420,6 +423,7 @@ void Transaction::Impl::Write(const std::string_view key,
           FindInSet(write_set_, write_index_, table_name, "", key)) {
     own_write->data_item_copy.Reset(value, size);
     if (is_rmf) own_write->is_read_modify_write = true;
+    if (is_insert) own_write->is_insert = true;
     return;
   }
 
@@ -434,6 +438,7 @@ void Transaction::Impl::Write(const std::string_view key,
               {});
   sp.pi_ref = &current_table_->GetPrimaryIndex();
   if (is_rmf) sp.is_read_modify_write = true;
+  sp.is_insert = is_insert;
   write_set_.emplace_back(std::move(sp));
 }
 
@@ -539,18 +544,77 @@ void Transaction::Impl::Insert(const std::string_view key,
                                const std::byte value[], const size_t size) {
   if (IsAborted()) return;
   EnsureCurrentTable();
+  const auto& table_name = current_table_->GetTableName();
 
+  // A duplicate is only this transaction's answer while it could still have
+  // committed; a read it already lost is the conflict the caller has to hear.
+  auto refuse = [this] {
+    if (ReadSetIsStillValid()) aborted_by_duplicate_key_ = true;
+    Abort();
+  };
+
+  // A key this transaction already wrote is decided by its own view: the slot
+  // is claimed, and a staged delete frees the key again.
+  if (auto* own_write =
+          FindInSet(write_set_, write_index_, table_name, "", key)) {
+    if (own_write->data_item_copy.IsPrimaryInitialized()) {
+      refuse();
+      return;
+    }
+    // Delete removed the key from the range index; make it visible again.
+    // No-op on Masstree.
+    Index::NodeVersionUpdate own_revisit;
+    if (!current_table_->GetPrimaryIndex().EnsureVisibleForSecondaryWrite(
+            key, &own_revisit)) {
+      Abort();
+      return;
+    }
+    ReconcileOwnInsertWithNodeVersionSet(own_revisit);
+    if (IsAborted()) return;
+    Write(key, value, size);
+    return;
+  }
+
+  // A live row refuses at the claim below; commit makes the binding decision
+  // under the write lock.
   Index::NodeVersionUpdate own_insert;
   auto inserted = current_table_->GetPrimaryIndex().Insert(key, &own_insert);
   if (!inserted) {
-    Abort();
+    refuse();
     return;
   }
   ReconcileOwnInsertWithNodeVersionSet(own_insert);
   if (IsAborted()) return;
 
-  // After successful insertion to index, delegate to Write
-  Write(key, value, size);
+  LINEAIRDB_DEBUG_SYNC("insert.after_index_claim");
+
+  // The write carries the claim: commit refuses it if the entry holds a row
+  // by the time it locks it.
+  Write(key, value, size, /*is_insert=*/true);
+}
+
+bool Transaction::Impl::ReadSetIsStillValid() {
+  for (const auto& snapshot : read_set_) {
+    if (snapshot.index_cache == nullptr) continue;
+    if (snapshot.index_cache->transaction_id.load() !=
+        snapshot.data_item_copy.transaction_id.load()) {
+      return false;
+    }
+  }
+  // Scan rows validate through the protocol's own set, and ranges through
+  // node versions; a stale one is a conflict this answer must not outrank.
+  return concurrency_control_->ObservedReadsStillValid() &&
+         PhantomsStillValid();
+}
+
+bool Transaction::Impl::PhantomsStillValid() {
+  if (node_version_set_.empty()) return true;
+  std::unordered_set<Index::IndexBase*> owners;
+  for (const auto& e : node_version_set_) owners.insert(e.owner);
+  for (auto* owner : owners) {
+    if (!owner->ValidatePhantoms(node_version_set_)) return false;
+  }
+  return true;
 }
 
 void Transaction::Impl::Update(const std::string_view key,
@@ -1409,21 +1473,17 @@ bool Transaction::Impl::Precommit() {
   // Running the check earlier admits a race window between validation
   // and lock acquisition; running it here keeps the protocol strict-
   // serializable. PL's ValidatePhantoms is a no-op.
-  concurrency_control_->SetPreCommitValidator([this]() {
-    if (node_version_set_.empty()) return true;
-    std::unordered_set<Index::IndexBase*> owners;
-    for (const auto& e : node_version_set_) owners.insert(e.owner);
-    for (auto* owner : owners) {
-      if (!owner->ValidatePhantoms(node_version_set_)) return false;
-    }
-    return true;
-  });
+  concurrency_control_->SetPreCommitValidator(
+      [this]() { return PhantomsStillValid(); });
 
   const bool need_to_checkpoint =
       (db_pimpl_->GetConfig().enable_checkpointing &&
        db_pimpl_->IsNeedToCheckpointing(
            db_pimpl_->epoch_framework_.GetMyThreadLocalEpoch()));
   bool committed = concurrency_control_->Precommit(need_to_checkpoint);
+  if (!committed && concurrency_control_->AbortedByDuplicateKey()) {
+    aborted_by_duplicate_key_ = true;
+  }
   return committed;
 }
 
@@ -1536,6 +1596,9 @@ const std::optional<size_t> Transaction::ScanSecondaryIndexReverse(
 }
 
 void Transaction::Abort() { tx_pimpl_->Abort(); }
+bool Transaction::AbortedByDuplicateKey() const {
+  return tx_pimpl_->AbortedByDuplicateKey();
+}
 bool Transaction::SetTable(const std::string_view table_name) {
   return tx_pimpl_->SetTable(table_name);
 }
