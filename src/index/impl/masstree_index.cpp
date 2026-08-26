@@ -5,6 +5,8 @@
 #include <mutex>
 #include <utility>
 
+#include "util/debug_sync.hpp"
+
 // Masstree headers. Must come after the PImpl header guard so other LDB
 // sources never see them; masstree's include path is PRIVATE to LDB and
 // therefore unreachable from public headers and tests.
@@ -383,6 +385,9 @@ struct MasstreeIndex::Impl {
       lp.finish(0, *tls_ti);
       return false;
     }
+    // A reader that resolved this entry parks on its lock bit until the
+    // retired TID is published below.
+    LINEAIRDB_DEBUG_SYNC("reaper.purge_locked_window");
     // finish(-1) calls finish_remove which removes the permutation slot and
     // RCU-frees the leaf if it becomes empty. The DataItem* itself rides on
     // a separate RCU callback below.

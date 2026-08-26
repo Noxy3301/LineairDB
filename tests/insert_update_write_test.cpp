@@ -279,3 +279,128 @@ TEST(InsertUpdateWriteTest, InsertThenUpdateSameTransaction) {
   db.Fence();
   ASSERT_TRUE(verified.load());
 }
+
+/**
+ * Test case 5: Delete then Insert the same key in one transaction
+ * - The row is written again, and it is visible to both a point read and a
+ *   range scan. The scan is the part a range index has to be told about: a
+ *   delete removes the key from it, and the insert has to put it back.
+ */
+TEST(InsertUpdateWriteTest, DeleteThenInsertSameTransaction) {
+  LineairDB::Config config;
+  config.enable_recovery = false;
+  // The default protocol needs the NWR pivot metadata this build omits, and
+  // the range-index backend cannot serve a re-inserted key at all: reading one
+  // back never returns, with or without this transaction shape.
+  config.concurrency_control_protocol = LineairDB::Config::ConcurrencyControl::Silo;
+  config.index_structure = LineairDB::Config::IndexStructure::Masstree;
+  LineairDB::Database db(config);
+
+  std::string key = "delete_then_insert_key";
+  int value1 = 30;
+  int value2 = 40;
+
+  std::atomic<bool> inserted(false);
+  db.ExecuteTransaction(
+      [&](LineairDB::Transaction& tx) { tx.Insert(key, value1); },
+      [&](LineairDB::TxStatus status) {
+        if (status == LineairDB::TxStatus::Committed) inserted.store(true);
+      });
+  db.Fence();
+  ASSERT_TRUE(inserted.load());
+
+  std::atomic<bool> committed(false);
+  db.ExecuteTransaction(
+      [&](LineairDB::Transaction& tx) {
+        tx.Delete(key);
+        tx.Insert(key, value2);
+      },
+      [&](LineairDB::TxStatus status) {
+        if (status == LineairDB::TxStatus::Committed) committed.store(true);
+      });
+  db.Fence();
+  ASSERT_TRUE(committed.load());
+
+  std::atomic<bool> read_back(false);
+  std::atomic<size_t> scanned(0);
+  db.ExecuteTransaction(
+      [&](LineairDB::Transaction& tx) {
+        auto result = tx.Read<int>(key);
+        if (result.has_value() && result.value() == value2) {
+          read_back.store(true);
+        }
+        size_t seen = 0;
+        tx.Scan(key, key + "\xff",
+                [&](std::string_view scanned_key,
+                    const std::pair<const void*, const size_t>) {
+                  if (scanned_key == key) seen++;
+                  return false;
+                });
+        scanned.store(seen);
+      },
+      [](LineairDB::TxStatus) {});
+  db.Fence();
+  ASSERT_TRUE(read_back.load());
+  ASSERT_EQ(1u, scanned.load());
+}
+
+/**
+ * Test case 6: Insert after the deleted key's entry was physically purged
+ * - The reaper removes a tombstone's entry a few epochs after the delete
+ *   commits. Re-inserting the key then claims a new entry, which must commit
+ *   and read back. The purge is not observable from here, so this covers the
+ *   outcome rather than the timing.
+ */
+TEST(InsertUpdateWriteTest, InsertAfterTombstoneIsPurged) {
+  LineairDB::Config config;
+  config.enable_recovery = false;
+  config.concurrency_control_protocol = LineairDB::Config::ConcurrencyControl::Silo;
+  config.index_structure = LineairDB::Config::IndexStructure::Masstree;
+  LineairDB::Database db(config);
+
+  std::string key = "purged_then_reinserted_key";
+  int value1 = 50;
+  int value2 = 60;
+
+  std::atomic<bool> inserted(false);
+  db.ExecuteTransaction(
+      [&](LineairDB::Transaction& tx) { tx.Insert(key, value1); },
+      [&](LineairDB::TxStatus status) {
+        if (status == LineairDB::TxStatus::Committed) inserted.store(true);
+      });
+  db.Fence();
+  ASSERT_TRUE(inserted.load());
+
+  std::atomic<bool> deleted(false);
+  db.ExecuteTransaction(
+      [&](LineairDB::Transaction& tx) { tx.Delete(key); },
+      [&](LineairDB::TxStatus status) {
+        if (status == LineairDB::TxStatus::Committed) deleted.store(true);
+      });
+  db.Fence();
+  ASSERT_TRUE(deleted.load());
+
+  // Give the deferred purge several epochs to retire the entry.
+  for (int i = 0; i < 5; i++) db.Fence();
+
+  std::atomic<bool> reinserted(false);
+  db.ExecuteTransaction(
+      [&](LineairDB::Transaction& tx) { tx.Insert(key, value2); },
+      [&](LineairDB::TxStatus status) {
+        if (status == LineairDB::TxStatus::Committed) reinserted.store(true);
+      });
+  db.Fence();
+  ASSERT_TRUE(reinserted.load());
+
+  std::atomic<bool> read_back(false);
+  db.ExecuteTransaction(
+      [&](LineairDB::Transaction& tx) {
+        auto result = tx.Read<int>(key);
+        if (result.has_value() && result.value() == value2) {
+          read_back.store(true);
+        }
+      },
+      [](LineairDB::TxStatus) {});
+  db.Fence();
+  ASSERT_TRUE(read_back.load());
+}
