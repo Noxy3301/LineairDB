@@ -56,6 +56,11 @@ bool ConcurrentTable::Insert(const std::string_view key,
   return index_->Insert(key, out_update);
 }
 
+bool ConcurrentTable::EnsureVisibleForSecondaryWrite(
+    const std::string_view key, NodeVersionUpdate* out_update) {
+  return index_->EnsureVisibleForSecondaryWrite(key, out_update);
+}
+
 // return false if a corresponding entry already exists
 bool ConcurrentTable::Put(const std::string_view key, DataItem&& rhs,
                           NodeVersionUpdate* out_update) {

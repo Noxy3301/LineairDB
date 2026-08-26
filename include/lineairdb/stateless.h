@@ -132,13 +132,19 @@ struct ExternalReadEntry {
  * @brief Row write or delete to install during ValidateAndCommit.
  *
  * When `is_delete` is true, `value` is ignored and the row is removed.
+ * When `is_insert` is true, the key must hold no live row at commit; if it
+ * does, ValidateAndCommit aborts with @ref kDuplicateKeyAbortReason.
  */
 struct ExternalWriteEntry {
   std::string table_name;
   std::string key;
   std::string value;
   bool is_delete = false;
+  bool is_insert = false;
 };
+
+/// Abort reason ValidateAndCommit reports when an insert entry finds a live row.
+inline constexpr char kDuplicateKeyAbortReason[] = "duplicate_primary_key";
 
 /**
  * @brief Secondary-index add or remove to install during ValidateAndCommit.

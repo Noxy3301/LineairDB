@@ -35,25 +35,26 @@ namespace Stateless {
  *   - range reads: scan bounds plus the returned key list
  *
  * The protocol is Silo's commit protocol (paper §4.4), bracketed by an
- * epoch join and leave; [Helios] marks implementation additions over
- * the paper for by-key inputs and SQL UNIQUE semantics:
+ * epoch join and leave; [added] marks steps beyond the paper, for by-key
+ * inputs and SQL insert / UNIQUE semantics:
  *
- *   Resolve   R1  [Helios] map every key to its DataItem
- *             R2  [Helios] materialize blank slots for fresh write keys
- *             R3  [Helios] reject in-request UNIQUE duplicates
- *   Phase 1   1.1 [Silo]   lock the write set in address order
- *             1.2 [Silo]   re-read the global epoch (serialization point)
- *   Phase 2   2.1 [Silo]   exact reads: observed TIDs unmoved
- *             2.2 [Helios] ranges: replay the scans, compare key lists
- *                          (membership only; row TIDs are validated
- *                          at 2.1)
- *             2.3 [Helios] UNIQUE recheck after the lock wait
- *   Phase 3   3.1 [Silo]   install values; deletes become tombstones
- *             3.2 [Silo]   log snapshot before unlock (when logging)
- *             3.3 [Silo]   publish even TIDs stamped with the 1.2 epoch
- *             3.4 [Helios] hand slots left empty to the reaper for
- *                          deferred physical purge
- *             3.5 [Silo]   enqueue the log set, leave the epoch
+ *   Resolve   R1  [added] map every key to its DataItem
+ *             R2  [added] materialize blank slots for fresh write keys
+ *             R3  [added] reject in-request UNIQUE duplicates
+ *   Phase 1   1.1 [paper] lock the write set in address order
+ *             1.2 [paper] re-read the global epoch (serialization point)
+ *   Phase 2   2.1 [paper] exact reads: observed TIDs unmoved
+ *             2.2 [added] ranges: replay the scans, compare key lists
+ *                         (membership only; row TIDs are validated
+ *                         at 2.1)
+ *             2.3 [added] inserts: the claimed key still holds no row
+ *             2.4 [added] UNIQUE recheck after the lock wait
+ *   Phase 3   3.1 [paper] install values; deletes become tombstones
+ *             3.2 [paper] log snapshot before unlock (when logging)
+ *             3.3 [paper] publish even TIDs stamped with the 1.2 epoch
+ *             3.4 [added] hand slots left empty to the reaper for
+ *                         deferred physical purge
+ *             3.5 [paper] enqueue the log set, leave the epoch
  *
  * @note Read validation is logical: Phase 2 re-reads every key and
  * replays every scan, then requires the observed TIDs and the result
@@ -65,8 +66,8 @@ namespace Stateless {
  *
  * @param[out] abort_reason When non-null and the attempt aborts,
  * receives a short label naming the failed check, such as
- * `exact_read_tid_moved`, `primary_range_result_changed`, or
- * `unique_si_exists_after_lock`.
+ * `exact_read_tid_moved`, `primary_range_result_changed`,
+ * `duplicate_primary_key`, or `unique_si_exists_after_lock`.
  * @return true when the transaction committed; false on abort, after
  * every lock this attempt acquired has been released.
  */

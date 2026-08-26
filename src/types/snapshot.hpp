@@ -48,6 +48,9 @@ struct Snapshot {
   // Purge).
   Index::ConcurrentTable* pi_ref = nullptr;
   Index::SecondaryIndex* si_ref = nullptr;
+  // Set when this write claimed a key that held no row. Commit refuses it if
+  // the claimed entry holds one by then.
+  bool is_insert = false;
   struct SecondaryIndexDelta {
     std::string primary_key;
     SecondaryIndexOp op;

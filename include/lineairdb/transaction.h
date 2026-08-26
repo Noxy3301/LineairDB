@@ -464,6 +464,13 @@ class Transaction {
 
   /**
    * @brief
+   * True when this transaction aborted because Insert found the key
+   * already holding a live row, as opposed to any other abort cause.
+   */
+  bool AbortedByDuplicateKey() const;
+
+  /**
+   * @brief
    * Sets the table to read/write/scan from this transaction.
    * If the table is not set, this transaction uses the `__anonymous_table`,
    * such that defined in the `Config::anonymous_table_name`. See

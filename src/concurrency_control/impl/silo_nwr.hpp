@@ -69,6 +69,7 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
     tx_ref_.~TransactionReferences();
     new (&tx_ref_) TransactionReferences(std::move(new_ref));
     validation_set_.clear();
+    aborted_by_duplicate_key_ = false;
     nwr_validation_result_ = NWRValidationResult::NOT_YET_VALIDATED;
     my_pivot_object_ = NWRPivotObject();
     pivot_object_snapshots_.clear();
@@ -203,7 +204,9 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
               Snapshot::Compare);
 
     if constexpr (EnableNWR) {
-      if (!IsReadOnly() && IsOmittable()) {
+      // An insert has to see the key it claimed, which omitting the write
+      // would skip.
+      if (!IsReadOnly() && !HasInsert() && IsOmittable()) {
         // NWR's omittable analysis orders versions but says nothing about
         // phantoms. Run deferred phantom validation here too; otherwise a
         // Masstree scan followed by an omittable commit can miss a
@@ -322,6 +325,24 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
       return false;
     }
 
+    // A write that claimed a free key must still find it free. The entry is
+    // the one the write resolved and the lock loop proved is attached to the
+    // key, so no reinsert of the slot can hide a row from this check.
+    for (const auto& snapshot : tx_ref_.write_set_ref_) {
+      if (!snapshot.is_insert) continue;
+      // Only primary writes may carry the flag: SI liveness is not
+      // IsPrimaryInitialized().
+      assert(snapshot.index_name.empty());
+      if (!snapshot.index_cache->IsPrimaryInitialized()) continue;
+      aborted_by_duplicate_key_ = true;
+      for (auto& locked : tx_ref_.write_set_ref_) {
+        auto current = locked.index_cache->transaction_id.load();
+        current.tid--;
+        locked.index_cache->transaction_id.store(current);
+      }
+      return false;
+    }
+
     /** Buffer Update **/
     //
     // Deletes install tombstones. Physical removal is deferred to the
@@ -402,7 +423,24 @@ class SiloNWRTyped final : public ConcurrencyControlBase {
     }
   }
 
+  bool ObservedReadsStillValid() const final {
+    for (const auto& validation_item : validation_set_) {
+      if (validation_item.item_p_cache->transaction_id.load() !=
+          validation_item.transaction_id) {
+        return false;
+      }
+    }
+    return true;
+  }
+
  private:
+  bool HasInsert() {
+    for (const auto& snapshot : tx_ref_.write_set_ref_) {
+      if (snapshot.is_insert) return true;
+    }
+    return false;
+  }
+
   bool AntiDependencyValidation() {
     for (auto& validation_item : validation_set_) {
       auto* item = validation_item.item_p_cache;

@@ -67,6 +67,15 @@ class ConcurrencyControlBase {
   virtual void PostProcessing(TxStatus) = 0;
   virtual void Reset(TransactionReferences&& new_ref) = 0;
 
+  // True when Precommit refused a write that claimed a free key and found a
+  // row under it by the time the write locks were held.
+  bool AbortedByDuplicateKey() const { return aborted_by_duplicate_key_; }
+
+  // True while every row this protocol tracked for validation outside the
+  // read set (scan rows) still carries the version it observed. Lock-free
+  // probe: a concurrently locked row counts as moved.
+  virtual bool ObservedReadsStillValid() const { return true; }
+
   bool IsReadOnly() { return (0 == tx_ref_.write_set_ref_.size()); }
   bool IsWriteOnly() { return (0 == tx_ref_.read_set_ref_.size()); }
 
@@ -82,6 +91,7 @@ class ConcurrencyControlBase {
  protected:
   TransactionReferences tx_ref_;
   PreCommitValidator pre_commit_validator_;
+  bool aborted_by_duplicate_key_ = false;
 };
 }  // namespace LineairDB
 
