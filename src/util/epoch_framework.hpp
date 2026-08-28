@@ -185,10 +185,17 @@ class EpochFramework {
   // beyond the mark.
   bool WaitGlobalEpochAtLeast(EpochNumber target,
                               std::chrono::milliseconds timeout) {
+    return WaitGlobalEpochAtLeastUntil(
+        target, std::chrono::steady_clock::now() + timeout);
+  }
+
+  // As above, against a deadline the caller already holds, so a wait that is
+  // one step of a longer bounded operation cannot restart the clock.
+  bool WaitGlobalEpochAtLeastUntil(
+      EpochNumber target, std::chrono::steady_clock::time_point deadline) {
     assert(GetMyThreadLocalEpoch() == THREAD_OFFLINE);
     if (global_epoch_.load() >= target) return true;
     if (target > kEpochHighWater) return false;
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
     std::unique_lock<std::mutex> lk(epoch_mtx_);
     for (;;) {
       if (global_epoch_.load() >= target) return true;

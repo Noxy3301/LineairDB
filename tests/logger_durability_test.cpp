@@ -209,15 +209,17 @@ TEST_F(LoggerDurabilityTest, SyncAcknowledgementFollowsTheFdatasync) {
   logger.StopAndDrainFlusher();
 }
 
-// Only Sync pays for the wait, and only for a transaction that left a record.
+// A caller that decided not to wait returns at once, whether because the
+// contract is Async or because the transaction left no record.
 TEST_F(LoggerDurabilityTest, AsyncAndUnloggedCommitsDoNotWait) {
   {
     Logger logger(config_);
     ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::Ok);
     logger.StartFlusher();
 
-    // Async: an epoch that will never be flushed still returns at once.
-    logger.AwaitCommitDurability(99, true);
+    // Async: the commit path decided not to wait, and an epoch that will
+    // never be flushed still returns at once.
+    logger.AwaitCommitDurability(99, false);
     EXPECT_EQ(logger.GetDurableEpoch(), 0u);
     logger.StopAndDrainFlusher();
   }
@@ -234,6 +236,100 @@ TEST_F(LoggerDurabilityTest, AsyncAndUnloggedCommitsDoNotWait) {
   sync_logger.AwaitCommitDurability(99, false);
   EXPECT_EQ(sync_logger.GetDurableEpoch(), 0u);
   sync_logger.StopAndDrainFlusher();
+}
+
+// The policy is switchable while the logger runs: a commit that captured
+// Async does not wait, and one that captured Sync afterwards waits for the
+// fdatasync that makes its epoch durable.
+TEST_F(LoggerDurabilityTest, CommitDurabilityIsSwitchableAtRuntime) {
+  std::mutex mutex;
+  std::condition_variable held;
+  bool inside_fdatasync = false;
+  bool released = false;
+
+  WalIo io = WalIo::Posix();
+  auto posix_fdatasync = io.fdatasync;
+  io.fdatasync = [&](int fd) {
+    std::unique_lock<std::mutex> lock(mutex);
+    inside_fdatasync = true;
+    held.notify_all();
+    held.wait(lock, [&] { return released; });
+    lock.unlock();
+    return posix_fdatasync(fd);
+  };
+
+  Logger logger(config_, io);
+  EXPECT_EQ(logger.GetCommitDurability(),
+            LineairDB::Config::CommitDurability::Async);
+
+  std::atomic<bool> committer_started{false};
+  std::future<void> committer;
+
+  // See SyncAcknowledgementFollowsTheFdatasync: releases the held fdatasync
+  // and drains the flusher on every exit path, so a failed assertion cannot
+  // leave the committer waiting forever.
+  struct ReleaseOnExit {
+    Logger& logger;
+    std::mutex& mutex;
+    std::condition_variable& held;
+    bool& released;
+    ~ReleaseOnExit() {
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        released = true;
+      }
+      held.notify_all();
+      logger.StopAndDrainFlusher();
+    }
+  } release_on_exit{logger, mutex, held, released};
+
+  ASSERT_EQ(logger.Recover().status, Logger::RecoveryStatus::Ok);
+  logger.StartFlusher();
+
+  // Async: the decision the commit captured is "do not wait", and an epoch
+  // that will never be flushed still returns at once.
+  ASSERT_TRUE(logger.Enqueue(MakeWriteSet("alice"), 3));
+  logger.AwaitCommitDurability(3, false);
+  EXPECT_EQ(logger.GetDurableEpoch(), 0u);
+
+  logger.SetCommitDurability(LineairDB::Config::CommitDurability::Sync);
+  EXPECT_EQ(logger.GetCommitDurability(),
+            LineairDB::Config::CommitDurability::Sync);
+
+  ASSERT_TRUE(logger.Enqueue(MakeWriteSet("bob"), 3));
+  committer = std::async(std::launch::async, [&logger, &committer_started] {
+    committer_started.store(true);
+    logger.AwaitCommitDurability(3, true);
+  });
+  while (!committer_started.load()) std::this_thread::yield();
+  logger.ScheduleFlush(3);
+
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(held.wait_for(lock, kTestTimeout,
+                              [&] { return inside_fdatasync; }));
+  }
+  EXPECT_EQ(committer.wait_for(std::chrono::milliseconds(200)),
+            std::future_status::timeout);
+  EXPECT_EQ(logger.GetDurableEpoch(), 0u);
+
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    released = true;
+  }
+  held.notify_all();
+
+  ASSERT_EQ(committer.wait_for(kTestTimeout), std::future_status::ready);
+  committer.get();
+  EXPECT_EQ(logger.GetDurableEpoch(), 3u);
+
+  // And back: a commit that captures Async after the switch does not wait.
+  logger.SetCommitDurability(LineairDB::Config::CommitDurability::Async);
+  ASSERT_TRUE(logger.Enqueue(MakeWriteSet("carol"), 9));
+  logger.AwaitCommitDurability(9, false);
+  EXPECT_EQ(logger.GetDurableEpoch(), 3u);
+
+  logger.StopAndDrainFlusher();
 }
 
 // With the fail-stop armed, a write failure ends the process by abort: under

@@ -410,10 +410,17 @@ Logger::WaitResult Logger::WaitUntilDurable(EpochNumber commit_epoch,
   return state_ == State::Stopped ? WaitResult::Stopped : WaitResult::Failed;
 }
 
+void Logger::SetCommitDurability(Config::CommitDurability mode) {
+  durability_.store(mode, std::memory_order_seq_cst);
+}
+
+Config::CommitDurability Logger::GetCommitDurability() const {
+  return durability_.load(std::memory_order_seq_cst);
+}
+
 void Logger::AwaitCommitDurability(EpochNumber commit_epoch,
-                                   bool log_enqueued) {
-  if (durability_ != Config::CommitDurability::Sync) return;
-  if (!log_enqueued) return;
+                                   bool awaits_durability) {
+  if (!awaits_durability) return;
 
   // The sample is drawn before the wait, so a commit whose epoch is already
   // durable is represented alongside one that waits. The watermark reading is

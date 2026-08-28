@@ -663,15 +663,19 @@ bool Commit(TableDictionary& tables, std::shared_mutex& schema_mutex,
                           tid_it->second);
   }
 
-  // Phase 3.5: enqueue the log set, then leave the epoch.
+  // Phase 3.5: enqueue the log set, capture the policy while still online at
+  // current_epoch, then leave the epoch.
   bool log_enqueued = false;
   if (!log_set.empty()) {
     log_enqueued = logger.Enqueue(log_set, current_epoch);
   }
+  const bool awaits_durability =
+      log_enqueued &&
+      logger.GetCommitDurability() == Config::CommitDurability::Sync;
 
   epoch_framework.MakeMeOffline();
 
-  logger.AwaitCommitDurability(current_epoch, log_enqueued);
+  logger.AwaitCommitDurability(current_epoch, awaits_durability);
   return true;
 }
 
